@@ -1127,6 +1127,20 @@ BENCH_START(small_step_prep_tim)
                              grid%j_start(ij), grid%j_end(ij),                        &
                              k_start    , k_end                                       )
  
+#ifdef WRF_GPU_DYN
+!  calc_p_rho is called before, and then during every acoustic step.  Retain
+!  its fixed coefficients and work fields for the entire acoustic phase.
+!  The surrounding routines remain host code, so mutable fields are updated
+!  explicitly at each CPU/GPU boundary below.
+!$acc enter data copyin(grid%al,grid%p,grid%ph_2,grid%alt,grid%t_2,grid%t_save,c2a,pm1) &
+!$acc& copyin(grid%mu_2,grid%muts,grid%c1h,grid%c2h,grid%c1f,grid%c2f,grid%c3h,grid%c4h) &
+!$acc& copyin(grid%c3f,grid%c4f,grid%znu,grid%rdnw,grid%dnw,grid%mut,grid%rdn,cqw) &
+!$acc& copyin(grid%w_2,rw_tend,grid%ww,w_save,grid%u_2,grid%v_2,muave,t_2save,ph_save) &
+!$acc& copyin(grid%phb,ph_tend,grid%ht,grid%alb,grid%fnm,grid%fnp,grid%cf1,grid%cf2) &
+!$acc& copyin(grid%cf3,grid%msftx,grid%msfty) &
+!$acc& create(a,alpha,gamma)
+#endif
+
        CALL calc_p_rho( grid%al, grid%p, grid%ph_2,                 &
                         grid%alt, grid%t_2, grid%t_save, c2a, pm1,  &
                         grid%mu_2, grid%muts,                       &
@@ -1140,6 +1154,9 @@ BENCH_START(small_step_prep_tim)
                         grid%i_start(ij), grid%i_end(ij),           &
                         grid%j_start(ij), grid%j_end(ij),           &
                         k_start    , k_end                          )
+#ifdef WRF_GPU_DYN
+!$acc update self(grid%al,grid%p,grid%ph_2,pm1)
+#endif
 
        IF (config_flags%non_hydrostatic) THEN
          CALL calc_coef_w( a,alpha,gamma,                    &
@@ -1517,6 +1534,11 @@ BENCH_END(spec_bdy_t_tim)
 
 BENCH_START(advance_w_tim)
          IF ( config_flags%non_hydrostatic ) THEN
+#ifdef WRF_GPU_DYN
+!  The preceding horizontal and mass/theta steps remain host code.
+!$acc update device(grid%w_2,grid%ww,grid%u_2,grid%v_2,grid%mu_2,grid%mut,muave, &
+!$acc& grid%muts,t_2save,grid%t_2,grid%ph_2)
+#endif
            CALL advance_w( grid%w_2, rw_tend, grid%ww, w_save,         &
                            grid%u_2, grid%v_2,                         &
                            grid%mu_2, grid%mut, muave, grid%muts,      &
@@ -1536,6 +1558,10 @@ BENCH_START(advance_w_tim)
                            grid%i_start(ij), grid%i_end(ij),           &
                            grid%j_start(ij), grid%j_end(ij),           &
                            k_start    , k_end                          )
+#ifdef WRF_GPU_DYN
+!  sumflux, boundary handling, and the next host acoustic step consume these.
+!$acc update self(grid%w_2,t_2save,grid%ph_2)
+#endif
          ENDIF
 BENCH_END(advance_w_tim)
 
@@ -1641,6 +1667,10 @@ BENCH_END(spec_bdynhyd_tim)
          ENDIF
 
 BENCH_START(cald_p_rho_tim)
+#ifdef WRF_GPU_DYN
+!  The preceding advance, halo, and boundary routines execute on the host.
+!$acc update device(grid%al,grid%p,grid%ph_2,grid%t_2,grid%mu_2,grid%muts,pm1)
+#endif
          CALL calc_p_rho( grid%al, grid%p, grid%ph_2,                 &
                           grid%alt, grid%t_2, grid%t_save, c2a, pm1,  &
                           grid%mu_2, grid%muts,                       &
@@ -1654,6 +1684,9 @@ BENCH_START(cald_p_rho_tim)
                           grid%i_start(ij), grid%i_end(ij), &
                           grid%j_start(ij), grid%j_end(ij), &
                           k_start    , k_end               )
+#ifdef WRF_GPU_DYN
+!$acc update self(grid%al,grid%p,grid%ph_2,pm1)
+#endif
 BENCH_END(cald_p_rho_tim)
 
        ENDDO
@@ -1824,6 +1857,16 @@ BENCH_END(small_step_finish_tim)
 
      END DO
      !$OMP END PARALLEL DO
+
+#ifdef WRF_GPU_DYN
+!$acc exit data delete(grid%al,grid%p,grid%ph_2,grid%alt,grid%t_2,grid%t_save,c2a,pm1) &
+!$acc& delete(grid%mu_2,grid%muts,grid%c1h,grid%c2h,grid%c1f,grid%c2f,grid%c3h,grid%c4h) &
+!$acc& delete(grid%c3f,grid%c4f,grid%znu,grid%rdnw,grid%dnw,grid%mut,grid%rdn,cqw) &
+!$acc& delete(grid%w_2,rw_tend,grid%ww,w_save,grid%u_2,grid%v_2,muave,t_2save,ph_save) &
+!$acc& delete(grid%phb,ph_tend,grid%ht,grid%alb,grid%fnm,grid%fnp,grid%cf1,grid%cf2) &
+!$acc& delete(grid%cf3,grid%msftx,grid%msfty) &
+!$acc& delete(a,alpha,gamma)
+#endif
 
 !-----------------------------------------------------------
 !  polar filter for full dynamics variables and time-averaged mass fluxes 

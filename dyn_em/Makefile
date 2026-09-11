@@ -58,6 +58,13 @@ $(LIBTARGET) :  $(MODULES) $(OBJS)
 
 include ../configure.wrf
 
+# Keep the OpenACC experiment limited to the first EM-dynamics kernels.
+# GPU_DYN_FLAGS is empty in every CPU configuration, so those builds continue
+# to use the ordinary implicit compilation rule unchanged.
+ifneq ($(GPU_DYN_FLAGS),)
+module_small_step_em.o module_big_step_utilities_em.o solve_em.o: FCFLAGS += $(GPU_DYN_FLAGS)
+endif
+
 cio.o :
 	$(CC) -c $(CFLAGS) cio.c
 

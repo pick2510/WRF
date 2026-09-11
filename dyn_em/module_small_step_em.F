@@ -578,6 +578,9 @@ SUBROUTINE calc_p_rho( al, p, ph,                    &
    k_end = min(kte,kde-1)
 
    IF (non_hydrostatic) THEN
+#ifdef WRF_GPU_DYN
+!$acc parallel loop collapse(3) present(al,p,ph,alt,t_2,t_1,c2a,mu,mut,rdnw,c1h,c2h,c1f,c2f,pm1)
+#endif
      DO j=j_start, j_end
      DO k=k_start, k_end
      DO i=i_start, i_end
@@ -598,8 +601,14 @@ SUBROUTINE calc_p_rho( al, p, ph,                    &
 
    ELSE  ! hydrostatic calculation
 
+#ifdef WRF_GPU_DYN
+!$acc parallel loop gang present(al,p,ph,alt,t_2,t_1,c2a,mu,mut,dnw,znu,c1h,c2h,c1f,c2f,pm1)
+#endif
        DO j=j_start, j_end
        DO k=k_start, k_end
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
        DO i=i_start, i_end
 #if ! ( HYBRID_COORD==1 ) 
          p(i,k,j)=mu(i,j)*znu(k)
@@ -617,8 +626,11 @@ SUBROUTINE calc_p_rho( al, p, ph,                    &
    END IF
 
 !  divergence damping setup
- 
+
      IF (step == 0) then   ! we're initializing small timesteps
+#ifdef WRF_GPU_DYN
+!$acc parallel loop collapse(3) present(pm1,p)
+#endif
        DO j=j_start, j_end
        DO k=k_start, k_end
        DO i=i_start, i_end
@@ -627,6 +639,9 @@ SUBROUTINE calc_p_rho( al, p, ph,                    &
        ENDDO
        ENDDO 
      ELSE                     ! we're in the small timesteps 
+#ifdef WRF_GPU_DYN
+!$acc parallel loop collapse(3) present(p,pm1)
+#endif
        DO j=j_start, j_end    ! and adding div damping component
        DO k=k_start, k_end
        DO i=i_start, i_end
@@ -684,8 +699,7 @@ SUBROUTINE calc_coef_w( a,alpha,gamma,              &
 
 !  Local stack data.
 
-  REAL, DIMENSION(ims:ime)                         :: cof
-  REAL  :: b, c
+  REAL  :: cof, b, c
   REAL  :: muthmutf_kk, muthmutf_km1k, muthmutf_kkp1
 
   INTEGER :: i, j, k, kk, i_start, i_end, j_start, j_end, k_start, k_end
@@ -709,57 +723,94 @@ SUBROUTINE calc_coef_w( a,alpha,gamma,              &
       lid_flag=1
       IF(top_lid)lid_flag=0
 
-     outer_j_loop:  DO j = j_start, j_end
+      cof = (.5*dts*g*(1.+epssm))**2
 
-        k = kde-1
+#ifdef WRF_GPU_DYN
+#if ! ( HYBRID_COORD )
+!$acc parallel loop collapse(2) present(a,gamma,mut,c2a,rdnw) private(muthmutf_kk)
+#else
+!$acc parallel loop collapse(2) present(a,gamma,mut,c2a,rdnw)
+#endif
+#endif
+     DO j = j_start, j_end
         DO i = i_start, i_end
-          cof(i)  = (.5*dts*g*(1.+epssm))**2
+          k = kde-1
           a(i, 2 ,j) = 0.
 #if ! ( HYBRID_COORD )
           MUTHMUTF_KK = mut(i,j)*mut(i,j)
 #endif
-          a(i,kde,j) =-2.*cof(i)*rdnw(kde-1)**2*c2a(i,kde-1,j)*lid_flag/MUTHMUTF_KK
+          a(i,kde,j) =-2.*cof*rdnw(kde-1)**2*c2a(i,kde-1,j)*lid_flag/MUTHMUTF_KK
           gamma(i,1 ,j) = 0.
         ENDDO
+     ENDDO
 
-        DO kk=3,kde-1
-        k=kk-1
+#ifdef WRF_GPU_DYN
+#if ! ( HYBRID_COORD )
+!$acc parallel loop collapse(2) present(a,cqw,c2a,mut,rdn,rdnw) private(muthmutf_kk)
+#else
+!$acc parallel loop collapse(2) present(a,cqw,c2a,mut,rdn,rdnw)
+#endif
+#endif
+        DO j = j_start, j_end
+        DO kk = 3, kde-1
+        k = kk-1
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
         DO i=i_start, i_end
 #if ! ( HYBRID_COORD )
           MUTHMUTF_KK = mut(i,j)*mut(i,j)
 #endif
-          a(i,kk,j) =   -cqw(i,kk,j)*cof(i)*rdn(kk)* rdnw(kk-1)*c2a(i,kk-1,j)/MUTHMUTF_KK
+          a(i,kk,j) =   -cqw(i,kk,j)*cof*rdn(kk)* rdnw(kk-1)*c2a(i,kk-1,j)/MUTHMUTF_KK
+        ENDDO
         ENDDO
         ENDDO
 
-
-        DO k=2,kde-1
+#ifdef WRF_GPU_DYN
+#if ! ( HYBRID_COORD )
+!$acc parallel loop collapse(2) present(a,alpha,gamma,cqw,c2a,mut,rdn,rdnw) &
+!$acc& private(b,c,muthmutf_kk,muthmutf_km1k,muthmutf_kkp1)
+#else
+!$acc parallel loop collapse(2) present(a,alpha,gamma,cqw,c2a,mut,rdn,rdnw) private(b,c)
+#endif
+#endif
+        DO j = j_start, j_end
         DO i=i_start, i_end
+        DO k=2,kde-1
 #if ! ( HYBRID_COORD )
           MUTHMUTF_KK = mut(i,j)*mut(i,j)
           MUTHMUTF_KM1K = mut(i,j)*mut(i,j)
           MUTHMUTF_KKP1 = mut(i,j)*mut(i,j)
 #endif
-          b = 1.+cqw(i,k,j)*cof(i)*rdn(k)*(rdnw(k  )*c2a(i,k,  j)/MUTHMUTF_KK  &
-                                          +rdnw(k-1)*c2a(i,k-1,j)/MUTHMUTF_KM1K )
-          c =   -cqw(i,k,j)*cof(i)*rdn(k)*rdnw(k  )*c2a(i,k,j  )/MUTHMUTF_KKP1
+          b = 1.+cqw(i,k,j)*cof*rdn(k)*(rdnw(k  )*c2a(i,k,  j)/MUTHMUTF_KK  &
+                                        +rdnw(k-1)*c2a(i,k-1,j)/MUTHMUTF_KM1K )
+          c =   -cqw(i,k,j)*cof*rdn(k)*rdnw(k  )*c2a(i,k,j  )/MUTHMUTF_KKP1
           alpha(i,k,j) = 1./(b-a(i,k,j)*gamma(i,k-1,j))
           gamma(i,k,j) = c*alpha(i,k,j)
         ENDDO
         ENDDO
+        ENDDO
 
-        k=kde
+#ifdef WRF_GPU_DYN
+#if ! ( HYBRID_COORD )
+!$acc parallel loop collapse(2) present(a,alpha,gamma,c2a,mut,rdnw) &
+!$acc& private(b,c,muthmutf_km1k)
+#else
+!$acc parallel loop collapse(2) present(a,alpha,gamma,c2a,mut,rdnw) private(b,c)
+#endif
+#endif
+        DO j = j_start, j_end
         DO i=i_start, i_end
+          k=kde
 #if ! ( HYBRID_COORD )
           MUTHMUTF_KM1K = mut(i,j)*mut(i,j)
 #endif
-          b = 1.+2.*cof(i)*rdnw(kde-1)**2*c2a(i,kde-1,j)/MUTHMUTF_KM1K
+          b = 1.+2.*cof*rdnw(kde-1)**2*c2a(i,kde-1,j)/MUTHMUTF_KM1K
           c = 0.
           alpha(i,kde,j) = 1./(b-a(i,kde,j)*gamma(i,kde-1,j))
           gamma(i,kde,j) = c*alpha(i,kde,j)
         ENDDO
-
-      ENDDO outer_j_loop
+        ENDDO
 
 END SUBROUTINE calc_coef_w
 
@@ -1500,9 +1551,9 @@ SUBROUTINE advance_w( w, rw_tend, ww, w_save, u, v,  &
       REAL, DIMENSION( its:ite ) :: mut_inv, msft_inv
       REAL, DIMENSION( its:ite, kts:kte ) :: rhs, wdwn
       INTEGER :: i,j,k, i_start, i_end, j_start, j_end, k_start, k_end
-      REAL, DIMENSION (kts:kte) :: dampwt
-      real :: htop,hbot,hdepth,hk
+      real :: dampwt, htop, hbot, hdepth, hk
       real    :: pi,dampmag
+      logical :: damp_enabled
       REAL :: muthk, muthkm1
 
 !<DESCRIPTION>
@@ -1534,6 +1585,7 @@ SUBROUTINE advance_w( w, rw_tend, ww, w_save, u, v,  &
    pi = 4.*atan(1.)
    dampmag = dts*config_flags%dampcoef
    hdepth=config_flags%zdamp
+   damp_enabled = config_flags%damp_opt .eq. 3
 
 ! calculation of phi and w equations
 
@@ -1557,6 +1609,12 @@ SUBROUTINE advance_w( w, rw_tend, ww, w_save, u, v,  &
 !  'u,v,w' sent here must be coupled variables (= rho w/my etc.) by their usage
 
 
+#ifdef WRF_GPU_DYN
+!$acc data present(w,rw_tend,ww,w_save,u,v,mu1,mut,muave,muts,t_2ave,t_2,t_1,ph,ph_1,phb,ph_tend) &
+!$acc& present(ht,c2a,cqw,alt,alb,a,alpha,gamma,dnw,fnm,fnp,rdnw,rdn,msftx,msfty) &
+!$acc& create(mut_inv,msft_inv,rhs,wdwn)
+!$acc kernels
+#endif
     DO i=i_start, i_end
       rhs(i,1) = 0.
     ENDDO
@@ -1694,17 +1752,17 @@ SUBROUTINE advance_w( w, rw_tend, ww, w_save, u, v,  &
     ENDDO
     ENDDO
 
-    IF (config_flags%damp_opt .eq. 3) THEN
+    IF (damp_enabled) THEN
       DO k=k_end+1,2,-1
       DO i=i_start, i_end
           htop=(ph_1(i,k_end+1,j)+phb(i,k_end+1,j))/g
           hk=(ph_1(i,k,j)+phb(i,k,j))/g
           hbot=htop-hdepth
-          dampwt(k) = 0.
+          dampwt = 0.
           if(hk .ge. hbot)then
-            dampwt(k) = dampmag*sin(0.5*pi*(hk-hbot)/hdepth)*sin(0.5*pi*(hk-hbot)/hdepth)
+            dampwt = dampmag*sin(0.5*pi*(hk-hbot)/hdepth)*sin(0.5*pi*(hk-hbot)/hdepth)
           endif
-          w(i,k,j) = (w(i,k,j) - dampwt(k)*mut(i,j)*w_save(i,k,j))/(1.+dampwt(k))
+          w(i,k,j) = (w(i,k,j) - dampwt*mut(i,j)*w_save(i,k,j))/(1.+dampwt)
       ENDDO
       ENDDO
     ENDIF
@@ -1717,6 +1775,11 @@ SUBROUTINE advance_w( w, rw_tend, ww, w_save, u, v,  &
     ENDDO
 
   ENDDO j_loop_w
+
+#ifdef WRF_GPU_DYN
+!$acc end kernels
+!$acc end data
+#endif
 
 END SUBROUTINE advance_w
 

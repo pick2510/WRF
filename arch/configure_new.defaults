@@ -216,6 +216,99 @@ RLFLAGS		=
 CC_TOOLS        =      $(SCC) 
 
 ###########################################################
+#ARCH    Linux x86_64, NVIDIA HPC SDK compiler with HPC-X MPI # serial smpar dmpar dm+sm
+#
+# Set PATH to the NVHPC compiler directory and HPC-X bin directory before
+# running configure.  This stanza is the initial OpenACC EM-dynamics path;
+# WRF_GPU_DYN leaves the existing CPU source path available in other builds.
+DESCRIPTION     =       NVIDIA HPC SDK ($SFC/$SCC): OpenACC EM dynamics
+DMPARALLEL      =       # 1
+OMPCPP          =       # -D_OPENMP
+OMP             =       # -mp -Mrecursive
+OMPCC           =       # -mp
+SFC             =       nvfortran
+SCC             =       nvc
+CCOMP           =       nvc
+DM_FC           =       mpifort
+DM_CC           =       mpicc
+FC              =       CONFIGURE_FC
+CC              =       CONFIGURE_CC
+LD              =       $(FC)
+RWORDSIZE       =       CONFIGURE_RWORDSIZE
+PROMOTION       =       -r$(RWORDSIZE) -i4
+ARCH_LOCAL      =       -DNONSTANDARD_SYSTEM_SUBR -DWRF_GPU_DYN -DWRF_USE_CLM
+# Recent glibc distributions ship SunRPC through libtirpc.
+CFLAGS_LOCAL    =       -O3 -I/usr/include/tirpc
+LDFLAGS_LOCAL   =       -ltirpc $(GPU_DYN_FLAGS)
+CPLUSPLUSLIB    =
+ESMF_LDFLAG     =       $(CPLUSPLUSLIB)
+GPU_DYN_FLAGS   =       -acc -gpu=cc120
+FCOPTIM         =       -O3
+FCREDUCEDOPT    =       $(FCOPTIM)
+FCNOOPT         =       -O0
+FCDEBUG         =       # -g $(FCNOOPT) -Kieee
+FORMAT_FIXED    =       -Mfixed
+FORMAT_FREE     =       -Mfree
+FCSUFFIX        =
+BYTESWAPIO      =       -byteswapio
+FCBASEOPTS      =       -w $(FCDEBUG) $(FORMAT_FREE) $(BYTESWAPIO) $(OMP)
+MODULE_SRCH_FLAG =     -module $(WRF_SRC_ROOT_DIR)/main
+TRADFLAG        =      CONFIGURE_TRADFLAG
+CPP             =      /lib/cpp CONFIGURE_CPPFLAGS
+AR              =      ar
+ARFLAGS         =      ru
+M4              =      m4 -B 14000
+RANLIB          =      ranlib
+RLFLAGS         =
+CC_TOOLS        =      $(SCC)
+
+###########################################################
+#ARCH    Linux x86_64, NVIDIA HPC SDK CPU-only compiler with HPC-X MPI # serial smpar dmpar dm+sm
+#
+# CPU-only counterpart to the OpenACC EM-dynamics configuration above.  It
+# uses the same compiler/MPI stack, but does not define WRF_GPU_DYN or enable
+# OpenACC, making it an appropriate numerical and performance baseline.
+DESCRIPTION     =       NVIDIA HPC SDK ($SFC/$SCC): CPU-only EM dynamics
+DMPARALLEL      =       # 1
+OMPCPP          =       # -D_OPENMP
+OMP             =       # -mp -Mrecursive
+OMPCC           =       # -mp
+SFC             =       nvfortran
+SCC             =       nvc
+CCOMP           =       nvc
+DM_FC           =       mpifort
+DM_CC           =       mpicc
+FC              =       CONFIGURE_FC
+CC              =       CONFIGURE_CC
+LD              =       $(FC)
+RWORDSIZE       =       CONFIGURE_RWORDSIZE
+PROMOTION       =       -r$(RWORDSIZE) -i4
+ARCH_LOCAL      =       -DNONSTANDARD_SYSTEM_SUBR -DWRF_USE_CLM
+CFLAGS_LOCAL    =       -O3 -I/usr/include/tirpc
+LDFLAGS_LOCAL   =       -ltirpc
+CPLUSPLUSLIB    =
+ESMF_LDFLAG     =       $(CPLUSPLUSLIB)
+GPU_DYN_FLAGS   =
+FCOPTIM         =       -O3
+FCREDUCEDOPT    =       $(FCOPTIM)
+FCNOOPT         =       -O0
+FCDEBUG         =       # -g $(FCNOOPT) -Kieee
+FORMAT_FIXED    =       -Mfixed
+FORMAT_FREE     =       -Mfree
+FCSUFFIX        =
+BYTESWAPIO      =       -byteswapio
+FCBASEOPTS      =       -w $(FCDEBUG) $(FORMAT_FREE) $(BYTESWAPIO) $(OMP)
+MODULE_SRCH_FLAG =     -module $(WRF_SRC_ROOT_DIR)/main
+TRADFLAG        =      CONFIGURE_TRADFLAG
+CPP             =      /lib/cpp CONFIGURE_CPPFLAGS
+AR              =      ar
+ARFLAGS         =      ru
+M4              =      m4 -B 14000
+RANLIB          =      ranlib
+RLFLAGS         =
+CC_TOOLS        =      $(SCC)
+
+###########################################################
 #ARCH    Linux x86_64 ppc64le, PGI accelerator compiler with gcc # serial smpar dmpar dm+sm
 #
 DESCRIPTION     =       PGI ($SFC/$SCC): PGI accelerator
@@ -1964,4 +2057,3 @@ CC_TOOLS        =      /usr/bin/gcc -Wall
 #insert new stanza before the Fujitsu block, keep Fujitsu at the end of the list
 ###########################################################
 #ARCH  NULL
-
