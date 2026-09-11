@@ -1613,18 +1613,31 @@ SUBROUTINE advance_w( w, rw_tend, ww, w_save, u, v,  &
 !$acc data present(w,rw_tend,ww,w_save,u,v,mu1,mut,muave,muts,t_2ave,t_2,t_1,ph,ph_1,phb,ph_tend) &
 !$acc& present(ht,c2a,cqw,alt,alb,a,alpha,gamma,dnw,fnm,fnp,rdnw,rdn,msftx,msfty) &
 !$acc& create(mut_inv,msft_inv,rhs,wdwn)
-!$acc kernels
+!$acc parallel loop
 #endif
     DO i=i_start, i_end
       rhs(i,1) = 0.
     ENDDO
 
+#ifdef WRF_GPU_DYN
+!$acc parallel private(dampwt,htop,hbot,hk,muthk,muthkm1)
+!$acc loop seq
+#endif
   j_loop_w:  DO j = j_start, j_end
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
     DO i=i_start, i_end
        msft_inv(i) = 1./msfty(i,j)
     ENDDO
 
+#ifdef WRF_GPU_DYN
+!$acc loop seq
+#endif
     DO k=1, k_end
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
     DO i=i_start, i_end
       t_2ave(i,k,j)=.5*((1.+epssm)*t_2(i,k,j)       &
                     +(1.-epssm)*t_2ave(i,k,j))
@@ -1640,7 +1653,13 @@ SUBROUTINE advance_w( w, rw_tend, ww, w_save, u, v,  &
 !   building up RHS of phi equation
 !   ph_tend contains terms 1 and 2; now adding 3 and 4 in stages:
 !   here rhs = delta t [ph_tend + ~g*w/2 - ~ww * partial d phi/dz]
+#ifdef WRF_GPU_DYN
+!$acc loop seq
+#endif
     DO k=2,k_end
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
     DO i=i_start, i_end
        rhs(i,k) = rhs(i,k)-dts*( fnm(k)*wdwn(i,k+1)  &
                                 +fnp(k)*wdwn(i,k  ) )
@@ -1657,7 +1676,13 @@ SUBROUTINE advance_w( w, rw_tend, ww, w_save, u, v,  &
 !                                                      partial d phi/dz]
 !            = ph_previous + (msft*delta t/mu)*[ph_tend + ~g*w/2 - ~ww *
 !                                                         partial d phi/dz]
+#ifdef WRF_GPU_DYN
+!$acc loop seq
+#endif
     DO k=2,k_end+1
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
     DO i=i_start, i_end
       rhs(i,k) = ph(i,k,j) + msfty(i,j)*rhs(i,k)/mut(i,j)
       if(top_lid .and. k.eq.k_end+1)rhs(i,k)=0.
@@ -1677,6 +1702,9 @@ SUBROUTINE advance_w( w, rw_tend, ww, w_save, u, v,  &
 !   [cf1, cf2 and cf3 do vertical weighting of u or v values nearest
 !    the surface]
 
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
     DO i=i_start, i_end
        w(i,1,j)=                                           &
 
@@ -1699,7 +1727,13 @@ SUBROUTINE advance_w( w, rw_tend, ww, w_save, u, v,  &
 ! (left a blank line where the other two k/i-loops were)
 !
 !   above surface, begin by adding delta t * previous (coupled) w tendency
+#ifdef WRF_GPU_DYN
+!$acc loop seq
+#endif
     DO k=2,k_end
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
       DO i=i_start, i_end
 #if ! ( HYBRID_COORD==1 ) 
         MUTHK   = mut(i,j)
@@ -1725,6 +1759,9 @@ SUBROUTINE advance_w( w, rw_tend, ww, w_save, u, v,  &
 
     K=k_end+1
 
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
     DO i=i_start, i_end
 #if ! ( HYBRID_COORD==1 ) 
        MUTHKM1 = mut(i,j)
@@ -1740,20 +1777,38 @@ SUBROUTINE advance_w( w, rw_tend, ww, w_save, u, v,  &
        if(top_lid)w(i,k,j) = 0.
     ENDDO
 
+#ifdef WRF_GPU_DYN
+!$acc loop seq
+#endif
     DO k=2,k_end+1
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
     DO i=i_start, i_end
        w(i,k,j)=(w(i,k,j)-a(i,k,j)*w(i,k-1,j))*alpha(i,k,j)
     ENDDO
     ENDDO
 
+#ifdef WRF_GPU_DYN
+!$acc loop seq
+#endif
     DO k=k_end,2,-1
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
     DO i=i_start, i_end
        w (i,k,j)=w (i,k,j)-gamma(i,k,j)*w(i,k+1,j)
     ENDDO
     ENDDO
 
     IF (damp_enabled) THEN
+#ifdef WRF_GPU_DYN
+!$acc loop seq
+#endif
       DO k=k_end+1,2,-1
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
       DO i=i_start, i_end
           htop=(ph_1(i,k_end+1,j)+phb(i,k_end+1,j))/g
           hk=(ph_1(i,k,j)+phb(i,k,j))/g
@@ -1767,7 +1822,13 @@ SUBROUTINE advance_w( w, rw_tend, ww, w_save, u, v,  &
       ENDDO
     ENDIF
 
+#ifdef WRF_GPU_DYN
+!$acc loop seq
+#endif
     DO k=k_end+1,2,-1
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
     DO i=i_start, i_end
        ph(i,k,j) = rhs(i,k)+msfty(i,j)*.5*dts*g*(1.+epssm) &
                       *w(i,k,j)/muts(i,j)
@@ -1777,7 +1838,7 @@ SUBROUTINE advance_w( w, rw_tend, ww, w_save, u, v,  &
   ENDDO j_loop_w
 
 #ifdef WRF_GPU_DYN
-!$acc end kernels
+!$acc end parallel
 !$acc end data
 #endif
 
