@@ -4462,6 +4462,460 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
 #endif
 END SUBROUTINE advect_v
 
+#ifdef WRF_GPU_DYN
+!-------------------------------------------------------------------------------
+!  Fast multi-gang path for the one (horz_order,vert_order) combination the
+!  target real-data case actually runs: h_mom_adv_order=5, v_mom_adv_order=3
+!  (WRF defaults). Semantically identical to the horz_order==5 / vert_order==3
+!  branches of advect_v above -- every flux expression below is a verbatim
+!  copy -- restructured the same way advect_u_o5v3/advect_scalar_o5v3 were:
+!  every loop nest is a standalone "!$acc parallel loop collapse(N)" kernel
+!  with no enclosing "!$acc data" and no manually-delimited region (see
+!  plan.md). Reuses the same shared module-level 3-D buffers
+!  (fast_fqy3/fast_fqx3/fast_vflux3) the other _o5v3 routines use -- none of
+!  them are ever live at the same time. Not called unless the dispatch check
+!  in module_em.F confirms both orders match; advect_v remains the fallback
+!  for every other order combination.
+SUBROUTINE advect_v_o5v3 ( v, v_old, tendency,         &
+                        ru, rv, rom,                   &
+                        c1, c2,                        &
+                        mut, time_step, config_flags,  &
+                        msfux, msfuy, msfvx, msfvy,    &
+                        msftx, msfty,                  &
+                        fzm, fzp,                      &
+                        rdx, rdy, rdzw,                &
+                        ids, ide, jds, jde, kds, kde,  &
+                        ims, ime, jms, jme, kms, kme,  &
+                        its, ite, jts, jte, kts, kte  )
+
+   IMPLICIT NONE
+
+   TYPE(grid_config_rec_type), INTENT(IN   ) :: config_flags
+
+   INTEGER ,                 INTENT(IN   ) :: ids, ide, jds, jde, kds, kde, &
+                                              ims, ime, jms, jme, kms, kme, &
+                                              its, ite, jts, jte, kts, kte
+
+   REAL , DIMENSION( ims:ime , kms:kme , jms:jme ) , INTENT(IN   ) :: v,     &
+                                                                      v_old, &
+                                                                      ru,    &
+                                                                      rv,    &
+                                                                      rom
+
+   REAL , DIMENSION( ims:ime , jms:jme ) , INTENT(IN   ) :: mut
+   REAL , DIMENSION( ims:ime , kms:kme , jms:jme ) , INTENT(INOUT) :: tendency
+
+   REAL , DIMENSION( ims:ime , jms:jme ) ,         INTENT(IN   ) :: msfux,  &
+                                                                    msfuy,  &
+                                                                    msfvx,  &
+                                                                    msfvy,  &
+                                                                    msftx,  &
+                                                                    msfty
+
+   REAL , DIMENSION( kms:kme ) ,                 INTENT(IN   ) :: fzm,  &
+                                                                  fzp,  &
+                                                                  rdzw, &
+                                                                  c1,   &
+                                                                  c2
+
+   REAL ,                                        INTENT(IN   ) :: rdx,  &
+                                                                  rdy
+   INTEGER ,                                     INTENT(IN   ) :: time_step
+
+   ! Local data
+
+   INTEGER :: i, j, k, ktf
+   INTEGER :: i_start, i_end, j_start, j_end
+   INTEGER :: i_start_f, i_end_f, j_start_f, j_end_f
+   INTEGER :: jmin, jmax, jp, jm, imin, imax
+
+   REAL    :: mrdx, mrdy, ub, vb, uw, vw, dup, dum, vel
+
+   LOGICAL :: degrade_xs, degrade_ys, degrade_xe, degrade_ye
+   LOGICAL :: specified, polar_l
+
+! definition of flux operators, 3rd, 4th, 5th or 6th order (verbatim from advect_v)
+
+   REAL    :: flux3, flux4, flux5
+   REAL    :: q_im3, q_im2, q_im1, q_i, q_ip1, q_ip2, ua
+
+   flux4(q_im2, q_im1, q_i, q_ip1, ua) =                         &
+          ( 7.*(q_i + q_im1) - (q_ip1 + q_im2) )/12.0
+
+   flux3(q_im2, q_im1, q_i, q_ip1, ua) =                         &
+            flux4(q_im2, q_im1, q_i, q_ip1, ua) +                &
+            sign(1,time_step)*sign(1.,ua)*((q_ip1 - q_im2)-3.*(q_i-q_im1))/12.0
+
+   flux5(q_im3, q_im2, q_im1, q_i, q_ip1, q_ip2, ua) =           &
+           ( 37.*(q_i+q_im1) - 8.*(q_ip1+q_im2)                 &
+            +(q_ip2+q_im3) )/60.0                                &
+            -sign(1,time_step)*sign(1.,ua)*(                     &
+              (q_ip2-q_im3)-5.*(q_ip1-q_im2)+10.*(q_i-q_im1) )/60.0
+
+   specified = .false.
+   if (config_flags%specified .or. config_flags%nested) specified = .true.
+   polar_l = config_flags%polar
+
+   CALL advect_fast_ensure_buffers( its, ite, jts, jte, kts, kte )
+
+   ktf = MIN(kte,kde-1)
+
+!  degrade-order boundary flags -- verbatim from advect_v horz_order==5
+!  (note: degrade_ye's threshold is jte<jde-3 here, unlike advect_u_o5v3's
+!  jte<jde-4 -- v is staggered in y, so this is a real, deliberate difference)
+
+   degrade_xs = .true.
+   degrade_xe = .true.
+   degrade_ys = .true.
+   degrade_ye = .true.
+
+   IF( config_flags%periodic_x   .or. &
+       config_flags%symmetric_xs .or. &
+       (its > ids+3)                ) degrade_xs = .false.
+   IF( config_flags%periodic_x   .or. &
+       config_flags%symmetric_xe .or. &
+       (ite < ide-3)                ) degrade_xe = .false.
+   IF( config_flags%periodic_y   .or. &
+       config_flags%symmetric_ys .or. &
+       (jts > jds+3)                ) degrade_ys = .false.
+   IF( config_flags%periodic_y   .or. &
+       config_flags%symmetric_ye .or. &
+       (jte < jde-3)                ) degrade_ye = .false.
+
+!--------------- y - advection ------------------------------------------------
+
+   i_start = its
+   i_end   = MIN(ite,ide-1)
+   j_start = jts
+   j_end   = jte
+
+   j_start_f = j_start
+   j_end_f   = j_end+1
+
+   IF(degrade_ys) then
+     j_start = MAX(jts,jds+1)
+     j_start_f = jds+3
+   ENDIF
+
+   IF(degrade_ye) then
+     j_end = MIN(jte,jde-1)
+     j_end_f = jde-2
+   ENDIF
+
+!  y flux -- collapsed over (j,k,i), one thread per point, no j-carried state
+
+!$acc parallel loop collapse(3) private(vel,vb) &
+!$acc& present(v,rv,fast_fqy3)
+   DO j = j_start, j_end+1
+   DO k = kts, ktf
+   DO i = i_start, i_end
+      IF( (j >= j_start_f ) .and. (j <= j_end_f) ) THEN
+         vel = 0.5*(rv(i,k,j)+rv(i,k,j-1))
+         fast_fqy3( i, k, j ) = vel*flux5(               &
+                 v(i,k,j-3), v(i,k,j-2), v(i,k,j-1),       &
+                 v(i,k,j  ), v(i,k,j+1), v(i,k,j+2),  vel )
+      ELSE IF ( j == jds+1 ) THEN
+         vb = v(i,k,j-1)
+         IF (specified .AND. v(i,k,j) .LT. 0.) vb = v(i,k,j)
+         fast_fqy3(i, k, j) = 0.25*(rv(i,k,j)+rv(i,k,j-1))  &
+                                *(v(i,k,j)+vb)
+      ELSE IF ( j == jds+2 ) THEN
+         vel = 0.5*(rv(i,k,j)+rv(i,k,j-1))
+         fast_fqy3( i, k, j ) = vel*flux3(      &
+              v(i,k,j-2),v(i,k,j-1),v(i,k,j),v(i,k,j+1),vel )
+      ELSE IF ( j == jde ) THEN
+         vb = v(i,k,j)
+         IF (specified .AND. v(i,k,j-1) .GT. 0.) vb = v(i,k,j-1)
+         fast_fqy3(i, k, j) = 0.25*(rv(i,k,j)+rv(i,k,j-1))    &
+                                *(vb+v(i,k,j-1))
+      ELSE IF ( j == jde-1 ) THEN
+         vel = 0.5*(rv(i,k,j)+rv(i,k,j-1))
+         fast_fqy3( i, k, j ) = vel*flux3(     &
+              v(i,k,j-2),v(i,k,j-1),v(i,k,j),v(i,k,j+1),vel )
+      ENDIF
+      ! else: unset for this j -- matches advect_v's stale-slot semantics;
+      ! only reachable at j==jde+1 under config_flags%polar, which is never
+      ! read (the polar j==jde+1 tendency branch below writes 0. directly
+      ! without reading fast_fqy3 at all).
+   ENDDO
+   ENDDO
+   ENDDO
+
+!  y flux-divergence into tendency -- collapsed over (j,k,i); each thread
+!  updates a disjoint tendency(:,:,j-1), so no write conflicts despite the
+!  per-thread branch structure mirroring advect_v's sequential IF-ladder.
+!  Comments on polar boundary conditions (from advect_v): no advection over
+!  the poles means tendencies (held from jds [S. pole] to jde [N pole], i.e.
+!  on the v grid) must be zero at the poles.
+
+!$acc parallel loop collapse(3) private(mrdy) &
+!$acc& present(tendency,fast_fqy3,msfvy)
+   DO j = j_start, j_end+1
+   DO k = kts, ktf
+   DO i = i_start, i_end
+      IF ( polar_l .AND. (j == jds+1) ) THEN
+         tendency(i,k,j-1) = 0.
+      ELSE IF( polar_l .AND. (j == jde+1) ) THEN
+         tendency(i,k,j-1) = 0.
+      ELSE IF ( j > j_start ) THEN
+         mrdy=msfvy(i,j-1)*rdy
+         tendency(i,k,j-1) = tendency(i,k,j-1) - mrdy*(fast_fqy3(i,k,j)-fast_fqy3(i,k,j-1))
+      ENDIF
+   ENDDO
+   ENDDO
+   ENDDO
+
+!--------------- x - flux divergence -------------------------------------------
+
+   i_start = its
+   i_end   = MIN(ite,ide-1)
+
+   j_start = jts
+   j_end   = jte
+   ! Polar boundary conditions are like open or specified
+   IF ( config_flags%open_ys .or. specified .or. polar_l ) j_start = MAX(jds+1,jts)
+   IF ( config_flags%open_ye .or. specified .or. polar_l ) j_end   = MIN(jde-1,jte)
+
+   i_start_f = i_start
+   i_end_f   = i_end+1
+
+   IF(degrade_xs) then
+     i_start = MAX(ids+1,its)
+     i_start_f = MIN(i_start+2,ids+3)
+   ENDIF
+
+   IF(degrade_xe) then
+     i_end = MIN(ide-2,ite)
+     i_end_f = ide-3
+   ENDIF
+
+!$acc parallel loop collapse(3) private(vel) &
+!$acc& present(v,ru,fast_fqx3)
+   DO j = j_start, j_end
+   DO k = kts, ktf
+   DO i = i_start_f, i_end_f
+      vel = 0.5*(ru(i,k,j)+ru(i,k,j-1))
+      fast_fqx3( i,k,j ) = vel*flux5( v(i-3,k,j), v(i-2,k,j),  &
+                                     v(i-1,k,j), v(i  ,k,j),  &
+                                     v(i+1,k,j), v(i+2,k,j),  &
+                                     vel                     )
+   ENDDO
+   ENDDO
+   ENDDO
+
+!  lower-order fixups close to boundaries -- small (i,j,k) kernels covering
+!  the (at most two) fixed i columns i_start..i_start_f-1 / i_end_f+1..i_end+1
+
+   IF( degrade_xs ) THEN
+!$acc parallel loop collapse(3) private(vel) &
+!$acc& present(v,ru,fast_fqx3)
+      DO j = j_start, j_end
+      DO k = kts, ktf
+      DO i = i_start, i_start_f-1
+         IF(i == ids+1) THEN
+            fast_fqx3(i,k,j) = 0.25*(ru(i,k,j)+ru(i,k,j-1)) &
+                                *(v(i,k,j)+v(i-1,k,j))
+         ELSE IF(i == ids+2) THEN
+            vel = 0.5*(ru(i,k,j)+ru(i,k,j-1))
+            fast_fqx3( i,k,j ) = vel*flux3( v(i-2,k,j), v(i-1,k,j),  &
+                                    v(i  ,k,j), v(i+1,k,j),  &
+                                    vel                     )
+         ENDIF
+      ENDDO
+      ENDDO
+      ENDDO
+   ENDIF
+
+   IF( degrade_xe ) THEN
+!$acc parallel loop collapse(3) private(vel) &
+!$acc& present(v,ru,fast_fqx3)
+      DO j = j_start, j_end
+      DO k = kts, ktf
+      DO i = i_end_f+1, i_end+1
+         IF( i == ide-1 ) THEN
+            fast_fqx3(i,k,j) = 0.25*(ru(i_end+1,k,j)+ru(i_end+1,k,j-1))      &
+                                *(v(i_end+1,k,j)+v(i_end,k,j))
+         ELSE IF( i == ide-2 ) THEN
+            vel = 0.5*(ru(i,k,j)+ru(i,k,j-1))
+            fast_fqx3( i,k,j ) = vel*flux3( v(i-2,k,j), v(i-1,k,j),  &
+                                    v(i  ,k,j), v(i+1,k,j),  &
+                                    vel                     )
+         ENDIF
+      ENDDO
+      ENDDO
+      ENDDO
+   ENDIF
+
+!  x flux-divergence into tendency
+
+!$acc parallel loop collapse(3) private(mrdx) &
+!$acc& present(tendency,fast_fqx3,msfvy)
+   DO j = j_start, j_end
+   DO k = kts, ktf
+   DO i = i_start, i_end
+      mrdx=msfvy(i,j)*rdx
+      tendency(i,k,j) = tendency(i,k,j) - mrdx*(fast_fqx3(i+1,k,j)-fast_fqx3(i,k,j))
+   ENDDO
+   ENDDO
+   ENDDO
+
+!  polar zero-out at N/S pole rows -- inactive for the Hong Kong case, kept
+!  for fidelity ("we keep setting this everywhere, but it can't hurt...")
+
+   IF ( polar_l .AND. (jts == jds) ) THEN
+!$acc parallel loop collapse(2) present(tendency)
+      DO i = its, ite
+      DO k = kts, ktf
+         tendency(i,k,jts) = 0.
+      ENDDO
+      ENDDO
+   ENDIF
+   IF ( polar_l .AND. (jte == jde) ) THEN
+!$acc parallel loop collapse(2) present(tendency)
+      DO i = its, ite
+      DO k = kts, ktf
+         tendency(i,k,jte) = 0.
+      ENDDO
+      ENDDO
+   ENDIF
+
+!  radiative lateral BC in y for v -- inactive for specified BCs (Hong Kong
+!  case), kept for fidelity; single-column kernels, cheap even when active.
+
+   IF ( (config_flags%open_ys) .and. jts == jds ) THEN
+      i_start = its
+      i_end   = MIN(ite,ide-1)
+!$acc parallel loop collapse(2) private(vb) present(v_old,rv,mut,tendency)
+      DO i = i_start, i_end
+      DO k = kts, ktf
+         vb = MIN(rv(i,k,jts)-cb*mut(i,jts), 0.)
+         tendency(i,k,jts) = tendency(i,k,jts)                    &
+                     - rdy*vb*(v_old(i,k,jts+1) - v_old(i,k,jts))
+      ENDDO
+      ENDDO
+   ENDIF
+
+   IF ( (config_flags%open_ye) .and. jte == jde ) THEN
+      i_start = its
+      i_end   = MIN(ite,ide-1)
+!$acc parallel loop collapse(2) private(vb) present(v_old,rv,mut,tendency)
+      DO i = i_start, i_end
+      DO k = kts, ktf
+         vb = MAX(rv(i,k,jte)+cb*mut(i,jte-1), 0.)
+         tendency(i,k,jte) = tendency(i,k,jte)                    &
+                     - rdy*vb*(v_old(i,k,jte) - v_old(i,k,jte-1))
+      ENDDO
+      ENDDO
+   ENDIF
+
+   j_start = jts
+   j_end   = MIN(jte,jde)
+   jmin    = jds
+   jmax    = jde-1
+
+   IF (config_flags%open_ys) THEN
+       j_start = MAX(jds+1, jts)
+       jmin = jds
+   ENDIF
+   IF (config_flags%open_ye) THEN
+       j_end = MIN(jte,jde-1)
+       jmax = jde-1
+   ENDIF
+
+   IF( (config_flags%open_xs) .and. (its == ids)) THEN
+!$acc parallel loop collapse(2) private(mrdx,jp,jm,uw,ub,dup,dum) &
+!$acc& present(v,v_old,ru,tendency,msfvy)
+      DO j = j_start, j_end
+      DO k = kts, ktf
+         mrdx=msfvy(its,j)*rdx
+         jp = MIN( jmax, j   )
+         jm = MAX( jmin, j-1 )
+         uw = 0.5*(ru(its,k,jp)+ru(its,k,jm))
+         ub = MIN( uw, 0. )
+         dup =  ru(its+1,k,jp)-ru(its,k,jp)
+         dum =  ru(its+1,k,jm)-ru(its,k,jm)
+         tendency(its,k,j)=tendency(its,k,j)-mrdx*(               &
+                           ub*(v_old(its+1,k,j)-v_old(its,k,j))   &
+                          +0.5*v(its,k,j)*(dup+dum))
+      ENDDO
+      ENDDO
+   ENDIF
+
+   IF( (config_flags%open_xe) .and. (ite == ide) ) THEN
+!$acc parallel loop collapse(2) private(mrdx,jp,jm,uw,ub,dup,dum) &
+!$acc& present(v,v_old,ru,tendency,msfvy)
+      DO j = j_start, j_end
+      DO k = kts, ktf
+         mrdx=msfvy(ite-1,j)*rdx
+         jp = MIN( jmax, j   )
+         jm = MAX( jmin, j-1 )
+         uw = 0.5*(ru(ite,k,jp)+ru(ite,k,jm))
+         ub = MAX( uw, 0. )
+         dup = ru(ite,k,jp)-ru(ite-1,k,jp)
+         dum = ru(ite,k,jm)-ru(ite-1,k,jm)
+         tendency(ite-1,k,j)=tendency(ite-1,k,j)-mrdx*(              &
+                           ub*(v_old(ite-1,k,j)-v_old(ite-2,k,j))    &
+                          +0.5*v(ite-1,k,j)*(dup+dum))
+      ENDDO
+      ENDDO
+   ENDIF
+
+!-------------------- vertical advection (vert_order==3) -----------------------
+!     ADT eqn 45 has 3rd term on RHS = -(1/mx) partial d/dz (rho v w)
+!     We need a correction using (my/mx) since 'my' isn't a function of z.
+
+   i_start = its
+   i_end   = MIN(ite,ide-1)
+   j_start = jts
+   j_end   = jte
+
+   IF ( config_flags%open_ys .or. specified .or. polar_l ) j_start = MAX(jds+1,jts)
+   IF ( config_flags%open_ye .or. specified .or. polar_l ) j_end   = MIN(jde-1,jte)
+
+!$acc parallel loop collapse(2) present(fast_vflux3)
+   DO j = j_start, j_end
+   DO i = i_start, i_end
+      fast_vflux3(i,kts,j) = 0.
+      fast_vflux3(i,kte,j) = 0.
+   ENDDO
+   ENDDO
+
+!$acc parallel loop collapse(3) private(vel) present(v,rom,fast_vflux3)
+   DO j = j_start, j_end
+   DO k = kts+2, ktf-1
+   DO i = i_start, i_end
+      vel=0.5*(rom(i,k,j)+rom(i,k,j-1))
+      fast_vflux3(i,k,j) = vel*flux3(               &
+              v(i,k-2,j), v(i,k-1,j),       &
+              v(i,k  ,j), v(i,k+1,j),  -vel )
+   ENDDO
+   ENDDO
+   ENDDO
+
+!$acc parallel loop collapse(2) present(v,rom,fzm,fzp,fast_vflux3)
+   DO j = j_start, j_end
+   DO i = i_start, i_end
+      fast_vflux3(i,kts+1,j)=0.5*(rom(i,kts+1,j)+rom(i,kts+1,j-1))  &
+                              *(fzm(kts+1)*v(i,kts+1,j)+fzp(kts+1)*v(i,kts+1-1,j))
+      fast_vflux3(i,ktf,j)=0.5*(rom(i,ktf,j)+rom(i,ktf,j-1)) &
+                              *(fzm(ktf)*v(i,ktf,j)+fzp(ktf)*v(i,ktf-1,j))
+   ENDDO
+   ENDDO
+
+!$acc parallel loop collapse(3) private(mrdy) present(tendency,fast_vflux3,rdzw,msfvy,msfvx)
+   DO j = j_start, j_end
+   DO k = kts, ktf
+   DO i = i_start, i_end
+      ! We are calculating vertical fluxes on v points, so we must mean
+      ! msf_v_x/y variables
+      tendency(i,k,j)=tendency(i,k,j)-(msfvy(i,j)/msfvx(i,j))*rdzw(k)*(fast_vflux3(i,k+1,j)-fast_vflux3(i,k,j))
+   ENDDO
+   ENDDO
+   ENDDO
+
+END SUBROUTINE advect_v_o5v3
+#endif
+
 !-------------------------------------------------------------------
 
 #endif
@@ -8939,6 +9393,506 @@ ELSE IF (horz_order == 2 ) THEN
    !$acc end data
 #endif
 END SUBROUTINE advect_w
+
+#ifdef WRF_GPU_DYN
+!----------------------------------------------------------------
+!  Fast multi-gang path for the one (horz_order,vert_order) combination the
+!  target real-data case actually runs. Note advect_w dispatches on
+!  h_sca_adv_order/v_sca_adv_order (the SCALAR order, not the momentum
+!  order -- verbatim from advect_w above), so this is dispatched from the
+!  same order check as advect_scalar_o5v3, not advect_u_o5v3/advect_v_o5v3.
+!  Semantically identical to the horz_order==5 / vert_order==3 branches of
+!  advect_w above -- every flux expression is a verbatim copy -- restructured
+!  the same way the other _o5v3 routines were: standalone
+!  "!$acc parallel loop collapse(N)" kernels, no enclosing "!$acc data", no
+!  manually-delimited region (see plan.md). Reuses the shared module-level
+!  3-D buffers (fast_fqy3/fast_fqx3/fast_vflux3). w is vertically staggered,
+!  so unlike advect_u/advect_v there is an extra k=ktf+1 top-of-atmosphere
+!  half-level in the horizontal flux ladders and an extra lid contribution
+!  in the vertical divergence -- both kept verbatim, folded into a single
+!  k-range per kernel with an inner IF on k rather than a separate small
+!  kernel for the top row, since the two cases only differ in which "vel"
+!  expression is used. Not called unless the dispatch check in module_em.F
+!  confirms both orders match; advect_w remains the fallback otherwise.
+SUBROUTINE advect_w_o5v3 ( w, w_old, tendency,          &
+                        ru, rv, rom,                   &
+                        c1, c2,                        &
+                        mut, time_step, config_flags,  &
+                        msfux, msfuy, msfvx, msfvy,    &
+                        msftx, msfty,                  &
+                        fzm, fzp,                      &
+                        rdx, rdy, rdzu,                &
+                        ids, ide, jds, jde, kds, kde,  &
+                        ims, ime, jms, jme, kms, kme,  &
+                        its, ite, jts, jte, kts, kte  )
+
+   IMPLICIT NONE
+
+   TYPE(grid_config_rec_type), INTENT(IN   ) :: config_flags
+
+   INTEGER ,                 INTENT(IN   ) :: ids, ide, jds, jde, kds, kde, &
+                                              ims, ime, jms, jme, kms, kme, &
+                                              its, ite, jts, jte, kts, kte
+
+   REAL , DIMENSION( ims:ime , kms:kme , jms:jme ) , INTENT(IN   ) :: w,     &
+                                                                      w_old, &
+                                                                      ru,    &
+                                                                      rv,    &
+                                                                      rom
+
+   REAL , DIMENSION( ims:ime , jms:jme ) , INTENT(IN   ) :: mut
+   REAL , DIMENSION( ims:ime , kms:kme , jms:jme ) , INTENT(INOUT) :: tendency
+
+   REAL , DIMENSION( ims:ime , jms:jme ) ,         INTENT(IN   ) :: msfux,  &
+                                                                    msfuy,  &
+                                                                    msfvx,  &
+                                                                    msfvy,  &
+                                                                    msftx,  &
+                                                                    msfty
+
+   REAL , DIMENSION( kms:kme ) ,                 INTENT(IN   ) :: fzm,  &
+                                                                  fzp,  &
+                                                                  rdzu, &
+                                                                  c1,   &
+                                                                  c2
+
+   REAL ,                                        INTENT(IN   ) :: rdx,  &
+                                                                  rdy
+   INTEGER ,                                     INTENT(IN   ) :: time_step
+
+   ! Local data
+
+   INTEGER :: i, j, k, ktf
+   INTEGER :: i_start, i_end, j_start, j_end
+   INTEGER :: i_start_f, i_end_f, j_start_f, j_end_f
+
+   REAL    :: mrdx, mrdy, ub, vb, uw, vw, vel
+
+   LOGICAL :: degrade_xs, degrade_ys, degrade_xe, degrade_ye
+   LOGICAL :: specified, polar_l
+
+! definition of flux operators, 3rd, 4th, 5th or 6th order (verbatim from advect_w)
+
+   REAL    :: flux3, flux4, flux5
+   REAL    :: q_im3, q_im2, q_im1, q_i, q_ip1, q_ip2, ua
+
+   flux4(q_im2, q_im1, q_i, q_ip1, ua) =                         &
+          ( 7.*(q_i + q_im1) - (q_ip1 + q_im2) )/12.0
+
+   flux3(q_im2, q_im1, q_i, q_ip1, ua) =                         &
+            flux4(q_im2, q_im1, q_i, q_ip1, ua) +                &
+            sign(1,time_step)*sign(1.,ua)*((q_ip1 - q_im2)-3.*(q_i-q_im1))/12.0
+
+   flux5(q_im3, q_im2, q_im1, q_i, q_ip1, q_ip2, ua) =           &
+           ( 37.*(q_i+q_im1) - 8.*(q_ip1+q_im2)                 &
+            +(q_ip2+q_im3) )/60.0                                &
+            -sign(1,time_step)*sign(1.,ua)*(                     &
+              (q_ip2-q_im3)-5.*(q_ip1-q_im2)+10.*(q_i-q_im1) )/60.0
+
+   specified = .false.
+   if (config_flags%specified .or. config_flags%nested) specified = .true.
+   polar_l = config_flags%polar
+
+   CALL advect_fast_ensure_buffers( its, ite, jts, jte, kts, kte )
+
+   ktf = MIN(kte,kde-1)
+
+!  degrade-order boundary flags -- verbatim from advect_w horz_order==5
+
+   degrade_xs = .true.
+   degrade_xe = .true.
+   degrade_ys = .true.
+   degrade_ye = .true.
+
+   IF( config_flags%periodic_x   .or. &
+       config_flags%symmetric_xs .or. &
+       (its > ids+3)                ) degrade_xs = .false.
+   IF( config_flags%periodic_x   .or. &
+       config_flags%symmetric_xe .or. &
+       (ite < ide-3)                ) degrade_xe = .false.
+   IF( config_flags%periodic_y   .or. &
+       config_flags%symmetric_ys .or. &
+       (jts > jds+3)                ) degrade_ys = .false.
+   IF( config_flags%periodic_y   .or. &
+       config_flags%symmetric_ye .or. &
+       (jte < jde-4)                ) degrade_ye = .false.
+
+!--------------- y - advection ------------------------------------------------
+
+   i_start = its
+   i_end   = MIN(ite,ide-1)
+   j_start = jts
+   j_end   = MIN(jte,jde-1)
+
+   j_start_f = j_start
+   j_end_f   = j_end+1
+
+   IF(degrade_ys) then
+     j_start = MAX(jts,jds+1)
+     j_start_f = jds+3
+   ENDIF
+
+   IF(degrade_ye) then
+     j_end = MIN(jte,jde-2)
+     j_end_f = jde-3
+   ENDIF
+
+   IF(config_flags%polar) j_end = MIN(jte,jde-1)
+
+!  y flux -- collapsed over (j,k,i); k spans kts+1..ktf+1 (the extra ktf+1
+!  row is the top-of-atmosphere half-level unique to w, using a different
+!  "vel" expression -- selected here by an inner IF on k rather than a
+!  separate kernel, since the flux ladder itself is otherwise identical).
+
+!$acc parallel loop collapse(3) private(vel) &
+!$acc& present(w,rv,fzm,fzp,fast_fqy3)
+   DO j = j_start, j_end+1
+   DO k = kts+1, ktf+1
+   DO i = i_start, i_end
+      IF ( k <= ktf ) THEN
+         vel = fzm(k)*rv(i,k,j)+fzp(k)*rv(i,k-1,j)
+      ELSE
+         vel = (2.-fzm(k-1))*rv(i,k-1,j)-fzp(k-1)*rv(i,k-2,j)
+      ENDIF
+      IF( (j >= j_start_f ) .and. (j <= j_end_f) ) THEN
+         fast_fqy3( i, k, j ) = vel*flux5(               &
+                 w(i,k,j-3), w(i,k,j-2), w(i,k,j-1),       &
+                 w(i,k,j  ), w(i,k,j+1), w(i,k,j+2),  vel )
+      ELSE IF ( j == jds+1 ) THEN
+         fast_fqy3(i, k, j) = 0.5*vel*(w(i,k,j)+w(i,k,j-1))
+      ELSE IF ( j == jds+2 ) THEN
+         fast_fqy3( i, k, j ) = vel*flux3(      &
+              w(i,k,j-2),w(i,k,j-1),w(i,k,j),w(i,k,j+1),vel )
+      ELSE IF ( j == jde-1 ) THEN
+         fast_fqy3(i, k, j) = 0.5*vel*(w(i,k,j)+w(i,k,j-1))
+      ELSE IF ( j == jde-2 ) THEN
+         fast_fqy3( i, k, j ) = vel*flux3(     &
+              w(i,k,j-2),w(i,k,j-1),w(i,k,j),w(i,k,j+1),vel )
+      ENDIF
+      ! else: unset for this j -- matches advect_w's stale-slot semantics;
+      ! only reachable at j==jde under config_flags%polar, which is never
+      ! read (see the polar j==jde branch below, which reads slot j-1).
+   ENDDO
+   ENDDO
+   ENDDO
+
+!  y flux-divergence into tendency -- collapsed over (j,k,i). The polar
+!  branches only ever ran over k=kts..ktf in the original (not ktf+1); the
+!  normal branch ran over k=kts+1..ktf+1. Both ranges are folded into one
+!  k=kts..ktf+1 loop here, each branch guarded by its own original k range
+!  so out-of-range k is simply a no-op for that branch, exactly as the
+!  narrower original DO loops would have produced.
+
+!$acc parallel loop collapse(3) private(mrdy) &
+!$acc& present(tendency,fast_fqy3,msftx)
+   DO j = j_start, j_end+1
+   DO k = kts, ktf+1
+   DO i = i_start, i_end
+      IF ( polar_l .AND. (j == jds+1) .AND. (k <= ktf) ) THEN
+         mrdy=msftx(i,j-1)*rdy
+         tendency(i,k,j-1) = tendency(i,k,j-1) - mrdy*fast_fqy3(i,k,j)
+      ELSE IF( polar_l .AND. (j == jde) .AND. (k <= ktf) ) THEN
+         mrdy=msftx(i,j-1)*rdy
+         tendency(i,k,j-1) = tendency(i,k,j-1) + mrdy*fast_fqy3(i,k,j-1)
+      ELSE IF ( (.NOT. (polar_l .AND. (j==jds+1 .OR. j==jde))) .AND. &
+                (j > j_start) .AND. (k >= kts+1) .AND. (k <= ktf+1) ) THEN
+         mrdy=msftx(i,j-1)*rdy
+         tendency(i,k,j-1) = tendency(i,k,j-1) - mrdy*(fast_fqy3(i,k,j)-fast_fqy3(i,k,j-1))
+      ENDIF
+   ENDDO
+   ENDDO
+   ENDDO
+
+!--------------- x - flux divergence -------------------------------------------
+
+   i_start = its
+   i_end   = MIN(ite,ide-1)
+
+   j_start = jts
+   j_end   = MIN(jte,jde-1)
+
+   i_start_f = i_start
+   i_end_f   = i_end+1
+
+   IF(degrade_xs) then
+     i_start = MAX(ids+1,its)
+     i_start_f = MIN(i_start+2,ids+3)
+   ENDIF
+
+   IF(degrade_xe) then
+     i_end = MIN(ide-2,ite)
+     i_end_f = ide-3
+   ENDIF
+
+!$acc parallel loop collapse(3) private(vel) &
+!$acc& present(w,ru,fzm,fzp,fast_fqx3)
+   DO j = j_start, j_end
+   DO k = kts+1, ktf+1
+   DO i = i_start_f, i_end_f
+      IF ( k <= ktf ) THEN
+         vel = fzm(k)*ru(i,k,j)+fzp(k)*ru(i,k-1,j)
+      ELSE
+         vel = (2.-fzm(k-1))*ru(i,k-1,j)-fzp(k-1)*ru(i,k-2,j)
+      ENDIF
+      fast_fqx3( i,k,j ) = vel*flux5( w(i-3,k,j), w(i-2,k,j),  &
+                                     w(i-1,k,j), w(i  ,k,j),  &
+                                     w(i+1,k,j), w(i+2,k,j),  &
+                                     vel                     )
+   ENDDO
+   ENDDO
+   ENDDO
+
+!  lower-order fixups close to boundaries -- small (i,j,k) kernels covering
+!  the (at most two) fixed i columns i_start..i_start_f-1 / i_end_f+1..i_end+1
+
+   IF( degrade_xs ) THEN
+!$acc parallel loop collapse(3) private(vel) &
+!$acc& present(w,ru,fzm,fzp,fast_fqx3)
+      DO j = j_start, j_end
+      DO k = kts+1, ktf+1
+      DO i = i_start, i_start_f-1
+         IF ( k <= ktf ) THEN
+            vel = fzm(k)*ru(i,k,j)+fzp(k)*ru(i,k-1,j)
+         ELSE
+            vel = (2.-fzm(k-1))*ru(i,k-1,j)-fzp(k-1)*ru(i,k-2,j)
+         ENDIF
+         IF(i == ids+1) THEN
+            fast_fqx3(i,k,j) = 0.5*vel*(w(i,k,j)+w(i-1,k,j))
+         ELSE IF(i == ids+2) THEN
+            fast_fqx3( i,k,j ) = vel*flux3( w(i-2,k,j), w(i-1,k,j),  &
+                                    w(i  ,k,j), w(i+1,k,j),  &
+                                    vel                     )
+         ENDIF
+      ENDDO
+      ENDDO
+      ENDDO
+   ENDIF
+
+   IF( degrade_xe ) THEN
+!$acc parallel loop collapse(3) private(vel) &
+!$acc& present(w,ru,fzm,fzp,fast_fqx3)
+      DO j = j_start, j_end
+      DO k = kts+1, ktf+1
+      DO i = i_end_f+1, i_end+1
+         IF ( k <= ktf ) THEN
+            vel = fzm(k)*ru(i,k,j)+fzp(k)*ru(i,k-1,j)
+         ELSE
+            vel = (2.-fzm(k-1))*ru(i,k-1,j)-fzp(k-1)*ru(i,k-2,j)
+         ENDIF
+         IF( i == ide-1 ) THEN
+            fast_fqx3(i,k,j) = 0.5*vel*(w(i,k,j)+w(i-1,k,j))
+         ELSE IF( i == ide-2 ) THEN
+            fast_fqx3( i,k,j ) = vel*flux3( w(i-2,k,j), w(i-1,k,j),  &
+                                    w(i  ,k,j), w(i+1,k,j),  &
+                                    vel                     )
+         ENDIF
+      ENDDO
+      ENDDO
+      ENDDO
+   ENDIF
+
+!  x flux-divergence into tendency
+
+!$acc parallel loop collapse(3) private(mrdx) &
+!$acc& present(tendency,fast_fqx3,msftx)
+   DO j = j_start, j_end
+   DO k = kts+1, ktf+1
+   DO i = i_start, i_end
+      mrdx=msftx(i,j)*rdx
+      tendency(i,k,j) = tendency(i,k,j) - mrdx*(fast_fqx3(i+1,k,j)-fast_fqx3(i,k,j))
+   ENDDO
+   ENDDO
+   ENDDO
+
+!  radiative lateral BC (open_xs/xe/ys/ye) -- inactive for specified BCs
+!  (Hong Kong case), kept for fidelity; small kernels even when active.
+!  k spans kts+1..ktf+1 the same way as the flux kernels above (extra
+!  top-of-atmosphere half-level for w).
+
+   i_start = its
+   i_end   = MIN(ite,ide-1)
+   j_start = jts
+   j_end   = MIN(jte,jde-1)
+
+   IF( (config_flags%open_xs) .and. (its == ids)) THEN
+!$acc parallel loop collapse(2) private(uw,ub) present(w,w_old,ru,fzm,fzp,tendency)
+      DO j = j_start, j_end
+      DO k = kts+1, ktf+1
+         IF ( k <= ktf ) THEN
+            uw = 0.5*(fzm(k)*(ru(its,k  ,j)+ru(its+1,k  ,j)) +  &
+                      fzp(k)*(ru(its,k-1,j)+ru(its+1,k-1,j))   )
+            ub = MIN( uw, 0. )
+            tendency(its,k,j) = tendency(its,k,j)                     &
+                  - rdx*(                                             &
+                          ub*(w_old(its+1,k,j) - w_old(its,k,j)) +    &
+                          w(its,k,j)*(                                &
+                          fzm(k)*(ru(its+1,k  ,j)-ru(its,k  ,j))+     &
+                          fzp(k)*(ru(its+1,k-1,j)-ru(its,k-1,j)))     &
+                                                                     )
+         ELSE
+            uw = 0.5*( (2.-fzm(k-1))*(ru(its,k-1,j)+ru(its+1,k-1,j))   &
+                      -fzp(k-1)*(ru(its,k-2,j)+ru(its+1,k-2,j))   )
+            ub = MIN( uw, 0. )
+            tendency(its,k,j) = tendency(its,k,j)                     &
+                  - rdx*(                                             &
+                          ub*(w_old(its+1,k,j) - w_old(its,k,j)) +    &
+                          w(its,k,j)*(                                &
+                                (2.-fzm(k-1))*(ru(its+1,k-1,j)-ru(its,k-1,j))-  &
+                                fzp(k-1)*(ru(its+1,k-2,j)-ru(its,k-2,j)))  &
+                                                                     )
+         ENDIF
+      ENDDO
+      ENDDO
+   ENDIF
+
+   IF( (config_flags%open_xe) .and. (ite == ide)) THEN
+!$acc parallel loop collapse(2) private(uw,ub) present(w,w_old,ru,fzm,fzp,tendency)
+      DO j = j_start, j_end
+      DO k = kts+1, ktf+1
+         IF ( k <= ktf ) THEN
+            uw = 0.5*(fzm(k)*(ru(ite-1,k  ,j)+ru(ite,k  ,j)) +  &
+                      fzp(k)*(ru(ite-1,k-1,j)+ru(ite,k-1,j))   )
+            ub = MAX( uw, 0. )
+            tendency(i_end,k,j) = tendency(i_end,k,j)                     &
+                  - rdx*(                                                 &
+                          ub*(w_old(i_end,k,j) - w_old(i_end-1,k,j)) +    &
+                          w(i_end,k,j)*(                                  &
+                               fzm(k)*(ru(ite,k  ,j)-ru(ite-1,k  ,j)) +   &
+                               fzp(k)*(ru(ite,k-1,j)-ru(ite-1,k-1,j)))    &
+                                                                       )
+         ELSE
+            uw = 0.5*( (2.-fzm(k-1))*(ru(ite-1,k-1,j)+ru(ite,k-1,j))    &
+                      -fzp(k-1)*(ru(ite-1,k-2,j)+ru(ite,k-2,j))   )
+            ub = MAX( uw, 0. )
+            tendency(i_end,k,j) = tendency(i_end,k,j)                     &
+                  - rdx*(                                                 &
+                          ub*(w_old(i_end,k,j) - w_old(i_end-1,k,j)) +    &
+                          w(i_end,k,j)*(                                  &
+                                  (2.-fzm(k-1))*(ru(ite,k-1,j)-ru(ite-1,k-1,j)) -   &
+                                  fzp(k-1)*(ru(ite,k-2,j)-ru(ite-1,k-2,j)))    &
+                                                                       )
+         ENDIF
+      ENDDO
+      ENDDO
+   ENDIF
+
+   IF( (config_flags%open_ys) .and. (jts == jds)) THEN
+!$acc parallel loop collapse(2) private(vw,vb) present(w,w_old,rv,fzm,fzp,tendency)
+      DO i = i_start, i_end
+      DO k = kts+1, ktf+1
+         IF ( k <= ktf ) THEN
+            vw = 0.5*( fzm(k)*(rv(i,k  ,jts)+rv(i,k  ,jts+1)) +  &
+                       fzp(k)*(rv(i,k-1,jts)+rv(i,k-1,jts+1))   )
+            vb = MIN( vw, 0. )
+            tendency(i,k,jts) = tendency(i,k,jts)                     &
+                  - rdy*(                                             &
+                          vb*(w_old(i,k,jts+1) - w_old(i,k,jts)) +    &
+                          w(i,k,jts)*(                                &
+                          fzm(k)*(rv(i,k  ,jts+1)-rv(i,k  ,jts))+     &
+                          fzp(k)*(rv(i,k-1,jts+1)-rv(i,k-1,jts)))     &
+                                                                   )
+         ELSE
+            vw = 0.5*( (2.-fzm(k-1))*(rv(i,k-1,jts)+rv(i,k-1,jts+1))    &
+                      -fzp(k-1)*(rv(i,k-2,jts)+rv(i,k-2,jts+1))   )
+            vb = MIN( vw, 0. )
+            tendency(i,k,jts) = tendency(i,k,jts)                     &
+                  - rdy*(                                             &
+                          vb*(w_old(i,k,jts+1) - w_old(i,k,jts)) +    &
+                          w(i,k,jts)*(                                &
+                             (2.-fzm(k-1))*(rv(i,k-1,jts+1)-rv(i,k-1,jts))-     &
+                             fzp(k-1)*(rv(i,k-2,jts+1)-rv(i,k-2,jts)))     &
+                                                                   )
+         ENDIF
+      ENDDO
+      ENDDO
+   ENDIF
+
+   IF( (config_flags%open_ye) .and. (jte == jde) ) THEN
+!$acc parallel loop collapse(2) private(vw,vb) present(w,w_old,rv,fzm,fzp,tendency)
+      DO i = i_start, i_end
+      DO k = kts+1, ktf+1
+         IF ( k <= ktf ) THEN
+            vw = 0.5*( fzm(k)*(rv(i,k  ,jte-1)+rv(i,k  ,jte)) +  &
+                       fzp(k)*(rv(i,k-1,jte-1)+rv(i,k-1,jte))   )
+            vb = MAX( vw, 0. )
+            tendency(i,k,j_end) = tendency(i,k,j_end)                     &
+                  - rdy*(                                                 &
+                          vb*(w_old(i,k,j_end) - w_old(i,k,j_end-1)) +    &
+                          w(i,k,j_end)*(                                  &
+                               fzm(k)*(rv(i,k  ,jte)-rv(i,k  ,jte-1))+    &
+                               fzp(k)*(rv(i,k-1,jte)-rv(i,k-1,jte-1)))    &
+                                                                       )
+         ELSE
+            vw = 0.5*( (2.-fzm(k-1))*(rv(i,k-1,jte-1)+rv(i,k-1,jte))    &
+                      -fzp(k-1)*(rv(i,k-2,jte-1)+rv(i,k-2,jte))   )
+            vb = MAX( vw, 0. )
+            tendency(i,k,j_end) = tendency(i,k,j_end)                     &
+                  - rdy*(                                                 &
+                          vb*(w_old(i,k,j_end) - w_old(i,k,j_end-1)) +    &
+                          w(i,k,j_end)*(                                  &
+                                  (2.-fzm(k-1))*(rv(i,k-1,jte)-rv(i,k-1,jte-1))-    &
+                                  fzp(k-1)*(rv(i,k-2,jte)-rv(i,k-2,jte-1)))    &
+                                                                       )
+         ENDIF
+      ENDDO
+      ENDDO
+   ENDIF
+
+!-------------------- vertical advection (vert_order==3) -----------------------
+
+   i_start = its
+   i_end   = MIN(ite,ide-1)
+   j_start = jts
+   j_end   = MIN(jte,jde-1)
+
+!$acc parallel loop collapse(2) present(fast_vflux3)
+   DO j = j_start, j_end
+   DO i = i_start, i_end
+      fast_vflux3(i,kts,j) = 0.
+      fast_vflux3(i,kte,j) = 0.
+   ENDDO
+   ENDDO
+
+!$acc parallel loop collapse(3) private(vel) present(w,rom,fast_vflux3)
+   DO j = j_start, j_end
+   DO k = kts+2, ktf
+   DO i = i_start, i_end
+      vel=0.5*(rom(i,k,j)+rom(i,k-1,j))
+      fast_vflux3(i,k,j) = vel*flux3(               &
+              w(i,k-2,j), w(i,k-1,j),       &
+              w(i,k  ,j), w(i,k+1,j),  -vel )
+   ENDDO
+   ENDDO
+   ENDDO
+
+!$acc parallel loop collapse(2) present(w,rom,fast_vflux3)
+   DO j = j_start, j_end
+   DO i = i_start, i_end
+      fast_vflux3(i,kts+1,j)=0.25*(rom(i,kts+1,j)+rom(i,kts+1-1,j))*(w(i,kts+1,j)+w(i,kts+1-1,j))
+      fast_vflux3(i,ktf+1,j)=0.25*(rom(i,ktf+1,j)+rom(i,ktf+1-1,j))*(w(i,ktf+1,j)+w(i,ktf+1-1,j))
+   ENDDO
+   ENDDO
+
+!$acc parallel loop collapse(3) present(tendency,fast_vflux3,rdzu)
+   DO j = j_start, j_end
+   DO k = kts+1, ktf
+   DO i = i_start, i_end
+      tendency(i,k,j)=tendency(i,k,j)-rdzu(k)*(fast_vflux3(i,k+1,j)-fast_vflux3(i,k,j))
+   ENDDO
+   ENDDO
+   ENDDO
+
+!  pick up flux contribution for w at the lid, wcs. 13 march 2004
+
+!$acc parallel loop collapse(2) present(tendency,fast_vflux3,rdzu)
+   DO j = j_start, j_end
+   DO i = i_start, i_end
+      tendency(i,ktf+1,j)=tendency(i,ktf+1,j)+2.*rdzu(ktf)*(fast_vflux3(i,ktf+1,j))
+   ENDDO
+   ENDDO
+
+END SUBROUTINE advect_w_o5v3
+#endif
 
 !----------------------------------------------------------------
 
