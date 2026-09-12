@@ -1163,7 +1163,10 @@ BENCH_START(small_step_prep_tim)
 !$acc update device(grid%al,grid%p,grid%ph_2,pm1)
 #else
 #ifdef WRF_GPU_DYN
-!$acc update self(grid%al,grid%p,grid%ph_2,pm1)
+!  pm1 is calc_p_rho's own device-resident scratch (divergence-damping
+!  reference pressure) -- never read or written by any host code, so it
+!  never needs to leave the device here.
+!$acc update self(grid%al,grid%p,grid%ph_2)
 #endif
 #endif
 
@@ -1501,13 +1504,19 @@ BENCH_END(spec_bdy_uv_tim)
 
 BENCH_START(advance_mu_t_tim)
 #ifdef WRF_GPU_DYN
-!  advance_uv and its halo exchange execute on the host.  Refresh only the
-!  fields they change, then retain advance_mu_t outputs for advance_w.
+!  advance_uv_fast runs entirely on the device; only the host-only
+!  spec_bdyupdate calls and HALO_EM_C.inc in between touch anything, and
+!  both only touch u_2/v_2 (see the update self just above this block).
+!  Every other array in this list (ww, u_save, v_save, mu_2, mut, muave,
+!  muts, muu, muv, mudf, ru_m, rv_m, ww_m, t_2, t_save, t_2save, t_tend,
+!  mu_tend) is untouched by host code here, so re-pushing it is a pure
+!  redundant transfer of data the device already has correctly -- this was
+!  previously the single largest data-movement cost in the acoustic loop
+!  (~700ms of the ~2.9s total per NVCOMPILER_ACC_TIME profiling on a
+!  2-minute run) and none of it was necessary.
            IF ( ntasks .GT. 1 .or. config_flags%periodic_y .or. config_flags%polar .or. &
                 config_flags%specified .or. config_flags%nested ) THEN
-!$acc update device(grid%ww,ww1,grid%u_2,grid%u_save,grid%v_2,grid%v_save, &
-!$acc& grid%mu_2,grid%mut,muave,grid%muts,grid%muu,grid%muv,grid%mudf, &
-!$acc& grid%ru_m,grid%rv_m,grid%ww_m,grid%t_2,grid%t_save,t_2save,t_tend,mu_tend)
+!$acc update device(grid%u_2,grid%v_2)
            END IF
 #endif
 #ifdef WRF_GPU_DYN
@@ -1704,8 +1713,11 @@ BENCH_START(advance_w_tim)
 #else
 #ifdef WRF_GPU_DYN
 !  sumflux, boundary handling, and the next host acoustic step consume these.
+!  t_2save is a pure inter-kernel device scratch between advance_mu_t_fast
+!  and advance_w_fast (never read/written by any host code), so it never
+!  needs to leave the device.
            IF ( config_flags%polar .or. config_flags%specified .or. config_flags%nested ) THEN
-!$acc update self(grid%w_2,grid%ww,t_2save,grid%ph_2)
+!$acc update self(grid%w_2,grid%ww,grid%ph_2)
            ELSE
 !$acc update self(grid%ww)
            END IF
@@ -1822,8 +1834,12 @@ BENCH_END(spec_bdynhyd_tim)
 
 BENCH_START(cald_p_rho_tim)
 #ifdef WRF_GPU_DYN
+!  Only ph_2 was written by host code since the last push of t_2/mu_2/muts
+!  (spec_bdyupdate_ph writes ph_2 only; muts is a read-only input to it) --
+!  advance_w_fast/calc_p_rho both take mu1/muts/t_2 as INTENT(IN), so their
+!  device-side values are still current and re-pushing them is redundant.
          IF ( config_flags%polar .or. config_flags%specified .or. config_flags%nested ) THEN
-!$acc update device(grid%ph_2,grid%t_2,grid%mu_2,grid%muts)
+!$acc update device(grid%ph_2)
          END IF
 #endif
          CALL calc_p_rho( grid%al, grid%p, grid%ph_2,                 &
@@ -1845,7 +1861,10 @@ BENCH_START(cald_p_rho_tim)
 !$acc update device(grid%al,grid%p,grid%ph_2,pm1)
 #else
 #ifdef WRF_GPU_DYN
-!$acc update self(grid%al,grid%p,grid%ph_2,pm1)
+!  pm1 is calc_p_rho's own device-resident scratch (divergence-damping
+!  reference pressure) -- never read or written by any host code, so it
+!  never needs to leave the device here.
+!$acc update self(grid%al,grid%p,grid%ph_2)
 #endif
 #endif
 BENCH_END(cald_p_rho_tim)
@@ -1955,10 +1974,12 @@ BENCH_END(phys_bc_tim)
 
 #ifdef WRF_GPU_DYN
 !  calc_mu_uv_1 and small_step_finish below are host routines that read and
-!  write mu_2/muts/t_2/mudf/ph_2.  Nothing between here and the end of the
+!  write mu_2/muts/t_2/ph_2.  Nothing between here and the end of the
 !  acoustic loop pulled the GPU-computed values back to the host, so fetch
 !  them now instead of letting the host routines run on stale pre-loop data.
-!$acc update self(grid%mu_2,grid%muts,grid%t_2,grid%mudf,grid%ph_2)
+!  mudf is NOT an argument to either call (verified) -- it's still correctly
+!  re-fetched on its own right before its actual consumer, below.
+!$acc update self(grid%mu_2,grid%muts,grid%t_2,grid%ph_2)
 #endif
 
      !$OMP PARALLEL DO   &
