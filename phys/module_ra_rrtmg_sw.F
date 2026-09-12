@@ -5214,6 +5214,1556 @@
 
       end module rrtmg_sw_taumol
 
+#ifdef WRF_GPU_RAD
+!-------------------------------------------------------------------------------
+!  GPU (OpenACC) port of taumol_sw, RRTMG-SW's per-column, per-band gaseous
+!  optical depth / Rayleigh scattering / TOA solar-flux calculation -- see
+!  plan.md "GPU Port: RRTMG Radiation" and the LW taugb1_gpu header comment
+!  (module_ra_rrtmg_lw.F) for the general restructuring rationale.  The
+!  original CPU taumol_sw and its 14 CONTAINS-nested taumol16..taumol29
+!  above are untouched.
+!
+!  taumol16..taumol29 are internal (CONTAINS-nested) subroutines of
+!  taumol_sw and reach nlayers/laytrop/jp/jt/jt1/colh2o/.../taug/taur/
+!  sfluxzen purely through Fortran host association -- exactly the pattern
+!  flagged in plan.md as the single largest mechanical cost of this port.
+!  Each is hoisted here to a module-scope taugbNN_gpu subroutine (NN =
+!  16..29) with an explicit argument list, ncol-major arrays, and a
+!  collapse(2) parallel loop over (column, layer) with a per-cell
+!  lay<=laytrop(iplon) branch replacing the original's separate
+!  "do lay=1,laytrop" / "do lay=laytrop+1,nlayers" loops -- the same
+!  restructuring already used throughout the LW taugbN_gpu port. All
+!  band-specific reference-table index arithmetic (the "+1", "+9", "+10",
+!  "+5", "+6" literal offsets baked into each band's ind0/ind1 formulas,
+!  which encode that band's nspa/nspb key-species combination count) is
+!  transcribed verbatim from the original, not recomputed generically.
+!
+!  sfluxzen (the column's TOA solar source function for each g-point) is
+!  the one piece of genuinely tricky control flow: each band writes it
+!  only from one specific "reference" layer (nearest a fixed pressure
+!  threshold, layreffr), found in the original via a running variable
+!  (laysolfr) updated inside the main lay-loop. This is NOT a sequential
+!  recurrence in the numerical sense -- the update test at each layer only
+!  reads that layer's and one neighbor's already-known jp() value, so
+!  which layer is "the" reference layer can be determined independently of
+!  the lay-loop restructuring. Across all 14 bands there are exactly two
+!  shapes of this search (grep-verified): search the upper-atmosphere
+!  layers for the first crossing where jp(lay-1) < layreffr <=  jp(lay),
+!  defaulting to nlayers if none is found (bands 16, 17, 27, 28, 29); or
+!  search the lower-atmosphere layers for the same crossing (using
+!  jp(lay) < layreffr <= jp(lay+1)), defaulting to laytrop if none is
+!  found (bands 18-25). Band 26 has no absorbing gas at all and always
+!  reports sfluxzen from the fixed layer laytrop, no search needed. The
+!  two shared search patterns are hoisted once each (laysolfr_upper_gpu,
+!  laysolfr_lower_gpu below) as tiny per-column kernels (a parallel loop
+!  over columns, a cheap sequential scan over the ~65-79 layers inside),
+!  called once per band from taumol_sw_driver_gpu before that band's main
+!  kernel, exactly mirroring the laytrop_gpu precomputation pattern
+!  already used by the LW and SW setcoef ports.
+!-------------------------------------------------------------------------------
+      MODULE rrtmg_sw_taumol_gpu
+
+      CONTAINS
+
+      SUBROUTINE laysolfr_upper_gpu(ncol, nlayers, laytrop, jp, layreffr, laysolfr)
+
+      use parkind, only : im => kind_im
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, layreffr
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol)
+      INTEGER(kind=im), INTENT(IN) :: jp(ncol,nlayers)
+      INTEGER(kind=im), INTENT(OUT) :: laysolfr(ncol)
+
+      INTEGER(kind=im) :: iplon, lay
+
+!$acc parallel loop present(laytrop, jp, laysolfr)
+      DO iplon = 1, ncol
+         laysolfr(iplon) = nlayers
+!$acc loop seq
+         DO lay = laytrop(iplon)+1, nlayers
+            IF (jp(iplon,lay-1) .lt. layreffr .and. jp(iplon,lay) .ge. layreffr) THEN
+               laysolfr(iplon) = lay
+            ENDIF
+         ENDDO
+      ENDDO
+
+      END SUBROUTINE laysolfr_upper_gpu
+
+      SUBROUTINE laysolfr_lower_gpu(ncol, nlayers, laytrop, jp, layreffr, laysolfr)
+
+      use parkind, only : im => kind_im
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, layreffr
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol)
+      INTEGER(kind=im), INTENT(IN) :: jp(ncol,nlayers)
+      INTEGER(kind=im), INTENT(OUT) :: laysolfr(ncol)
+
+      INTEGER(kind=im) :: iplon, lay
+
+!$acc parallel loop present(laytrop, jp, laysolfr)
+      DO iplon = 1, ncol
+         laysolfr(iplon) = laytrop(iplon)
+!$acc loop seq
+         DO lay = 1, laytrop(iplon)
+            IF (jp(iplon,lay) .lt. layreffr .and. jp(iplon,lay+1) .ge. layreffr) THEN
+               laysolfr(iplon) = min(lay+1, laytrop(iplon))
+            ENDIF
+         ENDDO
+      ENDDO
+
+      END SUBROUTINE laysolfr_lower_gpu
+
+!----------------------------------------------------------------------------
+!     band 16:  2600-3250 cm-1 (low - h2o,ch4; high - ch4)
+!----------------------------------------------------------------------------
+      SUBROUTINE taugb16_gpu(ncol, nlayers, laytrop, jp, jt, jt1, laysolfr, &
+                              colh2o, colch4, colmol, &
+                              selffac, selffrac, indself, forfac, forfrac, indfor, &
+                              fac00, fac01, fac10, fac11, &
+                              sfluxzen, taug, taur)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrsw, only : ng16
+      use rrsw_con, only : oneminus
+      use rrsw_wvn, only : nspa, nspb
+      use rrsw_kg16, only : absa, absb, forref, selfref, sfluxref, rayl, strrat1
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol), laysolfr(ncol)
+      INTEGER(kind=im), INTENT(IN) :: jp(ncol,nlayers), jt(ncol,nlayers), jt1(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: colh2o(ncol,nlayers), colch4(ncol,nlayers), colmol(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: selffac(ncol,nlayers), selffrac(ncol,nlayers)
+      INTEGER(kind=im), INTENT(IN) :: indself(ncol,nlayers), indfor(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: forfac(ncol,nlayers), forfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                    fac10(ncol,nlayers), fac11(ncol,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: sfluxzen(ncol,*)
+      REAL(kind=rb), INTENT(INOUT) :: taug(ncol,nlayers,*), taur(ncol,nlayers,*)
+
+      INTEGER(kind=im) :: iplon, lay, ig, ind0, ind1, inds, indf, js
+      REAL(kind=rb) :: fac000, fac001, fac010, fac011, fac100, fac101, &
+                        fac110, fac111, fs, speccomb, specmult, specparm, tauray
+
+!$acc parallel loop collapse(2) &
+!$acc   private(fac000,fac001,fac010,fac011,fac100,fac101,fac110,fac111) &
+!$acc   private(fs,speccomb,specmult,specparm,tauray,ind0,ind1,inds,indf,js) &
+!$acc   present(laytrop,laysolfr,jp,jt,jt1,colh2o,colch4,colmol) &
+!$acc   present(selffac,selffrac,indself,forfac,forfrac,indfor) &
+!$acc   present(fac00,fac01,fac10,fac11,sfluxzen,taug,taur) &
+!$acc   present(absa,absb,forref,selfref,sfluxref,nspa,nspb)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+
+         IF (lay .le. laytrop(iplon)) THEN
+            speccomb = colh2o(iplon,lay) + strrat1*colch4(iplon,lay)
+            specparm = colh2o(iplon,lay)/speccomb
+            IF (specparm .ge. oneminus) specparm = oneminus
+            specmult = 8._rb*specparm
+            js = 1 + int(specmult)
+            fs = mod(specmult, 1._rb)
+            fac000 = (1._rb - fs) * fac00(iplon,lay)
+            fac010 = (1._rb - fs) * fac10(iplon,lay)
+            fac100 = fs * fac00(iplon,lay)
+            fac110 = fs * fac10(iplon,lay)
+            fac001 = (1._rb - fs) * fac01(iplon,lay)
+            fac011 = (1._rb - fs) * fac11(iplon,lay)
+            fac101 = fs * fac01(iplon,lay)
+            fac111 = fs * fac11(iplon,lay)
+            ind0 = ((jp(iplon,lay)-1)*5+(jt(iplon,lay)-1))*nspa(16) + js
+            ind1 = (jp(iplon,lay)*5+(jt1(iplon,lay)-1))*nspa(16) + js
+            inds = indself(iplon,lay)
+            indf = indfor(iplon,lay)
+            tauray = colmol(iplon,lay) * rayl
+
+            DO ig = 1, ng16
+               taug(iplon,lay,ig) = speccomb * &
+                   (fac000 * absa(ind0   ,ig) + &
+                    fac100 * absa(ind0 +1,ig) + &
+                    fac010 * absa(ind0 +9,ig) + &
+                    fac110 * absa(ind0+10,ig) + &
+                    fac001 * absa(ind1   ,ig) + &
+                    fac101 * absa(ind1 +1,ig) + &
+                    fac011 * absa(ind1 +9,ig) + &
+                    fac111 * absa(ind1+10,ig)) + &
+                    colh2o(iplon,lay) * &
+                    (selffac(iplon,lay) * (selfref(inds,ig) + &
+                    selffrac(iplon,lay) * &
+                    (selfref(inds+1,ig) - selfref(inds,ig))) + &
+                    forfac(iplon,lay) * (forref(indf,ig) + &
+                    forfrac(iplon,lay) * &
+                    (forref(indf+1,ig) - forref(indf,ig))))
+               taur(iplon,lay,ig) = tauray
+            ENDDO
+         ELSE
+            ind0 = ((jp(iplon,lay)-13)*5+(jt(iplon,lay)-1))*nspb(16) + 1
+            ind1 = ((jp(iplon,lay)-12)*5+(jt1(iplon,lay)-1))*nspb(16) + 1
+            tauray = colmol(iplon,lay) * rayl
+
+            DO ig = 1, ng16
+               taug(iplon,lay,ig) = colch4(iplon,lay) * &
+                   (fac00(iplon,lay) * absb(ind0  ,ig) + &
+                    fac10(iplon,lay) * absb(ind0+1,ig) + &
+                    fac01(iplon,lay) * absb(ind1  ,ig) + &
+                    fac11(iplon,lay) * absb(ind1+1,ig))
+               IF (lay .eq. laysolfr(iplon)) sfluxzen(iplon,ig) = sfluxref(ig)
+               taur(iplon,lay,ig) = tauray
+            ENDDO
+         ENDIF
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE taugb16_gpu
+
+!----------------------------------------------------------------------------
+!     band 17:  3250-4000 cm-1 (low - h2o,co2; high - h2o,co2)
+!----------------------------------------------------------------------------
+      SUBROUTINE taugb17_gpu(ncol, nlayers, laytrop, jp, jt, jt1, laysolfr, &
+                              colh2o, colco2, colmol, &
+                              selffac, selffrac, indself, forfac, forfrac, indfor, &
+                              fac00, fac01, fac10, fac11, &
+                              sfluxzen, taug, taur)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrsw, only : ng17, ngs16
+      use rrsw_con, only : oneminus
+      use rrsw_wvn, only : nspa, nspb
+      use rrsw_kg17, only : absa, absb, forref, selfref, sfluxref, rayl, strrat
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol), laysolfr(ncol)
+      INTEGER(kind=im), INTENT(IN) :: jp(ncol,nlayers), jt(ncol,nlayers), jt1(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: colh2o(ncol,nlayers), colco2(ncol,nlayers), colmol(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: selffac(ncol,nlayers), selffrac(ncol,nlayers)
+      INTEGER(kind=im), INTENT(IN) :: indself(ncol,nlayers), indfor(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: forfac(ncol,nlayers), forfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                    fac10(ncol,nlayers), fac11(ncol,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: sfluxzen(ncol,*)
+      REAL(kind=rb), INTENT(INOUT) :: taug(ncol,nlayers,*), taur(ncol,nlayers,*)
+
+      INTEGER(kind=im) :: iplon, lay, ig, ind0, ind1, inds, indf, js
+      REAL(kind=rb) :: fac000, fac001, fac010, fac011, fac100, fac101, &
+                        fac110, fac111, fs, speccomb, specmult, specparm, tauray
+
+!$acc parallel loop collapse(2) &
+!$acc   private(fac000,fac001,fac010,fac011,fac100,fac101,fac110,fac111) &
+!$acc   private(fs,speccomb,specmult,specparm,tauray,ind0,ind1,inds,indf,js) &
+!$acc   present(laytrop,laysolfr,jp,jt,jt1,colh2o,colco2,colmol) &
+!$acc   present(selffac,selffrac,indself,forfac,forfrac,indfor) &
+!$acc   present(fac00,fac01,fac10,fac11,sfluxzen,taug,taur) &
+!$acc   present(absa,absb,forref,selfref,sfluxref,nspa,nspb)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+
+         IF (lay .le. laytrop(iplon)) THEN
+            speccomb = colh2o(iplon,lay) + strrat*colco2(iplon,lay)
+            specparm = colh2o(iplon,lay)/speccomb
+            IF (specparm .ge. oneminus) specparm = oneminus
+            specmult = 8._rb*specparm
+            js = 1 + int(specmult)
+            fs = mod(specmult, 1._rb)
+            fac000 = (1._rb - fs) * fac00(iplon,lay)
+            fac010 = (1._rb - fs) * fac10(iplon,lay)
+            fac100 = fs * fac00(iplon,lay)
+            fac110 = fs * fac10(iplon,lay)
+            fac001 = (1._rb - fs) * fac01(iplon,lay)
+            fac011 = (1._rb - fs) * fac11(iplon,lay)
+            fac101 = fs * fac01(iplon,lay)
+            fac111 = fs * fac11(iplon,lay)
+            ind0 = ((jp(iplon,lay)-1)*5+(jt(iplon,lay)-1))*nspa(17) + js
+            ind1 = (jp(iplon,lay)*5+(jt1(iplon,lay)-1))*nspa(17) + js
+            inds = indself(iplon,lay)
+            indf = indfor(iplon,lay)
+            tauray = colmol(iplon,lay) * rayl
+
+            DO ig = 1, ng17
+               taug(iplon,lay,ngs16+ig) = speccomb * &
+                   (fac000 * absa(ind0,ig) + &
+                    fac100 * absa(ind0+1,ig) + &
+                    fac010 * absa(ind0+9,ig) + &
+                    fac110 * absa(ind0+10,ig) + &
+                    fac001 * absa(ind1,ig) + &
+                    fac101 * absa(ind1+1,ig) + &
+                    fac011 * absa(ind1+9,ig) + &
+                    fac111 * absa(ind1+10,ig)) + &
+                    colh2o(iplon,lay) * &
+                    (selffac(iplon,lay) * (selfref(inds,ig) + &
+                    selffrac(iplon,lay) * &
+                    (selfref(inds+1,ig) - selfref(inds,ig))) + &
+                    forfac(iplon,lay) * (forref(indf,ig) + &
+                    forfrac(iplon,lay) * &
+                    (forref(indf+1,ig) - forref(indf,ig))))
+               taur(iplon,lay,ngs16+ig) = tauray
+            ENDDO
+         ELSE
+            speccomb = colh2o(iplon,lay) + strrat*colco2(iplon,lay)
+            specparm = colh2o(iplon,lay)/speccomb
+            IF (specparm .ge. oneminus) specparm = oneminus
+            specmult = 4._rb*specparm
+            js = 1 + int(specmult)
+            fs = mod(specmult, 1._rb)
+            fac000 = (1._rb - fs) * fac00(iplon,lay)
+            fac010 = (1._rb - fs) * fac10(iplon,lay)
+            fac100 = fs * fac00(iplon,lay)
+            fac110 = fs * fac10(iplon,lay)
+            fac001 = (1._rb - fs) * fac01(iplon,lay)
+            fac011 = (1._rb - fs) * fac11(iplon,lay)
+            fac101 = fs * fac01(iplon,lay)
+            fac111 = fs * fac11(iplon,lay)
+            ind0 = ((jp(iplon,lay)-13)*5+(jt(iplon,lay)-1))*nspb(17) + js
+            ind1 = ((jp(iplon,lay)-12)*5+(jt1(iplon,lay)-1))*nspb(17) + js
+            indf = indfor(iplon,lay)
+            tauray = colmol(iplon,lay) * rayl
+
+            DO ig = 1, ng17
+               taug(iplon,lay,ngs16+ig) = speccomb * &
+                   (fac000 * absb(ind0,ig) + &
+                    fac100 * absb(ind0+1,ig) + &
+                    fac010 * absb(ind0+5,ig) + &
+                    fac110 * absb(ind0+6,ig) + &
+                    fac001 * absb(ind1,ig) + &
+                    fac101 * absb(ind1+1,ig) + &
+                    fac011 * absb(ind1+5,ig) + &
+                    fac111 * absb(ind1+6,ig)) + &
+                    colh2o(iplon,lay) * &
+                    forfac(iplon,lay) * (forref(indf,ig) + &
+                    forfrac(iplon,lay) * &
+                    (forref(indf+1,ig) - forref(indf,ig)))
+               IF (lay .eq. laysolfr(iplon)) sfluxzen(iplon,ngs16+ig) = sfluxref(ig,js) &
+                  + fs * (sfluxref(ig,js+1) - sfluxref(ig,js))
+               taur(iplon,lay,ngs16+ig) = tauray
+            ENDDO
+         ENDIF
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE taugb17_gpu
+
+!----------------------------------------------------------------------------
+!     band 18:  4000-4650 cm-1 (low - h2o,ch4; high - ch4)
+!----------------------------------------------------------------------------
+      SUBROUTINE taugb18_gpu(ncol, nlayers, laytrop, jp, jt, jt1, laysolfr, &
+                              colh2o, colch4, colmol, &
+                              selffac, selffrac, indself, forfac, forfrac, indfor, &
+                              fac00, fac01, fac10, fac11, &
+                              sfluxzen, taug, taur)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrsw, only : ng18, ngs17
+      use rrsw_con, only : oneminus
+      use rrsw_wvn, only : nspa, nspb
+      use rrsw_kg18, only : absa, absb, forref, selfref, sfluxref, rayl, strrat
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol), laysolfr(ncol)
+      INTEGER(kind=im), INTENT(IN) :: jp(ncol,nlayers), jt(ncol,nlayers), jt1(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: colh2o(ncol,nlayers), colch4(ncol,nlayers), colmol(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: selffac(ncol,nlayers), selffrac(ncol,nlayers)
+      INTEGER(kind=im), INTENT(IN) :: indself(ncol,nlayers), indfor(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: forfac(ncol,nlayers), forfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                    fac10(ncol,nlayers), fac11(ncol,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: sfluxzen(ncol,*)
+      REAL(kind=rb), INTENT(INOUT) :: taug(ncol,nlayers,*), taur(ncol,nlayers,*)
+
+      INTEGER(kind=im) :: iplon, lay, ig, ind0, ind1, inds, indf, js
+      REAL(kind=rb) :: fac000, fac001, fac010, fac011, fac100, fac101, &
+                        fac110, fac111, fs, speccomb, specmult, specparm, tauray
+
+!$acc parallel loop collapse(2) &
+!$acc   private(fac000,fac001,fac010,fac011,fac100,fac101,fac110,fac111) &
+!$acc   private(fs,speccomb,specmult,specparm,tauray,ind0,ind1,inds,indf,js) &
+!$acc   present(laytrop,laysolfr,jp,jt,jt1,colh2o,colch4,colmol) &
+!$acc   present(selffac,selffrac,indself,forfac,forfrac,indfor) &
+!$acc   present(fac00,fac01,fac10,fac11,sfluxzen,taug,taur) &
+!$acc   present(absa,absb,forref,selfref,sfluxref,nspa,nspb)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+
+         IF (lay .le. laytrop(iplon)) THEN
+            speccomb = colh2o(iplon,lay) + strrat*colch4(iplon,lay)
+            specparm = colh2o(iplon,lay)/speccomb
+            IF (specparm .ge. oneminus) specparm = oneminus
+            specmult = 8._rb*specparm
+            js = 1 + int(specmult)
+            fs = mod(specmult, 1._rb)
+            fac000 = (1._rb - fs) * fac00(iplon,lay)
+            fac010 = (1._rb - fs) * fac10(iplon,lay)
+            fac100 = fs * fac00(iplon,lay)
+            fac110 = fs * fac10(iplon,lay)
+            fac001 = (1._rb - fs) * fac01(iplon,lay)
+            fac011 = (1._rb - fs) * fac11(iplon,lay)
+            fac101 = fs * fac01(iplon,lay)
+            fac111 = fs * fac11(iplon,lay)
+            ind0 = ((jp(iplon,lay)-1)*5+(jt(iplon,lay)-1))*nspa(18) + js
+            ind1 = (jp(iplon,lay)*5+(jt1(iplon,lay)-1))*nspa(18) + js
+            inds = indself(iplon,lay)
+            indf = indfor(iplon,lay)
+            tauray = colmol(iplon,lay) * rayl
+
+            DO ig = 1, ng18
+               taug(iplon,lay,ngs17+ig) = speccomb * &
+                   (fac000 * absa(ind0,ig) + &
+                    fac100 * absa(ind0+1,ig) + &
+                    fac010 * absa(ind0+9,ig) + &
+                    fac110 * absa(ind0+10,ig) + &
+                    fac001 * absa(ind1,ig) + &
+                    fac101 * absa(ind1+1,ig) + &
+                    fac011 * absa(ind1+9,ig) + &
+                    fac111 * absa(ind1+10,ig)) + &
+                    colh2o(iplon,lay) * &
+                    (selffac(iplon,lay) * (selfref(inds,ig) + &
+                    selffrac(iplon,lay) * &
+                    (selfref(inds+1,ig) - selfref(inds,ig))) + &
+                    forfac(iplon,lay) * (forref(indf,ig) + &
+                    forfrac(iplon,lay) * &
+                    (forref(indf+1,ig) - forref(indf,ig))))
+               IF (lay .eq. laysolfr(iplon)) sfluxzen(iplon,ngs17+ig) = sfluxref(ig,js) &
+                  + fs * (sfluxref(ig,js+1) - sfluxref(ig,js))
+               taur(iplon,lay,ngs17+ig) = tauray
+            ENDDO
+         ELSE
+            ind0 = ((jp(iplon,lay)-13)*5+(jt(iplon,lay)-1))*nspb(18) + 1
+            ind1 = ((jp(iplon,lay)-12)*5+(jt1(iplon,lay)-1))*nspb(18) + 1
+            tauray = colmol(iplon,lay) * rayl
+
+            DO ig = 1, ng18
+               taug(iplon,lay,ngs17+ig) = colch4(iplon,lay) * &
+                   (fac00(iplon,lay) * absb(ind0,ig) + &
+                    fac10(iplon,lay) * absb(ind0+1,ig) + &
+                    fac01(iplon,lay) * absb(ind1,ig) + &
+                    fac11(iplon,lay) * absb(ind1+1,ig))
+               taur(iplon,lay,ngs17+ig) = tauray
+            ENDDO
+         ENDIF
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE taugb18_gpu
+
+!----------------------------------------------------------------------------
+!     band 19:  4650-5150 cm-1 (low - h2o,co2; high - co2)
+!----------------------------------------------------------------------------
+      SUBROUTINE taugb19_gpu(ncol, nlayers, laytrop, jp, jt, jt1, laysolfr, &
+                              colh2o, colco2, colmol, &
+                              selffac, selffrac, indself, forfac, forfrac, indfor, &
+                              fac00, fac01, fac10, fac11, &
+                              sfluxzen, taug, taur)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrsw, only : ng19, ngs18
+      use rrsw_con, only : oneminus
+      use rrsw_wvn, only : nspa, nspb
+      use rrsw_kg19, only : absa, absb, forref, selfref, sfluxref, rayl, strrat
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol), laysolfr(ncol)
+      INTEGER(kind=im), INTENT(IN) :: jp(ncol,nlayers), jt(ncol,nlayers), jt1(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: colh2o(ncol,nlayers), colco2(ncol,nlayers), colmol(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: selffac(ncol,nlayers), selffrac(ncol,nlayers)
+      INTEGER(kind=im), INTENT(IN) :: indself(ncol,nlayers), indfor(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: forfac(ncol,nlayers), forfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                    fac10(ncol,nlayers), fac11(ncol,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: sfluxzen(ncol,*)
+      REAL(kind=rb), INTENT(INOUT) :: taug(ncol,nlayers,*), taur(ncol,nlayers,*)
+
+      INTEGER(kind=im) :: iplon, lay, ig, ind0, ind1, inds, indf, js
+      REAL(kind=rb) :: fac000, fac001, fac010, fac011, fac100, fac101, &
+                        fac110, fac111, fs, speccomb, specmult, specparm, tauray
+
+!$acc parallel loop collapse(2) &
+!$acc   private(fac000,fac001,fac010,fac011,fac100,fac101,fac110,fac111) &
+!$acc   private(fs,speccomb,specmult,specparm,tauray,ind0,ind1,inds,indf,js) &
+!$acc   present(laytrop,laysolfr,jp,jt,jt1,colh2o,colco2,colmol) &
+!$acc   present(selffac,selffrac,indself,forfac,forfrac,indfor) &
+!$acc   present(fac00,fac01,fac10,fac11,sfluxzen,taug,taur) &
+!$acc   present(absa,absb,forref,selfref,sfluxref,nspa,nspb)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+
+         IF (lay .le. laytrop(iplon)) THEN
+            speccomb = colh2o(iplon,lay) + strrat*colco2(iplon,lay)
+            specparm = colh2o(iplon,lay)/speccomb
+            IF (specparm .ge. oneminus) specparm = oneminus
+            specmult = 8._rb*specparm
+            js = 1 + int(specmult)
+            fs = mod(specmult, 1._rb)
+            fac000 = (1._rb - fs) * fac00(iplon,lay)
+            fac010 = (1._rb - fs) * fac10(iplon,lay)
+            fac100 = fs * fac00(iplon,lay)
+            fac110 = fs * fac10(iplon,lay)
+            fac001 = (1._rb - fs) * fac01(iplon,lay)
+            fac011 = (1._rb - fs) * fac11(iplon,lay)
+            fac101 = fs * fac01(iplon,lay)
+            fac111 = fs * fac11(iplon,lay)
+            ind0 = ((jp(iplon,lay)-1)*5+(jt(iplon,lay)-1))*nspa(19) + js
+            ind1 = (jp(iplon,lay)*5+(jt1(iplon,lay)-1))*nspa(19) + js
+            inds = indself(iplon,lay)
+            indf = indfor(iplon,lay)
+            tauray = colmol(iplon,lay) * rayl
+
+            DO ig = 1, ng19
+               taug(iplon,lay,ngs18+ig) = speccomb * &
+                   (fac000 * absa(ind0,ig) + &
+                    fac100 * absa(ind0+1,ig) + &
+                    fac010 * absa(ind0+9,ig) + &
+                    fac110 * absa(ind0+10,ig) + &
+                    fac001 * absa(ind1,ig) + &
+                    fac101 * absa(ind1+1,ig) + &
+                    fac011 * absa(ind1+9,ig) + &
+                    fac111 * absa(ind1+10,ig)) + &
+                    colh2o(iplon,lay) * &
+                    (selffac(iplon,lay) * (selfref(inds,ig) + &
+                    selffrac(iplon,lay) * &
+                    (selfref(inds+1,ig) - selfref(inds,ig))) + &
+                    forfac(iplon,lay) * (forref(indf,ig) + &
+                    forfrac(iplon,lay) * &
+                    (forref(indf+1,ig) - forref(indf,ig))))
+               IF (lay .eq. laysolfr(iplon)) sfluxzen(iplon,ngs18+ig) = sfluxref(ig,js) &
+                  + fs * (sfluxref(ig,js+1) - sfluxref(ig,js))
+               taur(iplon,lay,ngs18+ig) = tauray
+            ENDDO
+         ELSE
+            ind0 = ((jp(iplon,lay)-13)*5+(jt(iplon,lay)-1))*nspb(19) + 1
+            ind1 = ((jp(iplon,lay)-12)*5+(jt1(iplon,lay)-1))*nspb(19) + 1
+            tauray = colmol(iplon,lay) * rayl
+
+            DO ig = 1, ng19
+               taug(iplon,lay,ngs18+ig) = colco2(iplon,lay) * &
+                   (fac00(iplon,lay) * absb(ind0,ig) + &
+                    fac10(iplon,lay) * absb(ind0+1,ig) + &
+                    fac01(iplon,lay) * absb(ind1,ig) + &
+                    fac11(iplon,lay) * absb(ind1+1,ig))
+               taur(iplon,lay,ngs18+ig) = tauray
+            ENDDO
+         ENDIF
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE taugb19_gpu
+
+!----------------------------------------------------------------------------
+!     band 20:  5150-6150 cm-1 (low - h2o; high - h2o)
+!----------------------------------------------------------------------------
+      SUBROUTINE taugb20_gpu(ncol, nlayers, laytrop, jp, jt, jt1, laysolfr, &
+                              colh2o, colch4, colmol, &
+                              selffac, selffrac, indself, forfac, forfrac, indfor, &
+                              fac00, fac01, fac10, fac11, &
+                              sfluxzen, taug, taur)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrsw, only : ng20, ngs19
+      use rrsw_wvn, only : nspa, nspb
+      use rrsw_kg20, only : absa, absb, forref, selfref, sfluxref, absch4, rayl
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol), laysolfr(ncol)
+      INTEGER(kind=im), INTENT(IN) :: jp(ncol,nlayers), jt(ncol,nlayers), jt1(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: colh2o(ncol,nlayers), colch4(ncol,nlayers), colmol(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: selffac(ncol,nlayers), selffrac(ncol,nlayers)
+      INTEGER(kind=im), INTENT(IN) :: indself(ncol,nlayers), indfor(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: forfac(ncol,nlayers), forfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                    fac10(ncol,nlayers), fac11(ncol,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: sfluxzen(ncol,*)
+      REAL(kind=rb), INTENT(INOUT) :: taug(ncol,nlayers,*), taur(ncol,nlayers,*)
+
+      INTEGER(kind=im) :: iplon, lay, ig, ind0, ind1, inds, indf
+      REAL(kind=rb) :: tauray
+
+!$acc parallel loop collapse(2) &
+!$acc   private(tauray,ind0,ind1,inds,indf) &
+!$acc   present(laytrop,laysolfr,jp,jt,jt1,colh2o,colch4,colmol) &
+!$acc   present(selffac,selffrac,indself,forfac,forfrac,indfor) &
+!$acc   present(fac00,fac01,fac10,fac11,sfluxzen,taug,taur) &
+!$acc   present(absa,absb,forref,selfref,sfluxref,absch4,nspa,nspb)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+
+         IF (lay .le. laytrop(iplon)) THEN
+            ind0 = ((jp(iplon,lay)-1)*5+(jt(iplon,lay)-1))*nspa(20) + 1
+            ind1 = (jp(iplon,lay)*5+(jt1(iplon,lay)-1))*nspa(20) + 1
+            inds = indself(iplon,lay)
+            indf = indfor(iplon,lay)
+            tauray = colmol(iplon,lay) * rayl
+
+            DO ig = 1, ng20
+               taug(iplon,lay,ngs19+ig) = colh2o(iplon,lay) * &
+                  ((fac00(iplon,lay) * absa(ind0,ig) + &
+                    fac10(iplon,lay) * absa(ind0+1,ig) + &
+                    fac01(iplon,lay) * absa(ind1,ig) + &
+                    fac11(iplon,lay) * absa(ind1+1,ig)) + &
+                    selffac(iplon,lay) * (selfref(inds,ig) + &
+                    selffrac(iplon,lay) * &
+                    (selfref(inds+1,ig) - selfref(inds,ig))) + &
+                    forfac(iplon,lay) * (forref(indf,ig) + &
+                    forfrac(iplon,lay) * &
+                    (forref(indf+1,ig) - forref(indf,ig)))) &
+                    + colch4(iplon,lay) * absch4(ig)
+               taur(iplon,lay,ngs19+ig) = tauray
+               IF (lay .eq. laysolfr(iplon)) sfluxzen(iplon,ngs19+ig) = sfluxref(ig)
+            ENDDO
+         ELSE
+            ind0 = ((jp(iplon,lay)-13)*5+(jt(iplon,lay)-1))*nspb(20) + 1
+            ind1 = ((jp(iplon,lay)-12)*5+(jt1(iplon,lay)-1))*nspb(20) + 1
+            indf = indfor(iplon,lay)
+            tauray = colmol(iplon,lay) * rayl
+
+            DO ig = 1, ng20
+               taug(iplon,lay,ngs19+ig) = colh2o(iplon,lay) * &
+                   (fac00(iplon,lay) * absb(ind0,ig) + &
+                    fac10(iplon,lay) * absb(ind0+1,ig) + &
+                    fac01(iplon,lay) * absb(ind1,ig) + &
+                    fac11(iplon,lay) * absb(ind1+1,ig) + &
+                    forfac(iplon,lay) * (forref(indf,ig) + &
+                    forfrac(iplon,lay) * &
+                    (forref(indf+1,ig) - forref(indf,ig)))) + &
+                    colch4(iplon,lay) * absch4(ig)
+               taur(iplon,lay,ngs19+ig) = tauray
+            ENDDO
+         ENDIF
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE taugb20_gpu
+
+!----------------------------------------------------------------------------
+!     band 21:  6150-7700 cm-1 (low - h2o,co2; high - h2o,co2)
+!----------------------------------------------------------------------------
+      SUBROUTINE taugb21_gpu(ncol, nlayers, laytrop, jp, jt, jt1, laysolfr, &
+                              colh2o, colco2, colmol, &
+                              selffac, selffrac, indself, forfac, forfrac, indfor, &
+                              fac00, fac01, fac10, fac11, &
+                              sfluxzen, taug, taur)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrsw, only : ng21, ngs20
+      use rrsw_con, only : oneminus
+      use rrsw_wvn, only : nspa, nspb
+      use rrsw_kg21, only : absa, absb, forref, selfref, sfluxref, rayl, strrat
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol), laysolfr(ncol)
+      INTEGER(kind=im), INTENT(IN) :: jp(ncol,nlayers), jt(ncol,nlayers), jt1(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: colh2o(ncol,nlayers), colco2(ncol,nlayers), colmol(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: selffac(ncol,nlayers), selffrac(ncol,nlayers)
+      INTEGER(kind=im), INTENT(IN) :: indself(ncol,nlayers), indfor(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: forfac(ncol,nlayers), forfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                    fac10(ncol,nlayers), fac11(ncol,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: sfluxzen(ncol,*)
+      REAL(kind=rb), INTENT(INOUT) :: taug(ncol,nlayers,*), taur(ncol,nlayers,*)
+
+      INTEGER(kind=im) :: iplon, lay, ig, ind0, ind1, inds, indf, js
+      REAL(kind=rb) :: fac000, fac001, fac010, fac011, fac100, fac101, &
+                        fac110, fac111, fs, speccomb, specmult, specparm, tauray
+
+!$acc parallel loop collapse(2) &
+!$acc   private(fac000,fac001,fac010,fac011,fac100,fac101,fac110,fac111) &
+!$acc   private(fs,speccomb,specmult,specparm,tauray,ind0,ind1,inds,indf,js) &
+!$acc   present(laytrop,laysolfr,jp,jt,jt1,colh2o,colco2,colmol) &
+!$acc   present(selffac,selffrac,indself,forfac,forfrac,indfor) &
+!$acc   present(fac00,fac01,fac10,fac11,sfluxzen,taug,taur) &
+!$acc   present(absa,absb,forref,selfref,sfluxref,nspa,nspb)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+
+         IF (lay .le. laytrop(iplon)) THEN
+            speccomb = colh2o(iplon,lay) + strrat*colco2(iplon,lay)
+            specparm = colh2o(iplon,lay)/speccomb
+            IF (specparm .ge. oneminus) specparm = oneminus
+            specmult = 8._rb*specparm
+            js = 1 + int(specmult)
+            fs = mod(specmult, 1._rb)
+            fac000 = (1._rb - fs) * fac00(iplon,lay)
+            fac010 = (1._rb - fs) * fac10(iplon,lay)
+            fac100 = fs * fac00(iplon,lay)
+            fac110 = fs * fac10(iplon,lay)
+            fac001 = (1._rb - fs) * fac01(iplon,lay)
+            fac011 = (1._rb - fs) * fac11(iplon,lay)
+            fac101 = fs * fac01(iplon,lay)
+            fac111 = fs * fac11(iplon,lay)
+            ind0 = ((jp(iplon,lay)-1)*5+(jt(iplon,lay)-1))*nspa(21) + js
+            ind1 = (jp(iplon,lay)*5+(jt1(iplon,lay)-1))*nspa(21) + js
+            inds = indself(iplon,lay)
+            indf = indfor(iplon,lay)
+            tauray = colmol(iplon,lay) * rayl
+
+            DO ig = 1, ng21
+               taug(iplon,lay,ngs20+ig) = speccomb * &
+                   (fac000 * absa(ind0,ig) + &
+                    fac100 * absa(ind0+1,ig) + &
+                    fac010 * absa(ind0+9,ig) + &
+                    fac110 * absa(ind0+10,ig) + &
+                    fac001 * absa(ind1,ig) + &
+                    fac101 * absa(ind1+1,ig) + &
+                    fac011 * absa(ind1+9,ig) + &
+                    fac111 * absa(ind1+10,ig)) + &
+                    colh2o(iplon,lay) * &
+                    (selffac(iplon,lay) * (selfref(inds,ig) + &
+                    selffrac(iplon,lay) * &
+                    (selfref(inds+1,ig) - selfref(inds,ig))) + &
+                    forfac(iplon,lay) * (forref(indf,ig) + &
+                    forfrac(iplon,lay) * &
+                    (forref(indf+1,ig) - forref(indf,ig))))
+               IF (lay .eq. laysolfr(iplon)) sfluxzen(iplon,ngs20+ig) = sfluxref(ig,js) &
+                  + fs * (sfluxref(ig,js+1) - sfluxref(ig,js))
+               taur(iplon,lay,ngs20+ig) = tauray
+            ENDDO
+         ELSE
+            speccomb = colh2o(iplon,lay) + strrat*colco2(iplon,lay)
+            specparm = colh2o(iplon,lay)/speccomb
+            IF (specparm .ge. oneminus) specparm = oneminus
+            specmult = 4._rb*specparm
+            js = 1 + int(specmult)
+            fs = mod(specmult, 1._rb)
+            fac000 = (1._rb - fs) * fac00(iplon,lay)
+            fac010 = (1._rb - fs) * fac10(iplon,lay)
+            fac100 = fs * fac00(iplon,lay)
+            fac110 = fs * fac10(iplon,lay)
+            fac001 = (1._rb - fs) * fac01(iplon,lay)
+            fac011 = (1._rb - fs) * fac11(iplon,lay)
+            fac101 = fs * fac01(iplon,lay)
+            fac111 = fs * fac11(iplon,lay)
+            ind0 = ((jp(iplon,lay)-13)*5+(jt(iplon,lay)-1))*nspb(21) + js
+            ind1 = ((jp(iplon,lay)-12)*5+(jt1(iplon,lay)-1))*nspb(21) + js
+            indf = indfor(iplon,lay)
+            tauray = colmol(iplon,lay) * rayl
+
+            DO ig = 1, ng21
+               taug(iplon,lay,ngs20+ig) = speccomb * &
+                   (fac000 * absb(ind0,ig) + &
+                    fac100 * absb(ind0+1,ig) + &
+                    fac010 * absb(ind0+5,ig) + &
+                    fac110 * absb(ind0+6,ig) + &
+                    fac001 * absb(ind1,ig) + &
+                    fac101 * absb(ind1+1,ig) + &
+                    fac011 * absb(ind1+5,ig) + &
+                    fac111 * absb(ind1+6,ig)) + &
+                    colh2o(iplon,lay) * &
+                    forfac(iplon,lay) * (forref(indf,ig) + &
+                    forfrac(iplon,lay) * &
+                    (forref(indf+1,ig) - forref(indf,ig)))
+               taur(iplon,lay,ngs20+ig) = tauray
+            ENDDO
+         ENDIF
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE taugb21_gpu
+
+!----------------------------------------------------------------------------
+!     band 22:  7700-8050 cm-1 (low - h2o,o2; high - o2)
+!----------------------------------------------------------------------------
+      SUBROUTINE taugb22_gpu(ncol, nlayers, laytrop, jp, jt, jt1, laysolfr, &
+                              colh2o, colo2, colmol, &
+                              selffac, selffrac, indself, forfac, forfrac, indfor, &
+                              fac00, fac01, fac10, fac11, &
+                              sfluxzen, taug, taur)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrsw, only : ng22, ngs21
+      use rrsw_con, only : oneminus
+      use rrsw_wvn, only : nspa, nspb
+      use rrsw_kg22, only : absa, absb, forref, selfref, sfluxref, rayl, strrat
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol), laysolfr(ncol)
+      INTEGER(kind=im), INTENT(IN) :: jp(ncol,nlayers), jt(ncol,nlayers), jt1(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: colh2o(ncol,nlayers), colo2(ncol,nlayers), colmol(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: selffac(ncol,nlayers), selffrac(ncol,nlayers)
+      INTEGER(kind=im), INTENT(IN) :: indself(ncol,nlayers), indfor(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: forfac(ncol,nlayers), forfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                    fac10(ncol,nlayers), fac11(ncol,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: sfluxzen(ncol,*)
+      REAL(kind=rb), INTENT(INOUT) :: taug(ncol,nlayers,*), taur(ncol,nlayers,*)
+
+      INTEGER(kind=im) :: iplon, lay, ig, ind0, ind1, inds, indf, js
+      REAL(kind=rb) :: fac000, fac001, fac010, fac011, fac100, fac101, &
+                        fac110, fac111, fs, speccomb, specmult, specparm, &
+                        tauray, o2adj, o2cont
+
+      o2adj = 1.6_rb
+
+!$acc parallel loop collapse(2) &
+!$acc   private(fac000,fac001,fac010,fac011,fac100,fac101,fac110,fac111) &
+!$acc   private(fs,speccomb,specmult,specparm,tauray,o2cont,ind0,ind1,inds,indf,js) &
+!$acc   present(laytrop,laysolfr,jp,jt,jt1,colh2o,colo2,colmol) &
+!$acc   present(selffac,selffrac,indself,forfac,forfrac,indfor) &
+!$acc   present(fac00,fac01,fac10,fac11,sfluxzen,taug,taur) &
+!$acc   present(absa,absb,forref,selfref,sfluxref,nspa,nspb)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+
+         IF (lay .le. laytrop(iplon)) THEN
+            o2cont = 4.35e-4_rb*colo2(iplon,lay)/(350.0_rb*2.0_rb)
+            speccomb = colh2o(iplon,lay) + o2adj*strrat*colo2(iplon,lay)
+            specparm = colh2o(iplon,lay)/speccomb
+            IF (specparm .ge. oneminus) specparm = oneminus
+            specmult = 8._rb*specparm
+            js = 1 + int(specmult)
+            fs = mod(specmult, 1._rb)
+            fac000 = (1._rb - fs) * fac00(iplon,lay)
+            fac010 = (1._rb - fs) * fac10(iplon,lay)
+            fac100 = fs * fac00(iplon,lay)
+            fac110 = fs * fac10(iplon,lay)
+            fac001 = (1._rb - fs) * fac01(iplon,lay)
+            fac011 = (1._rb - fs) * fac11(iplon,lay)
+            fac101 = fs * fac01(iplon,lay)
+            fac111 = fs * fac11(iplon,lay)
+            ind0 = ((jp(iplon,lay)-1)*5+(jt(iplon,lay)-1))*nspa(22) + js
+            ind1 = (jp(iplon,lay)*5+(jt1(iplon,lay)-1))*nspa(22) + js
+            inds = indself(iplon,lay)
+            indf = indfor(iplon,lay)
+            tauray = colmol(iplon,lay) * rayl
+
+            DO ig = 1, ng22
+               taug(iplon,lay,ngs21+ig) = speccomb * &
+                   (fac000 * absa(ind0,ig) + &
+                    fac100 * absa(ind0+1,ig) + &
+                    fac010 * absa(ind0+9,ig) + &
+                    fac110 * absa(ind0+10,ig) + &
+                    fac001 * absa(ind1,ig) + &
+                    fac101 * absa(ind1+1,ig) + &
+                    fac011 * absa(ind1+9,ig) + &
+                    fac111 * absa(ind1+10,ig)) + &
+                    colh2o(iplon,lay) * &
+                    (selffac(iplon,lay) * (selfref(inds,ig) + &
+                    selffrac(iplon,lay) * &
+                     (selfref(inds+1,ig) - selfref(inds,ig))) + &
+                    forfac(iplon,lay) * (forref(indf,ig) + &
+                    forfrac(iplon,lay) * &
+                    (forref(indf+1,ig) - forref(indf,ig)))) &
+                    + o2cont
+               IF (lay .eq. laysolfr(iplon)) sfluxzen(iplon,ngs21+ig) = sfluxref(ig,js) &
+                   + fs * (sfluxref(ig,js+1) - sfluxref(ig,js))
+               taur(iplon,lay,ngs21+ig) = tauray
+            ENDDO
+         ELSE
+            o2cont = 4.35e-4_rb*colo2(iplon,lay)/(350.0_rb*2.0_rb)
+            ind0 = ((jp(iplon,lay)-13)*5+(jt(iplon,lay)-1))*nspb(22) + 1
+            ind1 = ((jp(iplon,lay)-12)*5+(jt1(iplon,lay)-1))*nspb(22) + 1
+            tauray = colmol(iplon,lay) * rayl
+
+            DO ig = 1, ng22
+               taug(iplon,lay,ngs21+ig) = colo2(iplon,lay) * o2adj * &
+                   (fac00(iplon,lay) * absb(ind0,ig) + &
+                    fac10(iplon,lay) * absb(ind0+1,ig) + &
+                    fac01(iplon,lay) * absb(ind1,ig) + &
+                    fac11(iplon,lay) * absb(ind1+1,ig)) + &
+                    o2cont
+               taur(iplon,lay,ngs21+ig) = tauray
+            ENDDO
+         ENDIF
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE taugb22_gpu
+
+!----------------------------------------------------------------------------
+!     band 23:  8050-12850 cm-1 (low - h2o; high - nothing)
+!----------------------------------------------------------------------------
+      SUBROUTINE taugb23_gpu(ncol, nlayers, laytrop, jp, jt, jt1, laysolfr, &
+                              colh2o, colmol, &
+                              selffac, selffrac, indself, forfac, forfrac, indfor, &
+                              fac00, fac01, fac10, fac11, &
+                              sfluxzen, taug, taur)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrsw, only : ng23, ngs22
+      use rrsw_wvn, only : nspa, nspb
+      use rrsw_kg23, only : absa, forref, selfref, sfluxref, rayl, givfac
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol), laysolfr(ncol)
+      INTEGER(kind=im), INTENT(IN) :: jp(ncol,nlayers), jt(ncol,nlayers), jt1(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: colh2o(ncol,nlayers), colmol(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: selffac(ncol,nlayers), selffrac(ncol,nlayers)
+      INTEGER(kind=im), INTENT(IN) :: indself(ncol,nlayers), indfor(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: forfac(ncol,nlayers), forfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                    fac10(ncol,nlayers), fac11(ncol,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: sfluxzen(ncol,*)
+      REAL(kind=rb), INTENT(INOUT) :: taug(ncol,nlayers,*), taur(ncol,nlayers,*)
+
+      INTEGER(kind=im) :: iplon, lay, ig, ind0, ind1, inds, indf
+      REAL(kind=rb) :: tauray
+
+!$acc parallel loop collapse(2) &
+!$acc   private(tauray,ind0,ind1,inds,indf) &
+!$acc   present(laytrop,laysolfr,jp,jt,jt1,colh2o,colmol) &
+!$acc   present(selffac,selffrac,indself,forfac,forfrac,indfor) &
+!$acc   present(fac00,fac01,fac10,fac11,sfluxzen,taug,taur) &
+!$acc   present(absa,forref,selfref,sfluxref,rayl,nspa,nspb)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+
+         IF (lay .le. laytrop(iplon)) THEN
+            ind0 = ((jp(iplon,lay)-1)*5+(jt(iplon,lay)-1))*nspa(23) + 1
+            ind1 = (jp(iplon,lay)*5+(jt1(iplon,lay)-1))*nspa(23) + 1
+            inds = indself(iplon,lay)
+            indf = indfor(iplon,lay)
+
+            DO ig = 1, ng23
+               tauray = colmol(iplon,lay) * rayl(ig)
+               taug(iplon,lay,ngs22+ig) = colh2o(iplon,lay) * &
+                   (givfac * (fac00(iplon,lay) * absa(ind0,ig) + &
+                    fac10(iplon,lay) * absa(ind0+1,ig) + &
+                    fac01(iplon,lay) * absa(ind1,ig) + &
+                    fac11(iplon,lay) * absa(ind1+1,ig)) + &
+                    selffac(iplon,lay) * (selfref(inds,ig) + &
+                    selffrac(iplon,lay) * &
+                    (selfref(inds+1,ig) - selfref(inds,ig))) + &
+                    forfac(iplon,lay) * (forref(indf,ig) + &
+                    forfrac(iplon,lay) * &
+                    (forref(indf+1,ig) - forref(indf,ig))))
+               IF (lay .eq. laysolfr(iplon)) sfluxzen(iplon,ngs22+ig) = sfluxref(ig)
+               taur(iplon,lay,ngs22+ig) = tauray
+            ENDDO
+         ELSE
+            DO ig = 1, ng23
+               taug(iplon,lay,ngs22+ig) = 0._rb
+               taur(iplon,lay,ngs22+ig) = colmol(iplon,lay) * rayl(ig)
+            ENDDO
+         ENDIF
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE taugb23_gpu
+
+!----------------------------------------------------------------------------
+!     band 24: 12850-16000 cm-1 (low - h2o,o2; high - o2)
+!----------------------------------------------------------------------------
+      SUBROUTINE taugb24_gpu(ncol, nlayers, laytrop, jp, jt, jt1, laysolfr, &
+                              colh2o, colo2, colo3, colmol, &
+                              selffac, selffrac, indself, forfac, forfrac, indfor, &
+                              fac00, fac01, fac10, fac11, &
+                              sfluxzen, taug, taur)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrsw, only : ng24, ngs23
+      use rrsw_con, only : oneminus
+      use rrsw_wvn, only : nspa, nspb
+      use rrsw_kg24, only : absa, absb, forref, selfref, sfluxref, &
+                             abso3a, abso3b, rayla, raylb, strrat
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol), laysolfr(ncol)
+      INTEGER(kind=im), INTENT(IN) :: jp(ncol,nlayers), jt(ncol,nlayers), jt1(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: colh2o(ncol,nlayers), colo2(ncol,nlayers), &
+                                    colo3(ncol,nlayers), colmol(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: selffac(ncol,nlayers), selffrac(ncol,nlayers)
+      INTEGER(kind=im), INTENT(IN) :: indself(ncol,nlayers), indfor(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: forfac(ncol,nlayers), forfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                    fac10(ncol,nlayers), fac11(ncol,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: sfluxzen(ncol,*)
+      REAL(kind=rb), INTENT(INOUT) :: taug(ncol,nlayers,*), taur(ncol,nlayers,*)
+
+      INTEGER(kind=im) :: iplon, lay, ig, ind0, ind1, inds, indf, js
+      REAL(kind=rb) :: fac000, fac001, fac010, fac011, fac100, fac101, &
+                        fac110, fac111, fs, speccomb, specmult, specparm, tauray
+
+!$acc parallel loop collapse(2) &
+!$acc   private(fac000,fac001,fac010,fac011,fac100,fac101,fac110,fac111) &
+!$acc   private(fs,speccomb,specmult,specparm,tauray,ind0,ind1,inds,indf,js) &
+!$acc   present(laytrop,laysolfr,jp,jt,jt1,colh2o,colo2,colo3,colmol) &
+!$acc   present(selffac,selffrac,indself,forfac,forfrac,indfor) &
+!$acc   present(fac00,fac01,fac10,fac11,sfluxzen,taug,taur) &
+!$acc   present(absa,absb,forref,selfref,sfluxref,abso3a,abso3b,rayla,raylb,nspa,nspb)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+
+         IF (lay .le. laytrop(iplon)) THEN
+            speccomb = colh2o(iplon,lay) + strrat*colo2(iplon,lay)
+            specparm = colh2o(iplon,lay)/speccomb
+            IF (specparm .ge. oneminus) specparm = oneminus
+            specmult = 8._rb*specparm
+            js = 1 + int(specmult)
+            fs = mod(specmult, 1._rb)
+            fac000 = (1._rb - fs) * fac00(iplon,lay)
+            fac010 = (1._rb - fs) * fac10(iplon,lay)
+            fac100 = fs * fac00(iplon,lay)
+            fac110 = fs * fac10(iplon,lay)
+            fac001 = (1._rb - fs) * fac01(iplon,lay)
+            fac011 = (1._rb - fs) * fac11(iplon,lay)
+            fac101 = fs * fac01(iplon,lay)
+            fac111 = fs * fac11(iplon,lay)
+            ind0 = ((jp(iplon,lay)-1)*5+(jt(iplon,lay)-1))*nspa(24) + js
+            ind1 = (jp(iplon,lay)*5+(jt1(iplon,lay)-1))*nspa(24) + js
+            inds = indself(iplon,lay)
+            indf = indfor(iplon,lay)
+
+            DO ig = 1, ng24
+               tauray = colmol(iplon,lay) * (rayla(ig,js) + &
+                  fs * (rayla(ig,js+1) - rayla(ig,js)))
+               taug(iplon,lay,ngs23+ig) = speccomb * &
+                   (fac000 * absa(ind0,ig) + &
+                    fac100 * absa(ind0+1,ig) + &
+                    fac010 * absa(ind0+9,ig) + &
+                    fac110 * absa(ind0+10,ig) + &
+                    fac001 * absa(ind1,ig) + &
+                    fac101 * absa(ind1+1,ig) + &
+                    fac011 * absa(ind1+9,ig) + &
+                    fac111 * absa(ind1+10,ig)) + &
+                    colo3(iplon,lay) * abso3a(ig) + &
+                    colh2o(iplon,lay) * &
+                    (selffac(iplon,lay) * (selfref(inds,ig) + &
+                    selffrac(iplon,lay) * &
+                    (selfref(inds+1,ig) - selfref(inds,ig))) + &
+                    forfac(iplon,lay) * (forref(indf,ig) + &
+                    forfrac(iplon,lay) * &
+                    (forref(indf+1,ig) - forref(indf,ig))))
+               IF (lay .eq. laysolfr(iplon)) sfluxzen(iplon,ngs23+ig) = sfluxref(ig,js) &
+                  + fs * (sfluxref(ig,js+1) - sfluxref(ig,js))
+               taur(iplon,lay,ngs23+ig) = tauray
+            ENDDO
+         ELSE
+            ind0 = ((jp(iplon,lay)-13)*5+(jt(iplon,lay)-1))*nspb(24) + 1
+            ind1 = ((jp(iplon,lay)-12)*5+(jt1(iplon,lay)-1))*nspb(24) + 1
+
+            DO ig = 1, ng24
+               tauray = colmol(iplon,lay) * raylb(ig)
+               taug(iplon,lay,ngs23+ig) = colo2(iplon,lay) * &
+                   (fac00(iplon,lay) * absb(ind0,ig) + &
+                    fac10(iplon,lay) * absb(ind0+1,ig) + &
+                    fac01(iplon,lay) * absb(ind1,ig) + &
+                    fac11(iplon,lay) * absb(ind1+1,ig)) + &
+                    colo3(iplon,lay) * abso3b(ig)
+               taur(iplon,lay,ngs23+ig) = tauray
+            ENDDO
+         ENDIF
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE taugb24_gpu
+
+!----------------------------------------------------------------------------
+!     band 25: 16000-22650 cm-1 (low - h2o; high - nothing)
+!----------------------------------------------------------------------------
+      SUBROUTINE taugb25_gpu(ncol, nlayers, laytrop, jp, jt, jt1, laysolfr, &
+                              colh2o, colo3, colmol, &
+                              fac00, fac01, fac10, fac11, &
+                              sfluxzen, taug, taur)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrsw, only : ng25, ngs24
+      use rrsw_wvn, only : nspa, nspb
+      use rrsw_kg25, only : absa, sfluxref, abso3a, abso3b, rayl
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol), laysolfr(ncol)
+      INTEGER(kind=im), INTENT(IN) :: jp(ncol,nlayers), jt(ncol,nlayers), jt1(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: colh2o(ncol,nlayers), colo3(ncol,nlayers), colmol(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                    fac10(ncol,nlayers), fac11(ncol,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: sfluxzen(ncol,*)
+      REAL(kind=rb), INTENT(INOUT) :: taug(ncol,nlayers,*), taur(ncol,nlayers,*)
+
+      INTEGER(kind=im) :: iplon, lay, ig, ind0, ind1
+      REAL(kind=rb) :: tauray
+
+!$acc parallel loop collapse(2) &
+!$acc   private(tauray,ind0,ind1) &
+!$acc   present(laytrop,laysolfr,jp,jt,jt1,colh2o,colo3,colmol) &
+!$acc   present(fac00,fac01,fac10,fac11,sfluxzen,taug,taur) &
+!$acc   present(absa,sfluxref,abso3a,abso3b,rayl,nspa,nspb)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+
+         IF (lay .le. laytrop(iplon)) THEN
+            ind0 = ((jp(iplon,lay)-1)*5+(jt(iplon,lay)-1))*nspa(25) + 1
+            ind1 = (jp(iplon,lay)*5+(jt1(iplon,lay)-1))*nspa(25) + 1
+
+            DO ig = 1, ng25
+               tauray = colmol(iplon,lay) * rayl(ig)
+               taug(iplon,lay,ngs24+ig) = colh2o(iplon,lay) * &
+                   (fac00(iplon,lay) * absa(ind0,ig) + &
+                    fac10(iplon,lay) * absa(ind0+1,ig) + &
+                    fac01(iplon,lay) * absa(ind1,ig) + &
+                    fac11(iplon,lay) * absa(ind1+1,ig)) + &
+                    colo3(iplon,lay) * abso3a(ig)
+               IF (lay .eq. laysolfr(iplon)) sfluxzen(iplon,ngs24+ig) = sfluxref(ig)
+               taur(iplon,lay,ngs24+ig) = tauray
+            ENDDO
+         ELSE
+            DO ig = 1, ng25
+               tauray = colmol(iplon,lay) * rayl(ig)
+               taug(iplon,lay,ngs24+ig) = colo3(iplon,lay) * abso3b(ig)
+               taur(iplon,lay,ngs24+ig) = tauray
+            ENDDO
+         ENDIF
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE taugb25_gpu
+
+!----------------------------------------------------------------------------
+!     band 26: 22650-29000 cm-1 (low - nothing; high - nothing)
+!----------------------------------------------------------------------------
+      SUBROUTINE taugb26_gpu(ncol, nlayers, laytrop, colmol, sfluxzen, taug, taur)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrsw, only : ng26, ngs25
+      use rrsw_kg26, only : sfluxref, rayl
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol)
+      REAL(kind=rb), INTENT(IN) :: colmol(ncol,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: sfluxzen(ncol,*)
+      REAL(kind=rb), INTENT(INOUT) :: taug(ncol,nlayers,*), taur(ncol,nlayers,*)
+
+      INTEGER(kind=im) :: iplon, lay, ig
+
+!$acc parallel loop collapse(2) &
+!$acc   present(laytrop,colmol,sfluxzen,taug,taur,sfluxref,rayl)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+
+         DO ig = 1, ng26
+            IF (lay .eq. laytrop(iplon)) sfluxzen(iplon,ngs25+ig) = sfluxref(ig)
+            taug(iplon,lay,ngs25+ig) = 0._rb
+            taur(iplon,lay,ngs25+ig) = colmol(iplon,lay) * rayl(ig)
+         ENDDO
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE taugb26_gpu
+
+!----------------------------------------------------------------------------
+!     band 27: 29000-38000 cm-1 (low - o3; high - o3)
+!----------------------------------------------------------------------------
+      SUBROUTINE taugb27_gpu(ncol, nlayers, laytrop, jp, jt, jt1, laysolfr, &
+                              colo3, colmol, &
+                              fac00, fac01, fac10, fac11, &
+                              sfluxzen, taug, taur)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrsw, only : ng27, ngs26
+      use rrsw_wvn, only : nspa, nspb
+      use rrsw_kg27, only : absa, absb, sfluxref, rayl, scalekur
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol), laysolfr(ncol)
+      INTEGER(kind=im), INTENT(IN) :: jp(ncol,nlayers), jt(ncol,nlayers), jt1(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: colo3(ncol,nlayers), colmol(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                    fac10(ncol,nlayers), fac11(ncol,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: sfluxzen(ncol,*)
+      REAL(kind=rb), INTENT(INOUT) :: taug(ncol,nlayers,*), taur(ncol,nlayers,*)
+
+      INTEGER(kind=im) :: iplon, lay, ig, ind0, ind1
+      REAL(kind=rb) :: tauray
+
+!$acc parallel loop collapse(2) &
+!$acc   private(tauray,ind0,ind1) &
+!$acc   present(laytrop,laysolfr,jp,jt,jt1,colo3,colmol) &
+!$acc   present(fac00,fac01,fac10,fac11,sfluxzen,taug,taur) &
+!$acc   present(absa,absb,sfluxref,rayl,nspa,nspb)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+
+         IF (lay .le. laytrop(iplon)) THEN
+            ind0 = ((jp(iplon,lay)-1)*5+(jt(iplon,lay)-1))*nspa(27) + 1
+            ind1 = (jp(iplon,lay)*5+(jt1(iplon,lay)-1))*nspa(27) + 1
+
+            DO ig = 1, ng27
+               tauray = colmol(iplon,lay) * rayl(ig)
+               taug(iplon,lay,ngs26+ig) = colo3(iplon,lay) * &
+                   (fac00(iplon,lay) * absa(ind0,ig) + &
+                    fac10(iplon,lay) * absa(ind0+1,ig) + &
+                    fac01(iplon,lay) * absa(ind1,ig) + &
+                    fac11(iplon,lay) * absa(ind1+1,ig))
+               taur(iplon,lay,ngs26+ig) = tauray
+            ENDDO
+         ELSE
+            ind0 = ((jp(iplon,lay)-13)*5+(jt(iplon,lay)-1))*nspb(27) + 1
+            ind1 = ((jp(iplon,lay)-12)*5+(jt1(iplon,lay)-1))*nspb(27) + 1
+
+            DO ig = 1, ng27
+               tauray = colmol(iplon,lay) * rayl(ig)
+               taug(iplon,lay,ngs26+ig) = colo3(iplon,lay) * &
+                   (fac00(iplon,lay) * absb(ind0,ig) + &
+                    fac10(iplon,lay) * absb(ind0+1,ig) + &
+                    fac01(iplon,lay) * absb(ind1,ig) + &
+                    fac11(iplon,lay) * absb(ind1+1,ig))
+               IF (lay .eq. laysolfr(iplon)) sfluxzen(iplon,ngs26+ig) = scalekur * sfluxref(ig)
+               taur(iplon,lay,ngs26+ig) = tauray
+            ENDDO
+         ENDIF
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE taugb27_gpu
+
+!----------------------------------------------------------------------------
+!     band 28: 38000-50000 cm-1 (low - o3,o2; high - o3,o2)
+!----------------------------------------------------------------------------
+      SUBROUTINE taugb28_gpu(ncol, nlayers, laytrop, jp, jt, jt1, laysolfr, &
+                              colo2, colo3, colmol, &
+                              fac00, fac01, fac10, fac11, &
+                              sfluxzen, taug, taur)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrsw, only : ng28, ngs27
+      use rrsw_con, only : oneminus
+      use rrsw_wvn, only : nspa, nspb
+      use rrsw_kg28, only : absa, absb, sfluxref, rayl, strrat
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol), laysolfr(ncol)
+      INTEGER(kind=im), INTENT(IN) :: jp(ncol,nlayers), jt(ncol,nlayers), jt1(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: colo2(ncol,nlayers), colo3(ncol,nlayers), colmol(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                    fac10(ncol,nlayers), fac11(ncol,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: sfluxzen(ncol,*)
+      REAL(kind=rb), INTENT(INOUT) :: taug(ncol,nlayers,*), taur(ncol,nlayers,*)
+
+      INTEGER(kind=im) :: iplon, lay, ig, ind0, ind1, js
+      REAL(kind=rb) :: fac000, fac001, fac010, fac011, fac100, fac101, &
+                        fac110, fac111, fs, speccomb, specmult, specparm, tauray
+
+!$acc parallel loop collapse(2) &
+!$acc   private(fac000,fac001,fac010,fac011,fac100,fac101,fac110,fac111) &
+!$acc   private(fs,speccomb,specmult,specparm,tauray,ind0,ind1,js) &
+!$acc   present(laytrop,laysolfr,jp,jt,jt1,colo2,colo3,colmol) &
+!$acc   present(fac00,fac01,fac10,fac11,sfluxzen,taug,taur) &
+!$acc   present(absa,absb,sfluxref,nspa,nspb)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+
+         IF (lay .le. laytrop(iplon)) THEN
+            speccomb = colo3(iplon,lay) + strrat*colo2(iplon,lay)
+            specparm = colo3(iplon,lay)/speccomb
+            IF (specparm .ge. oneminus) specparm = oneminus
+            specmult = 8._rb*specparm
+            js = 1 + int(specmult)
+            fs = mod(specmult, 1._rb)
+            fac000 = (1._rb - fs) * fac00(iplon,lay)
+            fac010 = (1._rb - fs) * fac10(iplon,lay)
+            fac100 = fs * fac00(iplon,lay)
+            fac110 = fs * fac10(iplon,lay)
+            fac001 = (1._rb - fs) * fac01(iplon,lay)
+            fac011 = (1._rb - fs) * fac11(iplon,lay)
+            fac101 = fs * fac01(iplon,lay)
+            fac111 = fs * fac11(iplon,lay)
+            ind0 = ((jp(iplon,lay)-1)*5+(jt(iplon,lay)-1))*nspa(28) + js
+            ind1 = (jp(iplon,lay)*5+(jt1(iplon,lay)-1))*nspa(28) + js
+            tauray = colmol(iplon,lay) * rayl
+
+            DO ig = 1, ng28
+               taug(iplon,lay,ngs27+ig) = speccomb * &
+                   (fac000 * absa(ind0,ig) + &
+                    fac100 * absa(ind0+1,ig) + &
+                    fac010 * absa(ind0+9,ig) + &
+                    fac110 * absa(ind0+10,ig) + &
+                    fac001 * absa(ind1,ig) + &
+                    fac101 * absa(ind1+1,ig) + &
+                    fac011 * absa(ind1+9,ig) + &
+                    fac111 * absa(ind1+10,ig))
+               taur(iplon,lay,ngs27+ig) = tauray
+            ENDDO
+         ELSE
+            speccomb = colo3(iplon,lay) + strrat*colo2(iplon,lay)
+            specparm = colo3(iplon,lay)/speccomb
+            IF (specparm .ge. oneminus) specparm = oneminus
+            specmult = 4._rb*specparm
+            js = 1 + int(specmult)
+            fs = mod(specmult, 1._rb)
+            fac000 = (1._rb - fs) * fac00(iplon,lay)
+            fac010 = (1._rb - fs) * fac10(iplon,lay)
+            fac100 = fs * fac00(iplon,lay)
+            fac110 = fs * fac10(iplon,lay)
+            fac001 = (1._rb - fs) * fac01(iplon,lay)
+            fac011 = (1._rb - fs) * fac11(iplon,lay)
+            fac101 = fs * fac01(iplon,lay)
+            fac111 = fs * fac11(iplon,lay)
+            ind0 = ((jp(iplon,lay)-13)*5+(jt(iplon,lay)-1))*nspb(28) + js
+            ind1 = ((jp(iplon,lay)-12)*5+(jt1(iplon,lay)-1))*nspb(28) + js
+            tauray = colmol(iplon,lay) * rayl
+
+            DO ig = 1, ng28
+               taug(iplon,lay,ngs27+ig) = speccomb * &
+                   (fac000 * absb(ind0,ig) + &
+                    fac100 * absb(ind0+1,ig) + &
+                    fac010 * absb(ind0+5,ig) + &
+                    fac110 * absb(ind0+6,ig) + &
+                    fac001 * absb(ind1,ig) + &
+                    fac101 * absb(ind1+1,ig) + &
+                    fac011 * absb(ind1+5,ig) + &
+                    fac111 * absb(ind1+6,ig))
+               IF (lay .eq. laysolfr(iplon)) sfluxzen(iplon,ngs27+ig) = sfluxref(ig,js) &
+                  + fs * (sfluxref(ig,js+1) - sfluxref(ig,js))
+               taur(iplon,lay,ngs27+ig) = tauray
+            ENDDO
+         ENDIF
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE taugb28_gpu
+
+!----------------------------------------------------------------------------
+!     band 29:  820-2600 cm-1 (low - h2o; high - co2)
+!----------------------------------------------------------------------------
+      SUBROUTINE taugb29_gpu(ncol, nlayers, laytrop, jp, jt, jt1, laysolfr, &
+                              colh2o, colco2, colmol, &
+                              selffac, selffrac, indself, forfac, forfrac, indfor, &
+                              fac00, fac01, fac10, fac11, &
+                              sfluxzen, taug, taur)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrsw, only : ng29, ngs28
+      use rrsw_wvn, only : nspa, nspb
+      use rrsw_kg29, only : absa, absb, forref, selfref, sfluxref, absh2o, absco2, rayl
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol), laysolfr(ncol)
+      INTEGER(kind=im), INTENT(IN) :: jp(ncol,nlayers), jt(ncol,nlayers), jt1(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: colh2o(ncol,nlayers), colco2(ncol,nlayers), colmol(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: selffac(ncol,nlayers), selffrac(ncol,nlayers)
+      INTEGER(kind=im), INTENT(IN) :: indself(ncol,nlayers), indfor(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: forfac(ncol,nlayers), forfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                    fac10(ncol,nlayers), fac11(ncol,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: sfluxzen(ncol,*)
+      REAL(kind=rb), INTENT(INOUT) :: taug(ncol,nlayers,*), taur(ncol,nlayers,*)
+
+      INTEGER(kind=im) :: iplon, lay, ig, ind0, ind1, inds, indf
+      REAL(kind=rb) :: tauray
+
+!$acc parallel loop collapse(2) &
+!$acc   private(tauray,ind0,ind1,inds,indf) &
+!$acc   present(laytrop,laysolfr,jp,jt,jt1,colh2o,colco2,colmol) &
+!$acc   present(selffac,selffrac,indself,forfac,forfrac,indfor) &
+!$acc   present(fac00,fac01,fac10,fac11,sfluxzen,taug,taur) &
+!$acc   present(absa,absb,forref,selfref,sfluxref,absh2o,absco2,nspa,nspb)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+
+         IF (lay .le. laytrop(iplon)) THEN
+            ind0 = ((jp(iplon,lay)-1)*5+(jt(iplon,lay)-1))*nspa(29) + 1
+            ind1 = (jp(iplon,lay)*5+(jt1(iplon,lay)-1))*nspa(29) + 1
+            inds = indself(iplon,lay)
+            indf = indfor(iplon,lay)
+            tauray = colmol(iplon,lay) * rayl
+
+            DO ig = 1, ng29
+               taug(iplon,lay,ngs28+ig) = colh2o(iplon,lay) * &
+                  ((fac00(iplon,lay) * absa(ind0,ig) + &
+                    fac10(iplon,lay) * absa(ind0+1,ig) + &
+                    fac01(iplon,lay) * absa(ind1,ig) + &
+                    fac11(iplon,lay) * absa(ind1+1,ig)) + &
+                    selffac(iplon,lay) * (selfref(inds,ig) + &
+                    selffrac(iplon,lay) * &
+                    (selfref(inds+1,ig) - selfref(inds,ig))) + &
+                    forfac(iplon,lay) * (forref(indf,ig) + &
+                    forfrac(iplon,lay) * &
+                    (forref(indf+1,ig) - forref(indf,ig)))) &
+                    + colco2(iplon,lay) * absco2(ig)
+               taur(iplon,lay,ngs28+ig) = tauray
+            ENDDO
+         ELSE
+            ind0 = ((jp(iplon,lay)-13)*5+(jt(iplon,lay)-1))*nspb(29) + 1
+            ind1 = ((jp(iplon,lay)-12)*5+(jt1(iplon,lay)-1))*nspb(29) + 1
+            tauray = colmol(iplon,lay) * rayl
+
+            DO ig = 1, ng29
+               taug(iplon,lay,ngs28+ig) = colco2(iplon,lay) * &
+                   (fac00(iplon,lay) * absb(ind0,ig) + &
+                    fac10(iplon,lay) * absb(ind0+1,ig) + &
+                    fac01(iplon,lay) * absb(ind1,ig) + &
+                    fac11(iplon,lay) * absb(ind1+1,ig)) &
+                    + colh2o(iplon,lay) * absh2o(ig)
+               IF (lay .eq. laysolfr(iplon)) sfluxzen(iplon,ngs28+ig) = sfluxref(ig)
+               taur(iplon,lay,ngs28+ig) = tauray
+            ENDDO
+         ENDIF
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE taugb29_gpu
+
+!-------------------------------------------------------------------------------
+!  Driver: calls all 14 band kernels in the same order as the original
+!  taumol_sw, precomputing each band's laysolfr(ncol) (via the shared
+!  laysolfr_upper_gpu / laysolfr_lower_gpu helpers, or using laytrop
+!  directly for band 26) immediately before that band's main kernel.
+!-------------------------------------------------------------------------------
+      SUBROUTINE taumol_sw_driver_gpu(ncol, nlayers, &
+                              colh2o, colco2, colch4, colo2, colo3, colmol, &
+                              laytrop, jp, jt, jt1, &
+                              fac00, fac01, fac10, fac11, &
+                              selffac, selffrac, indself, forfac, forfrac, indfor, &
+                              sfluxzen, taug, taur)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrsw, only : ngptsw
+      use rrsw_kg16, only : layreffr16 => layreffr
+      use rrsw_kg17, only : layreffr17 => layreffr
+      use rrsw_kg18, only : layreffr18 => layreffr
+      use rrsw_kg19, only : layreffr19 => layreffr
+      use rrsw_kg20, only : layreffr20 => layreffr
+      use rrsw_kg21, only : layreffr21 => layreffr
+      use rrsw_kg22, only : layreffr22 => layreffr
+      use rrsw_kg23, only : layreffr23 => layreffr
+      use rrsw_kg24, only : layreffr24 => layreffr
+      use rrsw_kg25, only : layreffr25 => layreffr
+      use rrsw_kg27, only : layreffr27 => layreffr
+      use rrsw_kg28, only : layreffr28 => layreffr
+      use rrsw_kg29, only : layreffr29 => layreffr
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol)
+      INTEGER(kind=im), INTENT(IN) :: jp(ncol,nlayers), jt(ncol,nlayers), jt1(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: colh2o(ncol,nlayers), colco2(ncol,nlayers), &
+                                    colch4(ncol,nlayers), colo2(ncol,nlayers), &
+                                    colo3(ncol,nlayers), colmol(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: selffac(ncol,nlayers), selffrac(ncol,nlayers)
+      INTEGER(kind=im), INTENT(IN) :: indself(ncol,nlayers), indfor(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: forfac(ncol,nlayers), forfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                    fac10(ncol,nlayers), fac11(ncol,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: sfluxzen(ncol,ngptsw)
+      REAL(kind=rb), INTENT(INOUT) :: taug(ncol,nlayers,ngptsw), taur(ncol,nlayers,ngptsw)
+
+      INTEGER(kind=im) :: laysolfr(ncol)
+
+!$acc enter data create(laysolfr)
+
+      CALL laysolfr_upper_gpu(ncol, nlayers, laytrop, jp, layreffr16, laysolfr)
+      CALL taugb16_gpu(ncol, nlayers, laytrop, jp, jt, jt1, laysolfr, &
+                        colh2o, colch4, colmol, &
+                        selffac, selffrac, indself, forfac, forfrac, indfor, &
+                        fac00, fac01, fac10, fac11, sfluxzen, taug, taur)
+
+      CALL laysolfr_upper_gpu(ncol, nlayers, laytrop, jp, layreffr17, laysolfr)
+      CALL taugb17_gpu(ncol, nlayers, laytrop, jp, jt, jt1, laysolfr, &
+                        colh2o, colco2, colmol, &
+                        selffac, selffrac, indself, forfac, forfrac, indfor, &
+                        fac00, fac01, fac10, fac11, sfluxzen, taug, taur)
+
+      CALL laysolfr_lower_gpu(ncol, nlayers, laytrop, jp, layreffr18, laysolfr)
+      CALL taugb18_gpu(ncol, nlayers, laytrop, jp, jt, jt1, laysolfr, &
+                        colh2o, colch4, colmol, &
+                        selffac, selffrac, indself, forfac, forfrac, indfor, &
+                        fac00, fac01, fac10, fac11, sfluxzen, taug, taur)
+
+      CALL laysolfr_lower_gpu(ncol, nlayers, laytrop, jp, layreffr19, laysolfr)
+      CALL taugb19_gpu(ncol, nlayers, laytrop, jp, jt, jt1, laysolfr, &
+                        colh2o, colco2, colmol, &
+                        selffac, selffrac, indself, forfac, forfrac, indfor, &
+                        fac00, fac01, fac10, fac11, sfluxzen, taug, taur)
+
+      CALL laysolfr_lower_gpu(ncol, nlayers, laytrop, jp, layreffr20, laysolfr)
+      CALL taugb20_gpu(ncol, nlayers, laytrop, jp, jt, jt1, laysolfr, &
+                        colh2o, colch4, colmol, &
+                        selffac, selffrac, indself, forfac, forfrac, indfor, &
+                        fac00, fac01, fac10, fac11, sfluxzen, taug, taur)
+
+      CALL laysolfr_lower_gpu(ncol, nlayers, laytrop, jp, layreffr21, laysolfr)
+      CALL taugb21_gpu(ncol, nlayers, laytrop, jp, jt, jt1, laysolfr, &
+                        colh2o, colco2, colmol, &
+                        selffac, selffrac, indself, forfac, forfrac, indfor, &
+                        fac00, fac01, fac10, fac11, sfluxzen, taug, taur)
+
+      CALL laysolfr_lower_gpu(ncol, nlayers, laytrop, jp, layreffr22, laysolfr)
+      CALL taugb22_gpu(ncol, nlayers, laytrop, jp, jt, jt1, laysolfr, &
+                        colh2o, colo2, colmol, &
+                        selffac, selffrac, indself, forfac, forfrac, indfor, &
+                        fac00, fac01, fac10, fac11, sfluxzen, taug, taur)
+
+      CALL laysolfr_lower_gpu(ncol, nlayers, laytrop, jp, layreffr23, laysolfr)
+      CALL taugb23_gpu(ncol, nlayers, laytrop, jp, jt, jt1, laysolfr, &
+                        colh2o, colmol, &
+                        selffac, selffrac, indself, forfac, forfrac, indfor, &
+                        fac00, fac01, fac10, fac11, sfluxzen, taug, taur)
+
+      CALL laysolfr_lower_gpu(ncol, nlayers, laytrop, jp, layreffr24, laysolfr)
+      CALL taugb24_gpu(ncol, nlayers, laytrop, jp, jt, jt1, laysolfr, &
+                        colh2o, colo2, colo3, colmol, &
+                        selffac, selffrac, indself, forfac, forfrac, indfor, &
+                        fac00, fac01, fac10, fac11, sfluxzen, taug, taur)
+
+      CALL laysolfr_lower_gpu(ncol, nlayers, laytrop, jp, layreffr25, laysolfr)
+      CALL taugb25_gpu(ncol, nlayers, laytrop, jp, jt, jt1, laysolfr, &
+                        colh2o, colo3, colmol, &
+                        fac00, fac01, fac10, fac11, sfluxzen, taug, taur)
+
+      CALL taugb26_gpu(ncol, nlayers, laytrop, colmol, sfluxzen, taug, taur)
+
+      CALL laysolfr_upper_gpu(ncol, nlayers, laytrop, jp, layreffr27, laysolfr)
+      CALL taugb27_gpu(ncol, nlayers, laytrop, jp, jt, jt1, laysolfr, &
+                        colo3, colmol, &
+                        fac00, fac01, fac10, fac11, sfluxzen, taug, taur)
+
+      CALL laysolfr_upper_gpu(ncol, nlayers, laytrop, jp, layreffr28, laysolfr)
+      CALL taugb28_gpu(ncol, nlayers, laytrop, jp, jt, jt1, laysolfr, &
+                        colo2, colo3, colmol, &
+                        fac00, fac01, fac10, fac11, sfluxzen, taug, taur)
+
+      CALL laysolfr_upper_gpu(ncol, nlayers, laytrop, jp, layreffr29, laysolfr)
+      CALL taugb29_gpu(ncol, nlayers, laytrop, jp, jt, jt1, laysolfr, &
+                        colh2o, colco2, colmol, &
+                        selffac, selffrac, indself, forfac, forfrac, indfor, &
+                        fac00, fac01, fac10, fac11, sfluxzen, taug, taur)
+
+!$acc exit data delete(laysolfr)
+
+      END SUBROUTINE taumol_sw_driver_gpu
+
+      END MODULE rrtmg_sw_taumol_gpu
+#endif
+
 !     path:      $Source: /cvsroot/NWP/WRFV3/phys/module_ra_rrtmg_sw.F,v $
 !     author:    $Author: trn $
 !     revision:  $Revision: 1.3 $
