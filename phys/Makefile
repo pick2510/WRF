@@ -218,6 +218,14 @@ $(LIBTARGET) :
 
 include ../configure.wrf
 
+# Keep the OpenACC radiation port limited to RRTMG. GPU_RAD_FLAGS is empty in
+# every CPU configuration, so those builds continue to use the ordinary
+# implicit compilation rule unchanged (mirrors dyn_em/Makefile's GPU_DYN_FLAGS
+# stanza for the dynamics port).
+ifneq ($(GPU_RAD_FLAGS),)
+module_ra_rrtmg_lw.o module_radiation_driver.o: FCFLAGS += $(GPU_RAD_FLAGS)
+endif
+
 nmm_contrib : $(NMM_OBJS) $(NMM_MODULES) $(MODULES) $(OBJS) $(DIAGNOSTIC_MODULES_NMM)
 
 non_nmm : $(MODULES) $(FIRE_MODULES) $(WIND_MODULES) $(OBJS) $(DIAGNOSTIC_MODULES_EM)

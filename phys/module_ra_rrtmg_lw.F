@@ -2915,6 +2915,244 @@ contains
 
       end module rrtmg_lw_cldprmc
 
+#ifdef WRF_GPU_RAD
+!-------------------------------------------------------------------------------
+!  GPU (OpenACC) port of cldprmc, RRTMG-LW's per-column McICA cloud optical
+!  depth calculation -- see plan.md "GPU Port: RRTMG Radiation" and the
+!  taugb1_gpu header comment above for the general restructuring rationale.
+!  The original CPU cldprmc above is untouched.
+!
+!  Unlike taumol/setcoef, cldprmc has NO troposphere/stratosphere split and
+!  every (g-point, layer) cell is already fully independent -- the ncol-major
+!  restructuring here is a plain collapse(3) over (column, g-point, layer),
+!  no laytrop-style branch needed.
+!
+!  The original has several STOP/wrf_error_fatal calls guarding physically
+!  invalid inputs (an ice/liquid/snow effective radius outside the table's
+!  valid range) -- device code cannot STOP, so, following the same pattern
+!  already used for advect_u's wrf_error_fatal hoist in dyn_em, those checks
+!  are hoisted into a host-side pre-validation pass (cldprmc_prep_gpu below)
+!  that runs once before the device kernel and aborts on the host if any
+!  input is out of bounds; the device kernel itself (cldprmc_gpu) then never
+!  needs to branch to an error path. cldprmc_prep_gpu also computes ncbands
+!  -- inspection of the original shows its value is a deterministic function
+!  of inflag/iceflag alone (1, 5, or 16, only assigned when a cloudy cell
+!  with nonzero ice/snow is actually encountered), not a data-dependent
+!  reduction, so it is safe and equivalent to compute on the host in the
+!  same pass rather than write it from many GPU threads.
+!
+!  inflag=0 (optical depth already supplied in taucmc) is a full no-op in
+!  the original (an early RETURN on the first qualifying cell, before which
+!  nothing has been touched, and after which nothing would be touched
+!  either since every remaining cell takes the same branch) -- callers
+!  should simply skip calling cldprmc_gpu when inflag==0. inflag=1 is not
+!  implemented in the original (unconditional STOP) and remains so here,
+!  reported by the host pre-validation.
+!-------------------------------------------------------------------------------
+      MODULE rrtmg_lw_cldprmc_gpu
+
+      CONTAINS
+
+      SUBROUTINE cldprmc_prep_gpu(ncol, nlayers, inflag, iceflag, liqflag, &
+                                   cldfmc, ciwpmc, clwpmc, cswpmc, &
+                                   reicmc, relqmc, resnmc, taucmc, ncbands)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrtm, only : ngptlw, nbndlw
+      use rrlw_wvn, only: ngb
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, inflag, iceflag, liqflag
+      REAL(kind=rb), INTENT(IN) :: cldfmc(ncol,ngptlw,nlayers)
+      REAL(kind=rb), INTENT(IN) :: ciwpmc(ncol,ngptlw,nlayers), &
+                                    clwpmc(ncol,ngptlw,nlayers), &
+                                    cswpmc(ncol,ngptlw,nlayers)
+      REAL(kind=rb), INTENT(IN) :: reicmc(ncol,nlayers), relqmc(ncol,nlayers), &
+                                    resnmc(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: taucmc(ncol,ngptlw,nlayers)
+      INTEGER(kind=im), INTENT(OUT) :: ncbands(ncol)
+
+      INTEGER(kind=im) :: iplon, lay, ig
+      INTEGER(kind=im) :: icb(nbndlw)
+      REAL(kind=rb) :: cwp, radice, radliq, radsno
+      REAL(kind=rb), PARAMETER :: cldmin = 1.e-20_rb
+      CHARACTER*80 :: errmess
+
+      data icb /1,2,3,3,3,4,4,4,5, 5, 5, 5, 5, 5, 5, 5/
+
+      IF (inflag .eq. 1) THEN
+         CALL wrf_error_fatal('cldprmc_prep_gpu: INFLAG = 1 OPTION NOT AVAILABLE WITH MCICA')
+      ENDIF
+
+      DO iplon = 1, ncol
+         ncbands(iplon) = 1
+         IF (inflag .lt. 2) CYCLE
+         DO lay = 1, nlayers
+            DO ig = 1, ngptlw
+               cwp = ciwpmc(iplon,ig,lay) + clwpmc(iplon,ig,lay) + cswpmc(iplon,ig,lay)
+               IF (cldfmc(iplon,ig,lay) .lt. cldmin) CYCLE
+               IF (cwp .lt. cldmin .and. taucmc(iplon,ig,lay) .lt. cldmin) CYCLE
+
+               radice = reicmc(iplon,lay)
+               IF ((ciwpmc(iplon,ig,lay)+cswpmc(iplon,ig,lay)) .ne. 0.0_rb) THEN
+                  IF (iceflag .eq. 0) THEN
+                     IF (radice .lt. 10.0_rb) CALL wrf_error_fatal('cldprmc_prep_gpu: ICE RADIUS TOO SMALL')
+                  ELSEIF (iceflag .eq. 1) THEN
+                     IF (radice .lt. 13.0_rb .or. radice .gt. 130._rb) &
+                        CALL wrf_error_fatal('cldprmc_prep_gpu: ICE RADIUS OUT OF BOUNDS')
+                     ncbands(iplon) = 5
+                  ELSEIF (iceflag .eq. 2) THEN
+                     IF (radice .lt. 5.0_rb .or. radice .gt. 131.0_rb) &
+                        CALL wrf_error_fatal('cldprmc_prep_gpu: ICE RADIUS OUT OF BOUNDS')
+                     ncbands(iplon) = 16
+                  ELSEIF (iceflag .ge. 3) THEN
+                     IF (radice .lt. 5.0_rb .or. radice .gt. 140.0_rb) THEN
+                        WRITE(errmess,'(A,i5,i5,f8.2,f8.2)') &
+                           'cldprmc_prep_gpu: ICE GENERALIZED EFFECTIVE SIZE OUT OF BOUNDS', &
+                           ig, lay, ciwpmc(iplon,ig,lay), radice
+                        CALL wrf_error_fatal(errmess)
+                     ENDIF
+                     ncbands(iplon) = 16
+                  ENDIF
+               ENDIF
+
+               IF (cswpmc(iplon,ig,lay) .gt. 0.0_rb .and. iceflag .eq. 5) THEN
+                  radsno = resnmc(iplon,lay)
+                  IF (radsno .lt. 5.0_rb .or. radsno .gt. 140.0_rb) THEN
+                     WRITE(errmess,'(A,i5,i5,f8.2,f8.2)') &
+                        'cldprmc_prep_gpu: SNOW GENERALIZED EFFECTIVE SIZE OUT OF BOUNDS', &
+                        ig, lay, cswpmc(iplon,ig,lay), radsno
+                     CALL wrf_error_fatal(errmess)
+                  ENDIF
+                  ncbands(iplon) = 16
+               ENDIF
+
+               IF (clwpmc(iplon,ig,lay) .ne. 0.0_rb .and. liqflag .eq. 1) THEN
+                  radliq = relqmc(iplon,lay)
+                  IF (radliq .lt. 2.5_rb .or. radliq .gt. 60._rb) &
+                     CALL wrf_error_fatal('cldprmc_prep_gpu: LIQUID EFFECTIVE RADIUS OUT OF BOUNDS')
+               ENDIF
+
+            ENDDO
+         ENDDO
+      ENDDO
+
+      END SUBROUTINE cldprmc_prep_gpu
+
+      SUBROUTINE cldprmc_gpu(ncol, nlayers, inflag, iceflag, liqflag, &
+                              cldfmc, ciwpmc, clwpmc, cswpmc, &
+                              reicmc, relqmc, resnmc, taucmc)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrtm, only : ngptlw, nbndlw
+      use rrlw_cld, only: absliq0, absliq1, absice0, absice1, absice2, absice3
+      use rrlw_wvn, only: ngb
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, inflag, iceflag, liqflag
+      REAL(kind=rb), INTENT(IN) :: cldfmc(ncol,ngptlw,nlayers)
+      REAL(kind=rb), INTENT(IN) :: ciwpmc(ncol,ngptlw,nlayers), &
+                                    clwpmc(ncol,ngptlw,nlayers), &
+                                    cswpmc(ncol,ngptlw,nlayers)
+      REAL(kind=rb), INTENT(IN) :: reicmc(ncol,nlayers), relqmc(ncol,nlayers), &
+                                    resnmc(ncol,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: taucmc(ncol,ngptlw,nlayers)
+
+      INTEGER(kind=im) :: iplon, lay, ig, ib, index
+      INTEGER(kind=im) :: icb(nbndlw)
+      REAL(kind=rb) :: cwp, radice, factor, fint, radliq, radsno
+      REAL(kind=rb) :: abscoice, abscoliq, abscosno
+      REAL(kind=rb), PARAMETER :: cldmin = 1.e-20_rb
+
+      data icb /1,2,3,3,3,4,4,4,5, 5, 5, 5, 5, 5, 5, 5/
+
+      IF (inflag .lt. 2) RETURN
+
+!$acc parallel loop collapse(3) &
+!$acc   private(cwp, radice, factor, fint, ib, index, radliq, radsno) &
+!$acc   private(abscoice, abscoliq, abscosno) &
+!$acc   present(cldfmc, ciwpmc, clwpmc, cswpmc, reicmc, relqmc, resnmc, taucmc) &
+!$acc   present(absliq0, absliq1, absice0, absice1, absice2, absice3, ngb) &
+!$acc   copyin(icb)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+      DO ig = 1, ngptlw
+
+         cwp = ciwpmc(iplon,ig,lay) + clwpmc(iplon,ig,lay) + cswpmc(iplon,ig,lay)
+         IF (cldfmc(iplon,ig,lay) .ge. cldmin .and. &
+            (cwp .ge. cldmin .or. taucmc(iplon,ig,lay) .ge. cldmin)) THEN
+
+            radice = reicmc(iplon,lay)
+            abscosno = 0.0_rb
+
+            IF ((ciwpmc(iplon,ig,lay)+cswpmc(iplon,ig,lay)) .eq. 0.0_rb) THEN
+               abscoice = 0.0_rb
+            ELSEIF (iceflag .eq. 0) THEN
+               abscoice = absice0(1) + absice0(2)/radice
+            ELSEIF (iceflag .eq. 1) THEN
+               ib = icb(ngb(ig))
+               abscoice = absice1(1,ib) + absice1(2,ib)/radice
+            ELSEIF (iceflag .eq. 2) THEN
+               factor = (radice - 2._rb)/3._rb
+               index = int(factor)
+               IF (index .eq. 43) index = 42
+               fint = factor - float(index)
+               ib = ngb(ig)
+               abscoice = absice2(index,ib) + fint * &
+                          (absice2(index+1,ib) - (absice2(index,ib)))
+            ELSEIF (iceflag .ge. 3) THEN
+               factor = (radice - 2._rb)/3._rb
+               index = int(factor)
+               IF (index .eq. 46) index = 45
+               fint = factor - float(index)
+               ib = ngb(ig)
+               abscoice = absice3(index,ib) + fint * &
+                          (absice3(index+1,ib) - (absice3(index,ib)))
+            ENDIF
+
+            IF (cswpmc(iplon,ig,lay) .gt. 0.0_rb .and. iceflag .eq. 5) THEN
+               radsno = resnmc(iplon,lay)
+               factor = (radsno - 2._rb)/3._rb
+               index = int(factor)
+               IF (index .eq. 46) index = 45
+               fint = factor - float(index)
+               ib = ngb(ig)
+               abscosno = absice3(index,ib) + fint * &
+                          (absice3(index+1,ib) - (absice3(index,ib)))
+            ENDIF
+
+            IF (clwpmc(iplon,ig,lay) .eq. 0.0_rb) THEN
+               abscoliq = 0.0_rb
+            ELSEIF (liqflag .eq. 0) THEN
+               abscoliq = absliq0
+            ELSEIF (liqflag .eq. 1) THEN
+               radliq = relqmc(iplon,lay)
+               index = int(radliq - 1.5_rb)
+               IF (index .eq. 0) index = 1
+               IF (index .eq. 58) index = 57
+               fint = radliq - 1.5_rb - float(index)
+               ib = ngb(ig)
+               abscoliq = absliq1(index,ib) + fint * &
+                          (absliq1(index+1,ib) - (absliq1(index,ib)))
+            ENDIF
+
+            taucmc(iplon,ig,lay) = ciwpmc(iplon,ig,lay) * abscoice + &
+                                    clwpmc(iplon,ig,lay) * abscoliq + &
+                                    cswpmc(iplon,ig,lay) * abscosno
+
+         ENDIF
+
+      ENDDO
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE cldprmc_gpu
+
+      END MODULE rrtmg_lw_cldprmc_gpu
+#endif
+
 !     path:      $Source: /cvsroot/NWP/WRFV3/phys/module_ra_rrtmg_lw.F,v $
 !     author:    $Author: trn $
 !     revision:  $Revision: 1.3 $
@@ -4678,6 +4916,443 @@ contains
       end subroutine lwavplank
 
       end module rrtmg_lw_setcoef
+
+#ifdef WRF_GPU_RAD
+!-------------------------------------------------------------------------------
+!  GPU (OpenACC) port of setcoef, RRTMG-LW's per-column pressure/temperature
+!  interpolation-index and Planck-function setup -- see plan.md "GPU Port:
+!  RRTMG Radiation" and the taugb1_gpu header comment above for the general
+!  restructuring rationale (ncol-major arrays, one column-batched kernel
+!  instead of ncol=1 per-call). The original CPU setcoef above is untouched.
+!
+!  Two GOTO-driven regimes (label 5300 splits "at/below tropopause" from
+!  "above tropopause" processing) become a single IF/ELSE branch per
+!  (iplon,lay) inside one collapse(2) kernel -- the branch condition itself
+!  ("plog .gt. 4.56", i.e. pressure above ~100mb) is evaluated per layer
+!  directly from that layer's own pressure, exactly as the original did
+!  (laytrop is only ever used there as an *output* counter, never to decide
+!  the branch), so no cross-layer dependency is introduced.
+!
+!  laytrop(ncol) itself -- a count of how many layers satisfy that
+!  condition -- is computed by a separate, small reduction kernel
+!  (laytrop_gpu below) rather than folded into the main collapse(2) loop,
+!  since a per-column running count can't be expressed as an independent
+!  (iplon,lay) grid point; the count is order-independent (addition is
+!  commutative) so a "!$acc loop vector reduction(+:cnt)" gives the same
+!  result as the original's sequential accumulation.
+!
+!  The lay==1-only Planck setup (boundary emission plankbnd and the level-0
+!  planklev term, both independent of lay once indbound/indlev0 are fixed by
+!  tbound/tz(iplon,0)) is hoisted out of the layer loop into its own small
+!  per-column kernel (setcoef_bnd_gpu below) instead of being guarded by
+!  "if (lay.eq.1)" inside the layer loop -- a straightforward hoist of
+!  loop-invariant work, not a functional change.
+!
+!  wkl follows the same species-last convention adopted for wx in the
+!  taugb*_gpu port: original is wkl(species,layer) (mxmol species); here it
+!  is wkl(iplon,lay,species).
+!-------------------------------------------------------------------------------
+      MODULE rrtmg_lw_setcoef_gpu
+
+      CONTAINS
+
+      SUBROUTINE laytrop_gpu(ncol, nlayers, pavel, laytrop)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers
+      REAL(kind=rb), INTENT(IN) :: pavel(ncol,nlayers)
+      INTEGER(kind=im), INTENT(OUT) :: laytrop(ncol)
+
+      INTEGER(kind=im) :: iplon, lay, cnt
+
+!$acc parallel loop private(cnt) &
+!$acc   present(pavel, laytrop)
+      DO iplon = 1, ncol
+         cnt = 0
+!$acc loop vector reduction(+:cnt)
+         DO lay = 1, nlayers
+            IF (log(pavel(iplon,lay)) .gt. 4.56_rb) THEN
+               cnt = cnt + 1
+            ENDIF
+         ENDDO
+         laytrop(iplon) = cnt
+      ENDDO
+
+      END SUBROUTINE laytrop_gpu
+
+      SUBROUTINE setcoef_bnd_gpu(ncol, nlayers, istart, tbound, tz, semiss, &
+                                  plankbnd, planklev)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use rrlw_wvn, only: totplnk, totplk16
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, istart
+      REAL(kind=rb), INTENT(IN) :: tbound(ncol)
+      REAL(kind=rb), INTENT(IN) :: tz(ncol,0:nlayers)
+      REAL(kind=rb), INTENT(IN) :: semiss(ncol,16)
+      REAL(kind=rb), INTENT(INOUT) :: plankbnd(ncol,16)
+      REAL(kind=rb), INTENT(INOUT) :: planklev(ncol,0:nlayers,16)
+
+      INTEGER(kind=im) :: iplon, iband, indbound, indlev0
+      REAL(kind=rb) :: tbndfrac, t0frac, dbdtlev
+
+!$acc parallel loop private(indbound, tbndfrac, indlev0, t0frac, iband, dbdtlev) &
+!$acc   present(tbound, tz, semiss, plankbnd, planklev) &
+!$acc   present(totplnk, totplk16)
+      DO iplon = 1, ncol
+         indbound = tbound(iplon) - 159._rb
+         IF (indbound .lt. 1) THEN
+            indbound = 1
+         ELSEIF (indbound .gt. 180) THEN
+            indbound = 180
+         ENDIF
+         tbndfrac = tbound(iplon) - 159._rb - float(indbound)
+         indlev0 = tz(iplon,0) - 159._rb
+         IF (indlev0 .lt. 1) THEN
+            indlev0 = 1
+         ELSEIF (indlev0 .gt. 180) THEN
+            indlev0 = 180
+         ENDIF
+         t0frac = tz(iplon,0) - 159._rb - float(indlev0)
+
+         DO iband = 1, 15
+            dbdtlev = totplnk(indbound+1,iband) - totplnk(indbound,iband)
+            plankbnd(iplon,iband) = semiss(iplon,iband) * &
+                (totplnk(indbound,iband) + tbndfrac * dbdtlev)
+            dbdtlev = totplnk(indlev0+1,iband) - totplnk(indlev0,iband)
+            planklev(iplon,0,iband) = totplnk(indlev0,iband) + t0frac * dbdtlev
+         ENDDO
+
+         iband = 16
+         IF (istart .eq. 16) THEN
+            dbdtlev = totplk16(indbound+1) - totplk16(indbound)
+            plankbnd(iplon,iband) = semiss(iplon,iband) * &
+                 (totplk16(indbound) + tbndfrac * dbdtlev)
+            dbdtlev = totplnk(indlev0+1,iband) - totplnk(indlev0,iband)
+            planklev(iplon,0,iband) = totplk16(indlev0) + t0frac * dbdtlev
+         ELSE
+            dbdtlev = totplnk(indbound+1,iband) - totplnk(indbound,iband)
+            plankbnd(iplon,iband) = semiss(iplon,iband) * &
+                 (totplnk(indbound,iband) + tbndfrac * dbdtlev)
+            dbdtlev = totplnk(indlev0+1,iband) - totplnk(indlev0,iband)
+            planklev(iplon,0,iband) = totplnk(indlev0,iband) + t0frac * dbdtlev
+         ENDIF
+      ENDDO
+
+      END SUBROUTINE setcoef_bnd_gpu
+
+      SUBROUTINE setcoef_gpu(ncol, nlayers, istart, pavel, tavel, tz, &
+                         coldry, wkl, wbroad, &
+                         jp, jt, jt1, planklay, planklev, &
+                         colh2o, colco2, colo3, coln2o, colco, colch4, colo2, &
+                         colbrd, fac00, fac01, fac10, fac11, &
+                         rat_h2oco2, rat_h2oco2_1, rat_h2oo3, rat_h2oo3_1, &
+                         rat_h2on2o, rat_h2on2o_1, rat_h2och4, rat_h2och4_1, &
+                         rat_n2oco2, rat_n2oco2_1, rat_o3co2, rat_o3co2_1, &
+                         selffac, selffrac, indself, forfac, forfrac, indfor, &
+                         minorfrac, scaleminor, scaleminorn2, indminor)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use rrlw_wvn, only: totplnk, totplk16
+      use rrlw_ref, only: preflog, tref, chi_mls
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, istart
+
+      REAL(kind=rb), INTENT(IN) :: pavel(ncol,nlayers), tavel(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: tz(ncol,0:nlayers)
+      REAL(kind=rb), INTENT(IN) :: coldry(ncol,nlayers), wbroad(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: wkl(ncol,nlayers,7)
+
+      INTEGER(kind=im), INTENT(OUT) :: jp(ncol,nlayers), jt(ncol,nlayers), &
+                                        jt1(ncol,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: planklay(ncol,nlayers,16)
+      REAL(kind=rb), INTENT(INOUT) :: planklev(ncol,0:nlayers,16)
+
+      REAL(kind=rb), INTENT(OUT) :: colh2o(ncol,nlayers), colco2(ncol,nlayers), &
+                                     colo3(ncol,nlayers), coln2o(ncol,nlayers), &
+                                     colco(ncol,nlayers), colch4(ncol,nlayers), &
+                                     colo2(ncol,nlayers), colbrd(ncol,nlayers)
+
+      INTEGER(kind=im), INTENT(OUT) :: indself(ncol,nlayers), indfor(ncol,nlayers), &
+                                        indminor(ncol,nlayers)
+      REAL(kind=rb), INTENT(OUT) :: selffac(ncol,nlayers), selffrac(ncol,nlayers), &
+                                     forfac(ncol,nlayers), forfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(OUT) :: minorfrac(ncol,nlayers), scaleminor(ncol,nlayers), &
+                                     scaleminorn2(ncol,nlayers)
+
+      REAL(kind=rb), INTENT(OUT) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                     fac10(ncol,nlayers), fac11(ncol,nlayers)
+      REAL(kind=rb), INTENT(OUT) :: rat_h2oco2(ncol,nlayers), rat_h2oco2_1(ncol,nlayers), &
+                                     rat_h2oo3(ncol,nlayers), rat_h2oo3_1(ncol,nlayers), &
+                                     rat_h2on2o(ncol,nlayers), rat_h2on2o_1(ncol,nlayers), &
+                                     rat_h2och4(ncol,nlayers), rat_h2och4_1(ncol,nlayers), &
+                                     rat_n2oco2(ncol,nlayers), rat_n2oco2_1(ncol,nlayers), &
+                                     rat_o3co2(ncol,nlayers), rat_o3co2_1(ncol,nlayers)
+
+      INTEGER(kind=im) :: iplon, lay, iband, jp1
+      INTEGER(kind=im) :: indlay, indlev
+      REAL(kind=rb) :: stpfac, tlayfrac, tlevfrac
+      REAL(kind=rb) :: dbdtlev, dbdtlay
+      REAL(kind=rb) :: plog, fp, ft, ft1, water, scalefac, factor, compfp
+
+      stpfac = 296._rb/1013._rb
+
+!$acc parallel loop collapse(2) &
+!$acc   private(iband, indlay, indlev, tlayfrac, tlevfrac, dbdtlev, dbdtlay) &
+!$acc   private(plog, jp1, fp, ft, ft1, water, scalefac, factor, compfp) &
+!$acc   present(pavel, tavel, tz, coldry, wbroad, wkl) &
+!$acc   present(jp, jt, jt1, planklay, planklev) &
+!$acc   present(colh2o, colco2, colo3, coln2o, colco, colch4, colo2, colbrd) &
+!$acc   present(indself, indfor, indminor, selffac, selffrac, forfac, forfrac) &
+!$acc   present(minorfrac, scaleminor, scaleminorn2) &
+!$acc   present(fac00, fac01, fac10, fac11) &
+!$acc   present(rat_h2oco2, rat_h2oco2_1, rat_h2oo3, rat_h2oo3_1) &
+!$acc   present(rat_h2on2o, rat_h2on2o_1, rat_h2och4, rat_h2och4_1) &
+!$acc   present(rat_n2oco2, rat_n2oco2_1, rat_o3co2, rat_o3co2_1) &
+!$acc   present(totplnk, totplk16, preflog, tref, chi_mls)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+
+         indlay = tavel(iplon,lay) - 159._rb
+         IF (indlay .lt. 1) THEN
+            indlay = 1
+         ELSEIF (indlay .gt. 180) THEN
+            indlay = 180
+         ENDIF
+         tlayfrac = tavel(iplon,lay) - 159._rb - float(indlay)
+         indlev = tz(iplon,lay) - 159._rb
+         IF (indlev .lt. 1) THEN
+            indlev = 1
+         ELSEIF (indlev .gt. 180) THEN
+            indlev = 180
+         ENDIF
+         tlevfrac = tz(iplon,lay) - 159._rb - float(indlev)
+
+         DO iband = 1, 15
+            dbdtlev = totplnk(indlev+1,iband) - totplnk(indlev,iband)
+            dbdtlay = totplnk(indlay+1,iband) - totplnk(indlay,iband)
+            planklay(iplon,lay,iband) = totplnk(indlay,iband) + tlayfrac * dbdtlay
+            planklev(iplon,lay,iband) = totplnk(indlev,iband) + tlevfrac * dbdtlev
+         ENDDO
+
+         iband = 16
+         IF (istart .eq. 16) THEN
+            dbdtlev = totplk16(indlev+1) - totplk16(indlev)
+            dbdtlay = totplk16(indlay+1) - totplk16(indlay)
+            planklay(iplon,lay,iband) = totplk16(indlay) + tlayfrac * dbdtlay
+            planklev(iplon,lay,iband) = totplk16(indlev) + tlevfrac * dbdtlev
+         ELSE
+            dbdtlev = totplnk(indlev+1,iband) - totplnk(indlev,iband)
+            dbdtlay = totplnk(indlay+1,iband) - totplnk(indlay,iband)
+            planklay(iplon,lay,iband) = totplnk(indlay,iband) + tlayfrac * dbdtlay
+            planklev(iplon,lay,iband) = totplnk(indlev,iband) + tlevfrac * dbdtlev
+         ENDIF
+
+         plog = log(pavel(iplon,lay))
+         jp(iplon,lay) = int(36._rb - 5*(plog+0.04_rb))
+         IF (jp(iplon,lay) .lt. 1) THEN
+            jp(iplon,lay) = 1
+         ELSEIF (jp(iplon,lay) .gt. 58) THEN
+            jp(iplon,lay) = 58
+         ENDIF
+         jp1 = jp(iplon,lay) + 1
+         fp = 5._rb * (preflog(jp(iplon,lay)) - plog)
+
+         jt(iplon,lay) = int(3._rb + (tavel(iplon,lay)-tref(jp(iplon,lay)))/15._rb)
+         IF (jt(iplon,lay) .lt. 1) THEN
+            jt(iplon,lay) = 1
+         ELSEIF (jt(iplon,lay) .gt. 4) THEN
+            jt(iplon,lay) = 4
+         ENDIF
+         ft = ((tavel(iplon,lay)-tref(jp(iplon,lay)))/15._rb) - float(jt(iplon,lay)-3)
+         jt1(iplon,lay) = int(3._rb + (tavel(iplon,lay)-tref(jp1))/15._rb)
+         IF (jt1(iplon,lay) .lt. 1) THEN
+            jt1(iplon,lay) = 1
+         ELSEIF (jt1(iplon,lay) .gt. 4) THEN
+            jt1(iplon,lay) = 4
+         ENDIF
+         ft1 = ((tavel(iplon,lay)-tref(jp1))/15._rb) - float(jt1(iplon,lay)-3)
+         water = wkl(iplon,lay,1)/coldry(iplon,lay)
+         scalefac = pavel(iplon,lay) * stpfac / tavel(iplon,lay)
+
+         IF (plog .gt. 4.56_rb) THEN
+
+            forfac(iplon,lay) = scalefac / (1.+water)
+            factor = (332.0_rb-tavel(iplon,lay))/36.0_rb
+            indfor(iplon,lay) = min(2, max(1, int(factor)))
+            forfrac(iplon,lay) = factor - float(indfor(iplon,lay))
+
+            selffac(iplon,lay) = water * forfac(iplon,lay)
+            factor = (tavel(iplon,lay)-188.0_rb)/7.2_rb
+            indself(iplon,lay) = min(9, max(1, int(factor)-7))
+            selffrac(iplon,lay) = factor - float(indself(iplon,lay) + 7)
+
+            scaleminor(iplon,lay) = pavel(iplon,lay)/tavel(iplon,lay)
+            scaleminorn2(iplon,lay) = (pavel(iplon,lay)/tavel(iplon,lay)) &
+                * (wbroad(iplon,lay)/(coldry(iplon,lay)+wkl(iplon,lay,1)))
+            factor = (tavel(iplon,lay)-180.8_rb)/7.2_rb
+            indminor(iplon,lay) = min(18, max(1, int(factor)))
+            minorfrac(iplon,lay) = factor - float(indminor(iplon,lay))
+
+            rat_h2oco2(iplon,lay) = chi_mls(1,jp(iplon,lay))/chi_mls(2,jp(iplon,lay))
+            rat_h2oco2_1(iplon,lay) = chi_mls(1,jp(iplon,lay)+1)/chi_mls(2,jp(iplon,lay)+1)
+
+            rat_h2oo3(iplon,lay) = chi_mls(1,jp(iplon,lay))/chi_mls(3,jp(iplon,lay))
+            rat_h2oo3_1(iplon,lay) = chi_mls(1,jp(iplon,lay)+1)/chi_mls(3,jp(iplon,lay)+1)
+
+            rat_h2on2o(iplon,lay) = chi_mls(1,jp(iplon,lay))/chi_mls(4,jp(iplon,lay))
+            rat_h2on2o_1(iplon,lay) = chi_mls(1,jp(iplon,lay)+1)/chi_mls(4,jp(iplon,lay)+1)
+
+            rat_h2och4(iplon,lay) = chi_mls(1,jp(iplon,lay))/chi_mls(6,jp(iplon,lay))
+            rat_h2och4_1(iplon,lay) = chi_mls(1,jp(iplon,lay)+1)/chi_mls(6,jp(iplon,lay)+1)
+
+            rat_n2oco2(iplon,lay) = chi_mls(4,jp(iplon,lay))/chi_mls(2,jp(iplon,lay))
+            rat_n2oco2_1(iplon,lay) = chi_mls(4,jp(iplon,lay)+1)/chi_mls(2,jp(iplon,lay)+1)
+
+            colh2o(iplon,lay) = 1.e-20_rb * wkl(iplon,lay,1)
+            colco2(iplon,lay) = 1.e-20_rb * wkl(iplon,lay,2)
+            colo3(iplon,lay) = 1.e-20_rb * wkl(iplon,lay,3)
+            coln2o(iplon,lay) = 1.e-20_rb * wkl(iplon,lay,4)
+            colco(iplon,lay) = 1.e-20_rb * wkl(iplon,lay,5)
+            colch4(iplon,lay) = 1.e-20_rb * wkl(iplon,lay,6)
+            colo2(iplon,lay) = 1.e-20_rb * wkl(iplon,lay,7)
+            IF (colco2(iplon,lay) .eq. 0._rb) colco2(iplon,lay) = 1.e-32_rb * coldry(iplon,lay)
+            IF (colo3(iplon,lay) .eq. 0._rb) colo3(iplon,lay) = 1.e-32_rb * coldry(iplon,lay)
+            IF (coln2o(iplon,lay) .eq. 0._rb) coln2o(iplon,lay) = 1.e-32_rb * coldry(iplon,lay)
+            IF (colco(iplon,lay) .eq. 0._rb) colco(iplon,lay) = 1.e-32_rb * coldry(iplon,lay)
+            IF (colch4(iplon,lay) .eq. 0._rb) colch4(iplon,lay) = 1.e-32_rb * coldry(iplon,lay)
+            colbrd(iplon,lay) = 1.e-20_rb * wbroad(iplon,lay)
+
+         ELSE
+
+            forfac(iplon,lay) = scalefac / (1.+water)
+            factor = (tavel(iplon,lay)-188.0_rb)/36.0_rb
+            indfor(iplon,lay) = 3
+            forfrac(iplon,lay) = factor - 1.0_rb
+
+            selffac(iplon,lay) = water * forfac(iplon,lay)
+
+            scaleminor(iplon,lay) = pavel(iplon,lay)/tavel(iplon,lay)
+            scaleminorn2(iplon,lay) = (pavel(iplon,lay)/tavel(iplon,lay)) &
+                * (wbroad(iplon,lay)/(coldry(iplon,lay)+wkl(iplon,lay,1)))
+            factor = (tavel(iplon,lay)-180.8_rb)/7.2_rb
+            indminor(iplon,lay) = min(18, max(1, int(factor)))
+            minorfrac(iplon,lay) = factor - float(indminor(iplon,lay))
+
+            rat_h2oco2(iplon,lay) = chi_mls(1,jp(iplon,lay))/chi_mls(2,jp(iplon,lay))
+            rat_h2oco2_1(iplon,lay) = chi_mls(1,jp(iplon,lay)+1)/chi_mls(2,jp(iplon,lay)+1)
+
+            rat_o3co2(iplon,lay) = chi_mls(3,jp(iplon,lay))/chi_mls(2,jp(iplon,lay))
+            rat_o3co2_1(iplon,lay) = chi_mls(3,jp(iplon,lay)+1)/chi_mls(2,jp(iplon,lay)+1)
+
+            colh2o(iplon,lay) = 1.e-20_rb * wkl(iplon,lay,1)
+            colco2(iplon,lay) = 1.e-20_rb * wkl(iplon,lay,2)
+            colo3(iplon,lay) = 1.e-20_rb * wkl(iplon,lay,3)
+            coln2o(iplon,lay) = 1.e-20_rb * wkl(iplon,lay,4)
+            colco(iplon,lay) = 1.e-20_rb * wkl(iplon,lay,5)
+            colch4(iplon,lay) = 1.e-20_rb * wkl(iplon,lay,6)
+            colo2(iplon,lay) = 1.e-20_rb * wkl(iplon,lay,7)
+            IF (colco2(iplon,lay) .eq. 0._rb) colco2(iplon,lay) = 1.e-32_rb * coldry(iplon,lay)
+            IF (colo3(iplon,lay) .eq. 0._rb) colo3(iplon,lay) = 1.e-32_rb * coldry(iplon,lay)
+            IF (coln2o(iplon,lay) .eq. 0._rb) coln2o(iplon,lay) = 1.e-32_rb * coldry(iplon,lay)
+            IF (colco(iplon,lay) .eq. 0._rb) colco(iplon,lay) = 1.e-32_rb * coldry(iplon,lay)
+            IF (colch4(iplon,lay) .eq. 0._rb) colch4(iplon,lay) = 1.e-32_rb * coldry(iplon,lay)
+            colbrd(iplon,lay) = 1.e-20_rb * wbroad(iplon,lay)
+
+         ENDIF
+
+         compfp = 1. - fp
+         fac10(iplon,lay) = compfp * ft
+         fac00(iplon,lay) = compfp * (1._rb - ft)
+         fac11(iplon,lay) = fp * ft1
+         fac01(iplon,lay) = fp * (1._rb - ft1)
+
+         selffac(iplon,lay) = colh2o(iplon,lay) * selffac(iplon,lay)
+         forfac(iplon,lay) = colh2o(iplon,lay) * forfac(iplon,lay)
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE setcoef_gpu
+
+! Single entry point bundling laytrop_gpu + setcoef_bnd_gpu + setcoef_gpu,
+! mirroring how taumol_gpu bundles taugb1_gpu..taugb16_gpu into one call.
+      SUBROUTINE setcoef_driver_gpu(ncol, nlayers, istart, pavel, tavel, tz, &
+                         tbound, semiss, coldry, wkl, wbroad, &
+                         laytrop, jp, jt, jt1, planklay, planklev, plankbnd, &
+                         colh2o, colco2, colo3, coln2o, colco, colch4, colo2, &
+                         colbrd, fac00, fac01, fac10, fac11, &
+                         rat_h2oco2, rat_h2oco2_1, rat_h2oo3, rat_h2oo3_1, &
+                         rat_h2on2o, rat_h2on2o_1, rat_h2och4, rat_h2och4_1, &
+                         rat_n2oco2, rat_n2oco2_1, rat_o3co2, rat_o3co2_1, &
+                         selffac, selffrac, indself, forfac, forfrac, indfor, &
+                         minorfrac, scaleminor, scaleminorn2, indminor)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, istart
+      REAL(kind=rb), INTENT(IN) :: pavel(ncol,nlayers), tavel(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: tz(ncol,0:nlayers)
+      REAL(kind=rb), INTENT(IN) :: tbound(ncol)
+      REAL(kind=rb), INTENT(IN) :: semiss(ncol,16)
+      REAL(kind=rb), INTENT(IN) :: coldry(ncol,nlayers), wbroad(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: wkl(ncol,nlayers,7)
+
+      INTEGER(kind=im), INTENT(OUT) :: laytrop(ncol)
+      INTEGER(kind=im), INTENT(OUT) :: jp(ncol,nlayers), jt(ncol,nlayers), &
+                                        jt1(ncol,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: planklay(ncol,nlayers,16)
+      REAL(kind=rb), INTENT(INOUT) :: planklev(ncol,0:nlayers,16)
+      REAL(kind=rb), INTENT(INOUT) :: plankbnd(ncol,16)
+
+      REAL(kind=rb), INTENT(OUT) :: colh2o(ncol,nlayers), colco2(ncol,nlayers), &
+                                     colo3(ncol,nlayers), coln2o(ncol,nlayers), &
+                                     colco(ncol,nlayers), colch4(ncol,nlayers), &
+                                     colo2(ncol,nlayers), colbrd(ncol,nlayers)
+      INTEGER(kind=im), INTENT(OUT) :: indself(ncol,nlayers), indfor(ncol,nlayers), &
+                                        indminor(ncol,nlayers)
+      REAL(kind=rb), INTENT(OUT) :: selffac(ncol,nlayers), selffrac(ncol,nlayers), &
+                                     forfac(ncol,nlayers), forfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(OUT) :: minorfrac(ncol,nlayers), scaleminor(ncol,nlayers), &
+                                     scaleminorn2(ncol,nlayers)
+      REAL(kind=rb), INTENT(OUT) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                     fac10(ncol,nlayers), fac11(ncol,nlayers)
+      REAL(kind=rb), INTENT(OUT) :: rat_h2oco2(ncol,nlayers), rat_h2oco2_1(ncol,nlayers), &
+                                     rat_h2oo3(ncol,nlayers), rat_h2oo3_1(ncol,nlayers), &
+                                     rat_h2on2o(ncol,nlayers), rat_h2on2o_1(ncol,nlayers), &
+                                     rat_h2och4(ncol,nlayers), rat_h2och4_1(ncol,nlayers), &
+                                     rat_n2oco2(ncol,nlayers), rat_n2oco2_1(ncol,nlayers), &
+                                     rat_o3co2(ncol,nlayers), rat_o3co2_1(ncol,nlayers)
+
+      CALL laytrop_gpu(ncol, nlayers, pavel, laytrop)
+
+      CALL setcoef_bnd_gpu(ncol, nlayers, istart, tbound, tz, semiss, &
+                            plankbnd, planklev)
+
+      CALL setcoef_gpu(ncol, nlayers, istart, pavel, tavel, tz, &
+                        coldry, wkl, wbroad, &
+                        jp, jt, jt1, planklay, planklev, &
+                        colh2o, colco2, colo3, coln2o, colco, colch4, colo2, &
+                        colbrd, fac00, fac01, fac10, fac11, &
+                        rat_h2oco2, rat_h2oco2_1, rat_h2oo3, rat_h2oo3_1, &
+                        rat_h2on2o, rat_h2on2o_1, rat_h2och4, rat_h2och4_1, &
+                        rat_n2oco2, rat_n2oco2_1, rat_o3co2, rat_o3co2_1, &
+                        selffac, selffrac, indself, forfac, forfrac, indfor, &
+                        minorfrac, scaleminor, scaleminorn2, indminor)
+
+      END SUBROUTINE setcoef_driver_gpu
+
+      END MODULE rrtmg_lw_setcoef_gpu
+#endif
 
 !     path:      $Source: /storm/rc1/cvsroot/rc/rrtmg_lw/src/rrtmg_lw_taumol.f90,v $
 !     author:    $Author: mike $
@@ -7829,6 +8504,3439 @@ contains
 
       end module rrtmg_lw_taumol
 
+#ifdef WRF_GPU_RAD
+!-------------------------------------------------------------------------------
+!  GPU (OpenACC) port of taumol/taugb1..16, RRTMG-LW's per-column optical-depth
+!  calculation -- see plan.md "GPU Port: RRTMG Radiation". taugb1..16 are
+!  ported one at a time as new, self-contained, module-level subroutines
+!  (never touching the original host-associated taugb1..16 above, which
+!  remain the CPU fallback) -- the same "new subroutine, don't restructure in
+!  place" strategy already proven for advect_u_o5v3 etc. in dyn_em.
+!
+!  Design, adapted from the codebase's own dormant CUDA Fortran port
+!  (module_ra_rrtmg_lwf.F's taugb1g..taugb16g, ra_lw_physics=24, never
+!  enabled since -D_ACCEL is commented out there): the WRF-facing wrapper
+!  calls the AER column driver once per (i,j) grid column on the host
+!  (ncol=1 every call) -- the natural GPU restructuring batches many columns
+!  into one call (ncol>1) with every per-column array made ncol-major
+!  (column is the first/fastest index), and each taugbN becomes a single
+!  standalone kernel looping over the whole (column,layer) grid, rather than
+!  a per-column subroutine call. This is exactly the same shape as
+!  dyn_em's flux-materialization transform (turn a loop-carried/per-call
+!  dependency into an extra array dimension so the loop can collapse), just
+!  applied to "column" instead of "j".
+!
+!  Directive rules carried over unchanged from the dyn_em port (NVHPC 26.5
+!  crash constraint): only standalone, auto-closing
+!  "!$acc parallel loop collapse(N)", no enclosing "!$acc data", no
+!  manually-delimited "!$acc parallel"/"!$acc end parallel" region.
+!
+!  laytrop was a scalar (host loop split into two DO ranges) in the original
+!  taugb1; here it is per-column (laytrop(ncol)) since different columns
+!  cross the troposphere/stratosphere boundary at different layers, so the
+!  two DO-ranges collapse into one collapse(2) loop over (iplon,lay) with an
+!  IF branch on lay vs. laytrop(iplon) -- verbatim from the dormant port's
+!  taugb1g, verified line-by-line against the original taugb1 above.
+!
+!  The rrlw_kg01 lookup tables (absa/absb/ka_mn2/kb_mn2/selfref/forref/
+!  fracrefa/fracrefb) and rrlw_wvn's nspa/nspb are read-only after
+!  rrtmg_lwinit runs -- reused directly via "present()" (not duplicated into
+!  device-only copies as the dormant CUDA port did), made resident once by
+!  the caller's one-time "!$acc enter data copyin(...)" after
+!  rrtmg_lwinit finishes building them.
+      MODULE rrtmg_lw_taumol_gpu
+
+      CONTAINS
+
+      SUBROUTINE taugb1_gpu(ncol, nlayers, laytrop, jp, jt, jt1,       &
+                             pavel, colh2o, colbrd, scaleminorn2,      &
+                             indself, indfor, indminor,                &
+                             selffac, selffrac, forfac, forfrac,       &
+                             minorfrac, fac00, fac01, fac10, fac11,    &
+                             ngptlw, taug, fracs)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrtm, only : ng1
+      use rrlw_kg01, only : fracrefa, fracrefb, absa, absb, ka_mn2, kb_mn2, &
+                             selfref, forref
+      use rrlw_wvn, only : nspa, nspb
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, ngptlw
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol)
+      INTEGER(kind=im), INTENT(IN) :: jp(ncol,nlayers), jt(ncol,nlayers), &
+                                       jt1(ncol,nlayers)
+      INTEGER(kind=im), INTENT(IN) :: indself(ncol,nlayers), &
+                                       indfor(ncol,nlayers), &
+                                       indminor(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: pavel(ncol,nlayers), colh2o(ncol,nlayers), &
+                                    colbrd(ncol,nlayers), scaleminorn2(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: selffac(ncol,nlayers), selffrac(ncol,nlayers), &
+                                    forfac(ncol,nlayers), forfrac(ncol,nlayers), &
+                                    minorfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                    fac10(ncol,nlayers), fac11(ncol,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: taug(ncol,nlayers,ngptlw)
+      REAL(kind=rb), INTENT(INOUT) :: fracs(ncol,nlayers,ngptlw)
+
+      INTEGER(kind=im) :: iplon, lay, ind0, ind1, inds, indf, indm, ig
+      REAL(kind=rb) :: pp, corradj, scalen2, tauself, taufor, taun2
+
+!  Minor gas mapping levels:
+!     lower - n2, p = 142.5490 mbar, t = 215.70 k
+!     upper - n2, p = 142.5490 mbar, t = 215.70 k
+
+!$acc parallel loop collapse(2) &
+!$acc& private(ind0,ind1,inds,indf,indm,ig,pp,corradj,scalen2,tauself,taufor,taun2) &
+!$acc& present(laytrop,jp,jt,jt1,pavel,colh2o,colbrd,scaleminorn2,indself,indfor, &
+!$acc& indminor,selffac,selffrac,forfac,forfrac,minorfrac,fac00,fac01,fac10,fac11, &
+!$acc& taug,fracs,fracrefa,fracrefb,absa,absb,ka_mn2,kb_mn2,selfref,forref,nspa,nspb)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+
+         IF ( lay <= laytrop(iplon) ) THEN
+
+            ind0 = ((jp(iplon,lay)-1)*5+(jt(iplon,lay)-1))*nspa(1) + 1
+            ind1 = (jp(iplon,lay)*5+(jt1(iplon,lay)-1))*nspa(1) + 1
+            inds = indself(iplon,lay)
+            indf = indfor(iplon,lay)
+            indm = indminor(iplon,lay)
+            pp = pavel(iplon,lay)
+            corradj = 1.
+            IF (pp .lt. 250._rb) THEN
+               corradj = 1._rb - 0.15_rb * (250._rb-pp) / 154.4_rb
+            ENDIF
+
+            scalen2 = colbrd(iplon,lay) * scaleminorn2(iplon,lay)
+            DO ig = 1, ng1
+               tauself = selffac(iplon,lay) * (selfref(inds,ig) + selffrac(iplon,lay) * &
+                    (selfref(inds+1,ig) - selfref(inds,ig)))
+               taufor =  forfac(iplon,lay) * (forref(indf,ig) + forfrac(iplon,lay) * &
+                    (forref(indf+1,ig) -  forref(indf,ig)))
+               taun2 = scalen2*(ka_mn2(indm,ig) + &
+                    minorfrac(iplon,lay) * (ka_mn2(indm+1,ig) - ka_mn2(indm,ig)))
+               taug(iplon,lay,ig) = corradj * (colh2o(iplon,lay) * &
+                   (fac00(iplon,lay) * absa(ind0,ig) + &
+                    fac10(iplon,lay) * absa(ind0+1,ig) + &
+                    fac01(iplon,lay) * absa(ind1,ig) + &
+                    fac11(iplon,lay) * absa(ind1+1,ig)) &
+                    + tauself + taufor + taun2)
+               fracs(iplon,lay,ig) = fracrefa(ig)
+            ENDDO
+
+         ELSE
+
+            ind0 = ((jp(iplon,lay)-13)*5+(jt(iplon,lay)-1))*nspb(1) + 1
+            ind1 = ((jp(iplon,lay)-12)*5+(jt1(iplon,lay)-1))*nspb(1) + 1
+            indf = indfor(iplon,lay)
+            indm = indminor(iplon,lay)
+            pp = pavel(iplon,lay)
+            corradj =  1._rb - 0.15_rb * (pp / 95.6_rb)
+
+            scalen2 = colbrd(iplon,lay) * scaleminorn2(iplon,lay)
+            DO ig = 1, ng1
+               taufor = forfac(iplon,lay) * (forref(indf,ig) + &
+                    forfrac(iplon,lay) * (forref(indf+1,ig) - forref(indf,ig)))
+               taun2 = scalen2*(kb_mn2(indm,ig) + &
+                    minorfrac(iplon,lay) * (kb_mn2(indm+1,ig) - kb_mn2(indm,ig)))
+               taug(iplon,lay,ig) = corradj * (colh2o(iplon,lay) * &
+                   (fac00(iplon,lay) * absb(ind0,ig) + &
+                    fac10(iplon,lay) * absb(ind0+1,ig) + &
+                    fac01(iplon,lay) * absb(ind1,ig) + &
+                    fac11(iplon,lay) * absb(ind1+1,ig)) &
+                    + taufor + taun2)
+               fracs(iplon,lay,ig) = fracrefb(ig)
+            ENDDO
+
+         ENDIF
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE taugb1_gpu
+
+      SUBROUTINE taugb2_gpu(ncol, nlayers, laytrop, jp, jt, jt1,       &
+                             pavel, colh2o,                            &
+                             indself, indfor,                          &
+                             selffac, selffrac, forfac, forfrac,       &
+                             fac00, fac01, fac10, fac11,                &
+                             ngptlw, taug, fracs)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrtm, only : ng2, ngs1
+      use rrlw_kg02, only : fracrefa, fracrefb, absa, absb, selfref, forref
+      use rrlw_wvn, only : nspa, nspb
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, ngptlw
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol)
+      INTEGER(kind=im), INTENT(IN) :: jp(ncol,nlayers), jt(ncol,nlayers), &
+                                       jt1(ncol,nlayers)
+      INTEGER(kind=im), INTENT(IN) :: indself(ncol,nlayers), indfor(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: pavel(ncol,nlayers), colh2o(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: selffac(ncol,nlayers), selffrac(ncol,nlayers), &
+                                    forfac(ncol,nlayers), forfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                    fac10(ncol,nlayers), fac11(ncol,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: taug(ncol,nlayers,ngptlw)
+      REAL(kind=rb), INTENT(INOUT) :: fracs(ncol,nlayers,ngptlw)
+
+      INTEGER(kind=im) :: iplon, lay, ind0, ind1, inds, indf, ig
+      REAL(kind=rb) :: pp, corradj, tauself, taufor
+
+! Compute the optical depth by interpolating in ln(pressure) and
+! temperature.  Below laytrop, the water vapor self-continuum and
+! foreign continuum is interpolated (in temperature) separately.
+
+!$acc parallel loop collapse(2) &
+!$acc& private(ind0,ind1,inds,indf,ig,pp,corradj,tauself,taufor) &
+!$acc& present(laytrop,jp,jt,jt1,pavel,colh2o,indself,indfor,selffac,selffrac, &
+!$acc& forfac,forfrac,fac00,fac01,fac10,fac11,taug,fracs, &
+!$acc& fracrefa,fracrefb,absa,absb,selfref,forref,nspa,nspb)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+
+         IF ( lay <= laytrop(iplon) ) THEN
+
+            ind0 = ((jp(iplon,lay)-1)*5+(jt(iplon,lay)-1))*nspa(2) + 1
+            ind1 = (jp(iplon,lay)*5+(jt1(iplon,lay)-1))*nspa(2) + 1
+            inds = indself(iplon,lay)
+            indf = indfor(iplon,lay)
+            pp = pavel(iplon,lay)
+            corradj = 1._rb - .05_rb * (pp - 100._rb) / 900._rb
+            DO ig = 1, ng2
+               tauself = selffac(iplon,lay) * (selfref(inds,ig) + selffrac(iplon,lay) * &
+                    (selfref(inds+1,ig) - selfref(inds,ig)))
+               taufor =  forfac(iplon,lay) * (forref(indf,ig) + forfrac(iplon,lay) * &
+                    (forref(indf+1,ig) - forref(indf,ig)))
+               taug(iplon,lay,ngs1+ig) = corradj * (colh2o(iplon,lay) * &
+                   (fac00(iplon,lay) * absa(ind0,ig) + &
+                    fac10(iplon,lay) * absa(ind0+1,ig) + &
+                    fac01(iplon,lay) * absa(ind1,ig) + &
+                    fac11(iplon,lay) * absa(ind1+1,ig)) &
+                    + tauself + taufor)
+               fracs(iplon,lay,ngs1+ig) = fracrefa(ig)
+            ENDDO
+
+         ELSE
+
+            ind0 = ((jp(iplon,lay)-13)*5+(jt(iplon,lay)-1))*nspb(2) + 1
+            ind1 = ((jp(iplon,lay)-12)*5+(jt1(iplon,lay)-1))*nspb(2) + 1
+            indf = indfor(iplon,lay)
+            DO ig = 1, ng2
+               taufor =  forfac(iplon,lay) * (forref(indf,ig) + &
+                    forfrac(iplon,lay) * (forref(indf+1,ig) - forref(indf,ig)))
+               taug(iplon,lay,ngs1+ig) = colh2o(iplon,lay) * &
+                   (fac00(iplon,lay) * absb(ind0,ig) + &
+                    fac10(iplon,lay) * absb(ind0+1,ig) + &
+                    fac01(iplon,lay) * absb(ind1,ig) + &
+                    fac11(iplon,lay) * absb(ind1+1,ig)) &
+                    + taufor
+               fracs(iplon,lay,ngs1+ig) = fracrefb(ig)
+            ENDDO
+
+         ENDIF
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE taugb2_gpu
+
+
+      SUBROUTINE taugb3_gpu(ncol, nlayers, laytrop, jp, jt, jt1,       &
+                             colh2o, colco2, coldry, coln2o,           &
+                             rat_h2oco2, rat_h2oco2_1,                 &
+                             indself, indfor, indminor,                &
+                             selffac, selffrac, forfac, forfrac,       &
+                             minorfrac, fac00, fac01, fac10, fac11,    &
+                             ngptlw, taug, fracs)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrtm, only : ng3, ngs2
+      use rrlw_con, only : oneminus
+      use rrlw_ref, only : chi_mls
+      use rrlw_kg03, only : fracrefa, fracrefb, absa, absb, &
+                            ka_mn2o, kb_mn2o, selfref, forref
+      use rrlw_wvn, only : nspa, nspb
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, ngptlw
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol)
+      INTEGER(kind=im), INTENT(IN) :: jp(ncol,nlayers), jt(ncol,nlayers), &
+                                       jt1(ncol,nlayers)
+      INTEGER(kind=im), INTENT(IN) :: indself(ncol,nlayers), &
+                                       indfor(ncol,nlayers), &
+                                       indminor(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: colh2o(ncol,nlayers), colco2(ncol,nlayers), &
+                                    coldry(ncol,nlayers), coln2o(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: rat_h2oco2(ncol,nlayers), rat_h2oco2_1(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: selffac(ncol,nlayers), selffrac(ncol,nlayers), &
+                                    forfac(ncol,nlayers), forfrac(ncol,nlayers), &
+                                    minorfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                    fac10(ncol,nlayers), fac11(ncol,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: taug(ncol,nlayers,ngptlw)
+      REAL(kind=rb), INTENT(INOUT) :: fracs(ncol,nlayers,ngptlw)
+
+      INTEGER(kind=im) :: iplon, lay, ind0, ind1, inds, indf, indm, ig
+      INTEGER(kind=im) :: js, js1, jmn2o, jpl
+      REAL(kind=rb) :: speccomb, specparm, specmult, fs
+      REAL(kind=rb) :: speccomb1, specparm1, specmult1, fs1
+      REAL(kind=rb) :: speccomb_mn2o, specparm_mn2o, specmult_mn2o, &
+                       fmn2o, fmn2omf, chi_n2o, ratn2o, adjfac, adjcoln2o
+      REAL(kind=rb) :: speccomb_planck, specparm_planck, specmult_planck, fpl
+      REAL(kind=rb) :: p, p4, fk0, fk1, fk2
+      REAL(kind=rb) :: fac000, fac100, fac200, fac010, fac110, fac210
+      REAL(kind=rb) :: fac001, fac101, fac201, fac011, fac111, fac211
+      REAL(kind=rb) :: tauself, taufor, n2om1, n2om2, absn2o
+      REAL(kind=rb) :: refrat_planck_a, refrat_planck_b, refrat_m_a, refrat_m_b
+      REAL(kind=rb) :: tau_major, tau_major1
+
+! Minor gas mapping levels:
+!     lower - n2o, p = 706.272 mbar, t = 278.94 k
+!     upper - n2o, p = 95.58 mbar, t = 215.7 k
+
+!  P = 212.725 mb
+      refrat_planck_a = chi_mls(1,9)/chi_mls(2,9)
+!  P = 95.58 mb
+      refrat_planck_b = chi_mls(1,13)/chi_mls(2,13)
+!  P = 706.270mb
+      refrat_m_a = chi_mls(1,3)/chi_mls(2,3)
+!  P = 95.58 mb
+      refrat_m_b = chi_mls(1,13)/chi_mls(2,13)
+
+!$acc parallel loop collapse(2) &
+!$acc& private(ind0,ind1,inds,indf,indm,ig,js,js1,jmn2o,jpl,speccomb,specparm, &
+!$acc& specmult,fs,speccomb1,specparm1,specmult1,fs1,speccomb_mn2o,specparm_mn2o, &
+!$acc& specmult_mn2o,fmn2o,fmn2omf,chi_n2o,ratn2o,adjfac,adjcoln2o,speccomb_planck, &
+!$acc& specparm_planck,specmult_planck,fpl,p,p4,fk0,fk1,fk2,fac000,fac100,fac200, &
+!$acc& fac010,fac110,fac210,fac001,fac101,fac201,fac011,fac111,fac211,tauself, &
+!$acc& taufor,n2om1,n2om2,absn2o,tau_major,tau_major1) &
+!$acc& present(laytrop,jp,jt,jt1,colh2o,colco2,coldry,coln2o,rat_h2oco2, &
+!$acc& rat_h2oco2_1,indself,indfor,indminor,selffac,selffrac,forfac,forfrac, &
+!$acc& minorfrac,fac00,fac01,fac10,fac11,taug,fracs,fracrefa,fracrefb,absa,absb, &
+!$acc& ka_mn2o,kb_mn2o,selfref,forref,nspa,nspb,chi_mls)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+
+         IF ( lay <= laytrop(iplon) ) THEN
+
+            speccomb = colh2o(iplon,lay) + rat_h2oco2(iplon,lay)*colco2(iplon,lay)
+            specparm = colh2o(iplon,lay)/speccomb
+            IF (specparm .ge. oneminus) specparm = oneminus
+            specmult = 8._rb*(specparm)
+            js = 1 + int(specmult)
+            fs = mod(specmult,1.0_rb)
+
+            speccomb1 = colh2o(iplon,lay) + rat_h2oco2_1(iplon,lay)*colco2(iplon,lay)
+            specparm1 = colh2o(iplon,lay)/speccomb1
+            IF (specparm1 .ge. oneminus) specparm1 = oneminus
+            specmult1 = 8._rb*(specparm1)
+            js1 = 1 + int(specmult1)
+            fs1 = mod(specmult1,1.0_rb)
+
+            speccomb_mn2o = colh2o(iplon,lay) + refrat_m_a*colco2(iplon,lay)
+            specparm_mn2o = colh2o(iplon,lay)/speccomb_mn2o
+            IF (specparm_mn2o .ge. oneminus) specparm_mn2o = oneminus
+            specmult_mn2o = 8._rb*specparm_mn2o
+            jmn2o = 1 + int(specmult_mn2o)
+            fmn2o = mod(specmult_mn2o,1.0_rb)
+            fmn2omf = minorfrac(iplon,lay)*fmn2o
+!  In atmospheres where the amount of N2O is too great to be considered
+!  a minor species, adjust the column amount of N2O by an empirical factor
+!  to obtain the proper contribution.
+            chi_n2o = coln2o(iplon,lay)/coldry(iplon,lay)
+            ratn2o = 1.e20_rb*chi_n2o/chi_mls(4,jp(iplon,lay)+1)
+            IF (ratn2o .gt. 1.5_rb) THEN
+               adjfac = 0.5_rb+(ratn2o-0.5_rb)**0.65_rb
+               adjcoln2o = adjfac*chi_mls(4,jp(iplon,lay)+1)*coldry(iplon,lay)*1.e-20_rb
+            ELSE
+               adjcoln2o = coln2o(iplon,lay)
+            ENDIF
+
+            speccomb_planck = colh2o(iplon,lay)+refrat_planck_a*colco2(iplon,lay)
+            specparm_planck = colh2o(iplon,lay)/speccomb_planck
+            IF (specparm_planck .ge. oneminus) specparm_planck=oneminus
+            specmult_planck = 8._rb*specparm_planck
+            jpl= 1 + int(specmult_planck)
+            fpl = mod(specmult_planck,1.0_rb)
+
+            ind0 = ((jp(iplon,lay)-1)*5+(jt(iplon,lay)-1))*nspa(3) + js
+            ind1 = (jp(iplon,lay)*5+(jt1(iplon,lay)-1))*nspa(3) + js1
+            inds = indself(iplon,lay)
+            indf = indfor(iplon,lay)
+            indm = indminor(iplon,lay)
+
+            IF (specparm .lt. 0.125_rb) THEN
+               p = fs - 1
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac000 = fk0*fac00(iplon,lay)
+               fac100 = fk1*fac00(iplon,lay)
+               fac200 = fk2*fac00(iplon,lay)
+               fac010 = fk0*fac10(iplon,lay)
+               fac110 = fk1*fac10(iplon,lay)
+               fac210 = fk2*fac10(iplon,lay)
+            ELSE IF (specparm .gt. 0.875_rb) THEN
+               p = -fs
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac000 = fk0*fac00(iplon,lay)
+               fac100 = fk1*fac00(iplon,lay)
+               fac200 = fk2*fac00(iplon,lay)
+               fac010 = fk0*fac10(iplon,lay)
+               fac110 = fk1*fac10(iplon,lay)
+               fac210 = fk2*fac10(iplon,lay)
+            ELSE
+               fac000 = (1._rb - fs) * fac00(iplon,lay)
+               fac010 = (1._rb - fs) * fac10(iplon,lay)
+               fac100 = fs * fac00(iplon,lay)
+               fac110 = fs * fac10(iplon,lay)
+            ENDIF
+            IF (specparm1 .lt. 0.125_rb) THEN
+               p = fs1 - 1
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac001 = fk0*fac01(iplon,lay)
+               fac101 = fk1*fac01(iplon,lay)
+               fac201 = fk2*fac01(iplon,lay)
+               fac011 = fk0*fac11(iplon,lay)
+               fac111 = fk1*fac11(iplon,lay)
+               fac211 = fk2*fac11(iplon,lay)
+            ELSE IF (specparm1 .gt. 0.875_rb) THEN
+               p = -fs1
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac001 = fk0*fac01(iplon,lay)
+               fac101 = fk1*fac01(iplon,lay)
+               fac201 = fk2*fac01(iplon,lay)
+               fac011 = fk0*fac11(iplon,lay)
+               fac111 = fk1*fac11(iplon,lay)
+               fac211 = fk2*fac11(iplon,lay)
+            ELSE
+               fac001 = (1._rb - fs1) * fac01(iplon,lay)
+               fac011 = (1._rb - fs1) * fac11(iplon,lay)
+               fac101 = fs1 * fac01(iplon,lay)
+               fac111 = fs1 * fac11(iplon,lay)
+            ENDIF
+
+            DO ig = 1, ng3
+               tauself = selffac(iplon,lay)* (selfref(inds,ig) + selffrac(iplon,lay) * &
+                    (selfref(inds+1,ig) - selfref(inds,ig)))
+               taufor = forfac(iplon,lay) * (forref(indf,ig) + forfrac(iplon,lay) * &
+                    (forref(indf+1,ig) - forref(indf,ig)))
+               n2om1 = ka_mn2o(jmn2o,indm,ig) + fmn2o * &
+                    (ka_mn2o(jmn2o+1,indm,ig) - ka_mn2o(jmn2o,indm,ig))
+               n2om2 = ka_mn2o(jmn2o,indm+1,ig) + fmn2o * &
+                    (ka_mn2o(jmn2o+1,indm+1,ig) - ka_mn2o(jmn2o,indm+1,ig))
+               absn2o = n2om1 + minorfrac(iplon,lay) * (n2om2 - n2om1)
+
+               IF (specparm .lt. 0.125_rb) THEN
+                  tau_major = speccomb * &
+                       (fac000 * absa(ind0,ig) + &
+                       fac100 * absa(ind0+1,ig) + &
+                       fac200 * absa(ind0+2,ig) + &
+                       fac010 * absa(ind0+9,ig) + &
+                       fac110 * absa(ind0+10,ig) + &
+                       fac210 * absa(ind0+11,ig))
+               ELSE IF (specparm .gt. 0.875_rb) THEN
+                  tau_major = speccomb * &
+                       (fac200 * absa(ind0-1,ig) + &
+                       fac100 * absa(ind0,ig) + &
+                       fac000 * absa(ind0+1,ig) + &
+                       fac210 * absa(ind0+8,ig) + &
+                       fac110 * absa(ind0+9,ig) + &
+                       fac010 * absa(ind0+10,ig))
+               ELSE
+                  tau_major = speccomb * &
+                       (fac000 * absa(ind0,ig) + &
+                       fac100 * absa(ind0+1,ig) + &
+                       fac010 * absa(ind0+9,ig) + &
+                       fac110 * absa(ind0+10,ig))
+               ENDIF
+
+               IF (specparm1 .lt. 0.125_rb) THEN
+                  tau_major1 = speccomb1 * &
+                       (fac001 * absa(ind1,ig) + &
+                       fac101 * absa(ind1+1,ig) + &
+                       fac201 * absa(ind1+2,ig) + &
+                       fac011 * absa(ind1+9,ig) + &
+                       fac111 * absa(ind1+10,ig) + &
+                       fac211 * absa(ind1+11,ig))
+               ELSE IF (specparm1 .gt. 0.875_rb) THEN
+                  tau_major1 = speccomb1 * &
+                       (fac201 * absa(ind1-1,ig) + &
+                       fac101 * absa(ind1,ig) + &
+                       fac001 * absa(ind1+1,ig) + &
+                       fac211 * absa(ind1+8,ig) + &
+                       fac111 * absa(ind1+9,ig) + &
+                       fac011 * absa(ind1+10,ig))
+               ELSE
+                  tau_major1 = speccomb1 * &
+                       (fac001 * absa(ind1,ig) +  &
+                       fac101 * absa(ind1+1,ig) + &
+                       fac011 * absa(ind1+9,ig) + &
+                       fac111 * absa(ind1+10,ig))
+               ENDIF
+
+               taug(iplon,lay,ngs2+ig) = tau_major + tau_major1 &
+                    + tauself + taufor &
+                    + adjcoln2o*absn2o
+               fracs(iplon,lay,ngs2+ig) = fracrefa(ig,jpl) + fpl * &
+                    (fracrefa(ig,jpl+1)-fracrefa(ig,jpl))
+            ENDDO
+
+         ELSE
+
+            speccomb = colh2o(iplon,lay) + rat_h2oco2(iplon,lay)*colco2(iplon,lay)
+            specparm = colh2o(iplon,lay)/speccomb
+            IF (specparm .ge. oneminus) specparm = oneminus
+            specmult = 4._rb*(specparm)
+            js = 1 + int(specmult)
+            fs = mod(specmult,1.0_rb)
+
+            speccomb1 = colh2o(iplon,lay) + rat_h2oco2_1(iplon,lay)*colco2(iplon,lay)
+            specparm1 = colh2o(iplon,lay)/speccomb1
+            IF (specparm1 .ge. oneminus) specparm1 = oneminus
+            specmult1 = 4._rb*(specparm1)
+            js1 = 1 + int(specmult1)
+            fs1 = mod(specmult1,1.0_rb)
+
+            fac000 = (1._rb - fs) * fac00(iplon,lay)
+            fac010 = (1._rb - fs) * fac10(iplon,lay)
+            fac100 = fs * fac00(iplon,lay)
+            fac110 = fs * fac10(iplon,lay)
+            fac001 = (1._rb - fs1) * fac01(iplon,lay)
+            fac011 = (1._rb - fs1) * fac11(iplon,lay)
+            fac101 = fs1 * fac01(iplon,lay)
+            fac111 = fs1 * fac11(iplon,lay)
+
+            speccomb_mn2o = colh2o(iplon,lay) + refrat_m_b*colco2(iplon,lay)
+            specparm_mn2o = colh2o(iplon,lay)/speccomb_mn2o
+            IF (specparm_mn2o .ge. oneminus) specparm_mn2o = oneminus
+            specmult_mn2o = 4._rb*specparm_mn2o
+            jmn2o = 1 + int(specmult_mn2o)
+            fmn2o = mod(specmult_mn2o,1.0_rb)
+            fmn2omf = minorfrac(iplon,lay)*fmn2o
+!  In atmospheres where the amount of N2O is too great to be considered
+!  a minor species, adjust the column amount of N2O by an empirical factor
+!  to obtain the proper contribution.
+            chi_n2o = coln2o(iplon,lay)/coldry(iplon,lay)
+            ratn2o = 1.e20_rb*chi_n2o/chi_mls(4,jp(iplon,lay)+1)
+            IF (ratn2o .gt. 1.5_rb) THEN
+               adjfac = 0.5_rb+(ratn2o-0.5_rb)**0.65_rb
+               adjcoln2o = adjfac*chi_mls(4,jp(iplon,lay)+1)*coldry(iplon,lay)*1.e-20_rb
+            ELSE
+               adjcoln2o = coln2o(iplon,lay)
+            ENDIF
+
+            speccomb_planck = colh2o(iplon,lay)+refrat_planck_b*colco2(iplon,lay)
+            specparm_planck = colh2o(iplon,lay)/speccomb_planck
+            IF (specparm_planck .ge. oneminus) specparm_planck=oneminus
+            specmult_planck = 4._rb*specparm_planck
+            jpl= 1 + int(specmult_planck)
+            fpl = mod(specmult_planck,1.0_rb)
+
+            ind0 = ((jp(iplon,lay)-13)*5+(jt(iplon,lay)-1))*nspb(3) + js
+            ind1 = ((jp(iplon,lay)-12)*5+(jt1(iplon,lay)-1))*nspb(3) + js1
+            indf = indfor(iplon,lay)
+            indm = indminor(iplon,lay)
+
+            DO ig = 1, ng3
+               taufor = forfac(iplon,lay) * (forref(indf,ig) + &
+                    forfrac(iplon,lay) * (forref(indf+1,ig) - forref(indf,ig)))
+               n2om1 = kb_mn2o(jmn2o,indm,ig) + fmn2o * &
+                    (kb_mn2o(jmn2o+1,indm,ig)-kb_mn2o(jmn2o,indm,ig))
+               n2om2 = kb_mn2o(jmn2o,indm+1,ig) + fmn2o * &
+                    (kb_mn2o(jmn2o+1,indm+1,ig)-kb_mn2o(jmn2o,indm+1,ig))
+               absn2o = n2om1 + minorfrac(iplon,lay) * (n2om2 - n2om1)
+               taug(iplon,lay,ngs2+ig) = speccomb * &
+                   (fac000 * absb(ind0,ig) + &
+                   fac100 * absb(ind0+1,ig) + &
+                   fac010 * absb(ind0+5,ig) + &
+                   fac110 * absb(ind0+6,ig)) &
+                   + speccomb1 * &
+                   (fac001 * absb(ind1,ig) +  &
+                   fac101 * absb(ind1+1,ig) + &
+                   fac011 * absb(ind1+5,ig) + &
+                   fac111 * absb(ind1+6,ig))  &
+                   + taufor &
+                   + adjcoln2o*absn2o
+               fracs(iplon,lay,ngs2+ig) = fracrefb(ig,jpl) + fpl * &
+                   (fracrefb(ig,jpl+1)-fracrefb(ig,jpl))
+            ENDDO
+
+         ENDIF
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE taugb3_gpu
+
+
+      SUBROUTINE taugb4_gpu(ncol, nlayers, laytrop, jp, jt, jt1,       &
+                             colh2o, colco2, colo3,                    &
+                             rat_h2oco2, rat_h2oco2_1,                 &
+                             rat_o3co2, rat_o3co2_1,                   &
+                             indself, indfor,                          &
+                             selffac, selffrac, forfac, forfrac,       &
+                             fac00, fac01, fac10, fac11,               &
+                             ngptlw, taug, fracs)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrtm, only : ng4, ngs3
+      use rrlw_con, only : oneminus
+      use rrlw_ref, only : chi_mls
+      use rrlw_kg04, only : fracrefa, fracrefb, absa, absb, selfref, forref
+      use rrlw_wvn, only : nspa, nspb
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, ngptlw
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol)
+      INTEGER(kind=im), INTENT(IN) :: jp(ncol,nlayers), jt(ncol,nlayers), &
+                                       jt1(ncol,nlayers)
+      INTEGER(kind=im), INTENT(IN) :: indself(ncol,nlayers), indfor(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: colh2o(ncol,nlayers), colco2(ncol,nlayers), &
+                                    colo3(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: rat_h2oco2(ncol,nlayers), rat_h2oco2_1(ncol,nlayers), &
+                                    rat_o3co2(ncol,nlayers), rat_o3co2_1(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: selffac(ncol,nlayers), selffrac(ncol,nlayers), &
+                                    forfac(ncol,nlayers), forfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                    fac10(ncol,nlayers), fac11(ncol,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: taug(ncol,nlayers,ngptlw)
+      REAL(kind=rb), INTENT(INOUT) :: fracs(ncol,nlayers,ngptlw)
+
+      INTEGER(kind=im) :: iplon, lay, ind0, ind1, inds, indf, ig
+      INTEGER(kind=im) :: js, js1, jpl
+      REAL(kind=rb) :: speccomb, specparm, specmult, fs
+      REAL(kind=rb) :: speccomb1, specparm1, specmult1, fs1
+      REAL(kind=rb) :: speccomb_planck, specparm_planck, specmult_planck, fpl
+      REAL(kind=rb) :: p, p4, fk0, fk1, fk2
+      REAL(kind=rb) :: fac000, fac100, fac200, fac010, fac110, fac210
+      REAL(kind=rb) :: fac001, fac101, fac201, fac011, fac111, fac211
+      REAL(kind=rb) :: tauself, taufor
+      REAL(kind=rb) :: refrat_planck_a, refrat_planck_b
+      REAL(kind=rb) :: tau_major, tau_major1
+
+! P =   142.5940 mb
+      refrat_planck_a = chi_mls(1,11)/chi_mls(2,11)
+! P = 95.58350 mb
+      refrat_planck_b = chi_mls(3,13)/chi_mls(2,13)
+
+!$acc parallel loop collapse(2) &
+!$acc& private(ind0,ind1,inds,indf,ig,js,js1,jpl,speccomb,specparm,specmult,fs, &
+!$acc& speccomb1,specparm1,specmult1,fs1,speccomb_planck,specparm_planck, &
+!$acc& specmult_planck,fpl,p,p4,fk0,fk1,fk2,fac000,fac100,fac200,fac010,fac110, &
+!$acc& fac210,fac001,fac101,fac201,fac011,fac111,fac211,tauself,taufor,tau_major, &
+!$acc& tau_major1) &
+!$acc& present(laytrop,jp,jt,jt1,colh2o,colco2,colo3,rat_h2oco2,rat_h2oco2_1, &
+!$acc& rat_o3co2,rat_o3co2_1,indself,indfor,selffac,selffrac,forfac,forfrac, &
+!$acc& fac00,fac01,fac10,fac11,taug,fracs,fracrefa,fracrefb,absa,absb,selfref, &
+!$acc& forref,nspa,nspb,chi_mls)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+
+         IF ( lay <= laytrop(iplon) ) THEN
+
+            speccomb = colh2o(iplon,lay) + rat_h2oco2(iplon,lay)*colco2(iplon,lay)
+            specparm = colh2o(iplon,lay)/speccomb
+            IF (specparm .ge. oneminus) specparm = oneminus
+            specmult = 8._rb*(specparm)
+            js = 1 + int(specmult)
+            fs = mod(specmult,1.0_rb)
+
+            speccomb1 = colh2o(iplon,lay) + rat_h2oco2_1(iplon,lay)*colco2(iplon,lay)
+            specparm1 = colh2o(iplon,lay)/speccomb1
+            IF (specparm1 .ge. oneminus) specparm1 = oneminus
+            specmult1 = 8._rb*(specparm1)
+            js1 = 1 + int(specmult1)
+            fs1 = mod(specmult1,1.0_rb)
+
+            speccomb_planck = colh2o(iplon,lay)+refrat_planck_a*colco2(iplon,lay)
+            specparm_planck = colh2o(iplon,lay)/speccomb_planck
+            IF (specparm_planck .ge. oneminus) specparm_planck=oneminus
+            specmult_planck = 8._rb*specparm_planck
+            jpl= 1 + int(specmult_planck)
+            fpl = mod(specmult_planck,1.0_rb)
+
+            ind0 = ((jp(iplon,lay)-1)*5+(jt(iplon,lay)-1))*nspa(4) + js
+            ind1 = (jp(iplon,lay)*5+(jt1(iplon,lay)-1))*nspa(4) + js1
+            inds = indself(iplon,lay)
+            indf = indfor(iplon,lay)
+
+            IF (specparm .lt. 0.125_rb) THEN
+               p = fs - 1
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac000 = fk0*fac00(iplon,lay)
+               fac100 = fk1*fac00(iplon,lay)
+               fac200 = fk2*fac00(iplon,lay)
+               fac010 = fk0*fac10(iplon,lay)
+               fac110 = fk1*fac10(iplon,lay)
+               fac210 = fk2*fac10(iplon,lay)
+            ELSE IF (specparm .gt. 0.875_rb) THEN
+               p = -fs
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac000 = fk0*fac00(iplon,lay)
+               fac100 = fk1*fac00(iplon,lay)
+               fac200 = fk2*fac00(iplon,lay)
+               fac010 = fk0*fac10(iplon,lay)
+               fac110 = fk1*fac10(iplon,lay)
+               fac210 = fk2*fac10(iplon,lay)
+            ELSE
+               fac000 = (1._rb - fs) * fac00(iplon,lay)
+               fac010 = (1._rb - fs) * fac10(iplon,lay)
+               fac100 = fs * fac00(iplon,lay)
+               fac110 = fs * fac10(iplon,lay)
+            ENDIF
+
+            IF (specparm1 .lt. 0.125_rb) THEN
+               p = fs1 - 1
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac001 = fk0*fac01(iplon,lay)
+               fac101 = fk1*fac01(iplon,lay)
+               fac201 = fk2*fac01(iplon,lay)
+               fac011 = fk0*fac11(iplon,lay)
+               fac111 = fk1*fac11(iplon,lay)
+               fac211 = fk2*fac11(iplon,lay)
+            ELSE IF (specparm1 .gt. 0.875_rb) THEN
+               p = -fs1
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac001 = fk0*fac01(iplon,lay)
+               fac101 = fk1*fac01(iplon,lay)
+               fac201 = fk2*fac01(iplon,lay)
+               fac011 = fk0*fac11(iplon,lay)
+               fac111 = fk1*fac11(iplon,lay)
+               fac211 = fk2*fac11(iplon,lay)
+            ELSE
+               fac001 = (1._rb - fs1) * fac01(iplon,lay)
+               fac011 = (1._rb - fs1) * fac11(iplon,lay)
+               fac101 = fs1 * fac01(iplon,lay)
+               fac111 = fs1 * fac11(iplon,lay)
+            ENDIF
+
+            DO ig = 1, ng4
+               tauself = selffac(iplon,lay)* (selfref(inds,ig) + selffrac(iplon,lay) * &
+                    (selfref(inds+1,ig) - selfref(inds,ig)))
+               taufor =  forfac(iplon,lay) * (forref(indf,ig) + forfrac(iplon,lay) * &
+                    (forref(indf+1,ig) - forref(indf,ig)))
+
+               IF (specparm .lt. 0.125_rb) THEN
+                  tau_major = speccomb * &
+                       (fac000 * absa(ind0,ig) + &
+                       fac100 * absa(ind0+1,ig) + &
+                       fac200 * absa(ind0+2,ig) + &
+                       fac010 * absa(ind0+9,ig) + &
+                       fac110 * absa(ind0+10,ig) + &
+                       fac210 * absa(ind0+11,ig))
+               ELSE IF (specparm .gt. 0.875_rb) THEN
+                  tau_major = speccomb * &
+                       (fac200 * absa(ind0-1,ig) + &
+                       fac100 * absa(ind0,ig) + &
+                       fac000 * absa(ind0+1,ig) + &
+                       fac210 * absa(ind0+8,ig) + &
+                       fac110 * absa(ind0+9,ig) + &
+                       fac010 * absa(ind0+10,ig))
+               ELSE
+                  tau_major = speccomb * &
+                       (fac000 * absa(ind0,ig) + &
+                       fac100 * absa(ind0+1,ig) + &
+                       fac010 * absa(ind0+9,ig) + &
+                       fac110 * absa(ind0+10,ig))
+               ENDIF
+
+               IF (specparm1 .lt. 0.125_rb) THEN
+                  tau_major1 = speccomb1 * &
+                       (fac001 * absa(ind1,ig) +  &
+                       fac101 * absa(ind1+1,ig) + &
+                       fac201 * absa(ind1+2,ig) + &
+                       fac011 * absa(ind1+9,ig) + &
+                       fac111 * absa(ind1+10,ig) + &
+                       fac211 * absa(ind1+11,ig))
+               ELSE IF (specparm1 .gt. 0.875_rb) THEN
+                  tau_major1 = speccomb1 * &
+                       (fac201 * absa(ind1-1,ig) + &
+                       fac101 * absa(ind1,ig) + &
+                       fac001 * absa(ind1+1,ig) + &
+                       fac211 * absa(ind1+8,ig) + &
+                       fac111 * absa(ind1+9,ig) + &
+                       fac011 * absa(ind1+10,ig))
+               ELSE
+                  tau_major1 = speccomb1 * &
+                       (fac001 * absa(ind1,ig) + &
+                       fac101 * absa(ind1+1,ig) + &
+                       fac011 * absa(ind1+9,ig) + &
+                       fac111 * absa(ind1+10,ig))
+               ENDIF
+
+               taug(iplon,lay,ngs3+ig) = tau_major + tau_major1 &
+                    + tauself + taufor
+               fracs(iplon,lay,ngs3+ig) = fracrefa(ig,jpl) + fpl * &
+                    (fracrefa(ig,jpl+1)-fracrefa(ig,jpl))
+            ENDDO
+
+         ELSE
+
+            speccomb = colo3(iplon,lay) + rat_o3co2(iplon,lay)*colco2(iplon,lay)
+            specparm = colo3(iplon,lay)/speccomb
+            IF (specparm .ge. oneminus) specparm = oneminus
+            specmult = 4._rb*(specparm)
+            js = 1 + int(specmult)
+            fs = mod(specmult,1.0_rb)
+
+            speccomb1 = colo3(iplon,lay) + rat_o3co2_1(iplon,lay)*colco2(iplon,lay)
+            specparm1 = colo3(iplon,lay)/speccomb1
+            IF (specparm1 .ge. oneminus) specparm1 = oneminus
+            specmult1 = 4._rb*(specparm1)
+            js1 = 1 + int(specmult1)
+            fs1 = mod(specmult1,1.0_rb)
+
+            fac000 = (1._rb - fs) * fac00(iplon,lay)
+            fac010 = (1._rb - fs) * fac10(iplon,lay)
+            fac100 = fs * fac00(iplon,lay)
+            fac110 = fs * fac10(iplon,lay)
+            fac001 = (1._rb - fs1) * fac01(iplon,lay)
+            fac011 = (1._rb - fs1) * fac11(iplon,lay)
+            fac101 = fs1 * fac01(iplon,lay)
+            fac111 = fs1 * fac11(iplon,lay)
+
+            speccomb_planck = colo3(iplon,lay)+refrat_planck_b*colco2(iplon,lay)
+            specparm_planck = colo3(iplon,lay)/speccomb_planck
+            IF (specparm_planck .ge. oneminus) specparm_planck=oneminus
+            specmult_planck = 4._rb*specparm_planck
+            jpl= 1 + int(specmult_planck)
+            fpl = mod(specmult_planck,1.0_rb)
+
+            ind0 = ((jp(iplon,lay)-13)*5+(jt(iplon,lay)-1))*nspb(4) + js
+            ind1 = ((jp(iplon,lay)-12)*5+(jt1(iplon,lay)-1))*nspb(4) + js1
+
+            DO ig = 1, ng4
+               taug(iplon,lay,ngs3+ig) =  speccomb * &
+                   (fac000 * absb(ind0,ig) + &
+                   fac100 * absb(ind0+1,ig) + &
+                   fac010 * absb(ind0+5,ig) + &
+                   fac110 * absb(ind0+6,ig)) &
+                   + speccomb1 * &
+                   (fac001 * absb(ind1,ig) +  &
+                   fac101 * absb(ind1+1,ig) + &
+                   fac011 * absb(ind1+5,ig) + &
+                   fac111 * absb(ind1+6,ig))
+               fracs(iplon,lay,ngs3+ig) = fracrefb(ig,jpl) + fpl * &
+                   (fracrefb(ig,jpl+1)-fracrefb(ig,jpl))
+            ENDDO
+
+! Empirical modification to code to improve stratospheric cooling rates
+! for co2.  Revised to apply weighting for g-point reduction in this band.
+
+            taug(iplon,lay,ngs3+8)=taug(iplon,lay,ngs3+8)*0.92
+            taug(iplon,lay,ngs3+9)=taug(iplon,lay,ngs3+9)*0.88
+            taug(iplon,lay,ngs3+10)=taug(iplon,lay,ngs3+10)*1.07
+            taug(iplon,lay,ngs3+11)=taug(iplon,lay,ngs3+11)*1.1
+            taug(iplon,lay,ngs3+12)=taug(iplon,lay,ngs3+12)*0.99
+            taug(iplon,lay,ngs3+13)=taug(iplon,lay,ngs3+13)*0.88
+            taug(iplon,lay,ngs3+14)=taug(iplon,lay,ngs3+14)*0.943
+
+         ENDIF
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE taugb4_gpu
+      SUBROUTINE taugb5_gpu(ncol, nlayers, laytrop, jp, jt, jt1,       &
+                             colh2o, colco2, colo3,                    &
+                             rat_h2oco2, rat_h2oco2_1,                 &
+                             rat_o3co2, rat_o3co2_1,                   &
+                             indself, indfor, indminor,                &
+                             selffac, selffrac, forfac, forfrac,       &
+                             minorfrac, fac00, fac01, fac10, fac11,    &
+                             wx, ngptlw, taug, fracs)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrtm, only : ng5, ngs4
+      use rrlw_ref, only : chi_mls
+      use rrlw_con, only : oneminus
+      use rrlw_kg05, only : fracrefa, fracrefb, absa, absb, ka_mo3, &
+                             selfref, forref, ccl4
+      use rrlw_wvn, only : nspa, nspb
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, ngptlw
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol)
+      INTEGER(kind=im), INTENT(IN) :: jp(ncol,nlayers), jt(ncol,nlayers), &
+                                       jt1(ncol,nlayers)
+      INTEGER(kind=im), INTENT(IN) :: indself(ncol,nlayers), &
+                                       indfor(ncol,nlayers), &
+                                       indminor(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: colh2o(ncol,nlayers), colco2(ncol,nlayers), &
+                                    colo3(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: rat_h2oco2(ncol,nlayers), rat_h2oco2_1(ncol,nlayers), &
+                                    rat_o3co2(ncol,nlayers), rat_o3co2_1(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: selffac(ncol,nlayers), selffrac(ncol,nlayers), &
+                                    forfac(ncol,nlayers), forfrac(ncol,nlayers), &
+                                    minorfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                    fac10(ncol,nlayers), fac11(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: wx(ncol,nlayers,4)
+      REAL(kind=rb), INTENT(INOUT) :: taug(ncol,nlayers,ngptlw)
+      REAL(kind=rb), INTENT(INOUT) :: fracs(ncol,nlayers,ngptlw)
+
+      INTEGER(kind=im) :: iplon, lay, ind0, ind1, inds, indf, indm, ig
+      INTEGER(kind=im) :: js, js1, jmo3, jpl
+      REAL(kind=rb) :: speccomb, specparm, specmult, fs
+      REAL(kind=rb) :: speccomb1, specparm1, specmult1, fs1
+      REAL(kind=rb) :: speccomb_mo3, specparm_mo3, specmult_mo3, fmo3
+      REAL(kind=rb) :: speccomb_planck, specparm_planck, specmult_planck, fpl
+      REAL(kind=rb) :: p, p4, fk0, fk1, fk2
+      REAL(kind=rb) :: fac000, fac100, fac200, fac010, fac110, fac210
+      REAL(kind=rb) :: fac001, fac101, fac201, fac011, fac111, fac211
+      REAL(kind=rb) :: tauself, taufor, o3m1, o3m2, abso3
+      REAL(kind=rb) :: refrat_planck_a, refrat_planck_b, refrat_m_a
+      REAL(kind=rb) :: tau_major, tau_major1
+
+! Calculate reference ratio to be used in calculation of Planck
+! fraction in lower/upper atmosphere.
+
+! P = 473.420 mb
+      refrat_planck_a = chi_mls(1,5)/chi_mls(2,5)
+
+! P = 0.2369 mb
+      refrat_planck_b = chi_mls(3,43)/chi_mls(2,43)
+
+! P = 317.3480
+      refrat_m_a = chi_mls(1,7)/chi_mls(2,7)
+
+!$acc parallel loop collapse(2) &
+!$acc& private(ind0,ind1,inds,indf,indm,ig,js,js1,jmo3,jpl,speccomb,specparm, &
+!$acc& specmult,fs,speccomb1,specparm1,specmult1,fs1,speccomb_mo3,specparm_mo3, &
+!$acc& specmult_mo3,fmo3,speccomb_planck,specparm_planck,specmult_planck,fpl, &
+!$acc& p,p4,fk0,fk1,fk2,fac000,fac100,fac200,fac010,fac110,fac210,fac001,fac101, &
+!$acc& fac201,fac011,fac111,fac211,tauself,taufor,o3m1,o3m2,abso3,tau_major,tau_major1) &
+!$acc& present(laytrop,jp,jt,jt1,colh2o,colco2,colo3,rat_h2oco2,rat_h2oco2_1, &
+!$acc& rat_o3co2,rat_o3co2_1,indself,indfor,indminor,selffac,selffrac,forfac, &
+!$acc& forfrac,minorfrac,fac00,fac01,fac10,fac11,wx,taug,fracs,fracrefa,fracrefb, &
+!$acc& absa,absb,ka_mo3,selfref,forref,ccl4,nspa,nspb,chi_mls)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+
+         IF ( lay <= laytrop(iplon) ) THEN
+
+            speccomb = colh2o(iplon,lay) + rat_h2oco2(iplon,lay)*colco2(iplon,lay)
+            specparm = colh2o(iplon,lay)/speccomb
+            IF (specparm .ge. oneminus) specparm = oneminus
+            specmult = 8._rb*(specparm)
+            js = 1 + int(specmult)
+            fs = mod(specmult,1.0_rb)
+
+            speccomb1 = colh2o(iplon,lay) + rat_h2oco2_1(iplon,lay)*colco2(iplon,lay)
+            specparm1 = colh2o(iplon,lay)/speccomb1
+            IF (specparm1 .ge. oneminus) specparm1 = oneminus
+            specmult1 = 8._rb*(specparm1)
+            js1 = 1 + int(specmult1)
+            fs1 = mod(specmult1,1.0_rb)
+
+            speccomb_mo3 = colh2o(iplon,lay) + refrat_m_a*colco2(iplon,lay)
+            specparm_mo3 = colh2o(iplon,lay)/speccomb_mo3
+            IF (specparm_mo3 .ge. oneminus) specparm_mo3 = oneminus
+            specmult_mo3 = 8._rb*specparm_mo3
+            jmo3 = 1 + int(specmult_mo3)
+            fmo3 = mod(specmult_mo3,1.0_rb)
+
+            speccomb_planck = colh2o(iplon,lay)+refrat_planck_a*colco2(iplon,lay)
+            specparm_planck = colh2o(iplon,lay)/speccomb_planck
+            IF (specparm_planck .ge. oneminus) specparm_planck=oneminus
+            specmult_planck = 8._rb*specparm_planck
+            jpl= 1 + int(specmult_planck)
+            fpl = mod(specmult_planck,1.0_rb)
+
+            ind0 = ((jp(iplon,lay)-1)*5+(jt(iplon,lay)-1))*nspa(5) + js
+            ind1 = (jp(iplon,lay)*5+(jt1(iplon,lay)-1))*nspa(5) + js1
+            inds = indself(iplon,lay)
+            indf = indfor(iplon,lay)
+            indm = indminor(iplon,lay)
+
+            IF (specparm .lt. 0.125_rb) THEN
+               p = fs - 1
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac000 = fk0*fac00(iplon,lay)
+               fac100 = fk1*fac00(iplon,lay)
+               fac200 = fk2*fac00(iplon,lay)
+               fac010 = fk0*fac10(iplon,lay)
+               fac110 = fk1*fac10(iplon,lay)
+               fac210 = fk2*fac10(iplon,lay)
+            ELSE IF (specparm .gt. 0.875_rb) THEN
+               p = -fs
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac000 = fk0*fac00(iplon,lay)
+               fac100 = fk1*fac00(iplon,lay)
+               fac200 = fk2*fac00(iplon,lay)
+               fac010 = fk0*fac10(iplon,lay)
+               fac110 = fk1*fac10(iplon,lay)
+               fac210 = fk2*fac10(iplon,lay)
+            ELSE
+               fac000 = (1._rb - fs) * fac00(iplon,lay)
+               fac010 = (1._rb - fs) * fac10(iplon,lay)
+               fac100 = fs * fac00(iplon,lay)
+               fac110 = fs * fac10(iplon,lay)
+            ENDIF
+
+            IF (specparm1 .lt. 0.125_rb) THEN
+               p = fs1 - 1
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac001 = fk0*fac01(iplon,lay)
+               fac101 = fk1*fac01(iplon,lay)
+               fac201 = fk2*fac01(iplon,lay)
+               fac011 = fk0*fac11(iplon,lay)
+               fac111 = fk1*fac11(iplon,lay)
+               fac211 = fk2*fac11(iplon,lay)
+            ELSE IF (specparm1 .gt. 0.875_rb) THEN
+               p = -fs1
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac001 = fk0*fac01(iplon,lay)
+               fac101 = fk1*fac01(iplon,lay)
+               fac201 = fk2*fac01(iplon,lay)
+               fac011 = fk0*fac11(iplon,lay)
+               fac111 = fk1*fac11(iplon,lay)
+               fac211 = fk2*fac11(iplon,lay)
+            ELSE
+               fac001 = (1._rb - fs1) * fac01(iplon,lay)
+               fac011 = (1._rb - fs1) * fac11(iplon,lay)
+               fac101 = fs1 * fac01(iplon,lay)
+               fac111 = fs1 * fac11(iplon,lay)
+            ENDIF
+
+            DO ig = 1, ng5
+               tauself = selffac(iplon,lay) * (selfref(inds,ig) + selffrac(iplon,lay) * &
+                    (selfref(inds+1,ig) - selfref(inds,ig)))
+               taufor =  forfac(iplon,lay) * (forref(indf,ig) + forfrac(iplon,lay) * &
+                    (forref(indf+1,ig) - forref(indf,ig)))
+               o3m1 = ka_mo3(jmo3,indm,ig) + fmo3 * &
+                    (ka_mo3(jmo3+1,indm,ig)-ka_mo3(jmo3,indm,ig))
+               o3m2 = ka_mo3(jmo3,indm+1,ig) + fmo3 * &
+                    (ka_mo3(jmo3+1,indm+1,ig)-ka_mo3(jmo3,indm+1,ig))
+               abso3 = o3m1 + minorfrac(iplon,lay)*(o3m2-o3m1)
+
+               IF (specparm .lt. 0.125_rb) THEN
+                  tau_major = speccomb * &
+                       (fac000 * absa(ind0,ig) + &
+                       fac100 * absa(ind0+1,ig) + &
+                       fac200 * absa(ind0+2,ig) + &
+                       fac010 * absa(ind0+9,ig) + &
+                       fac110 * absa(ind0+10,ig) + &
+                       fac210 * absa(ind0+11,ig))
+               ELSE IF (specparm .gt. 0.875_rb) THEN
+                  tau_major = speccomb * &
+                       (fac200 * absa(ind0-1,ig) + &
+                       fac100 * absa(ind0,ig) + &
+                       fac000 * absa(ind0+1,ig) + &
+                       fac210 * absa(ind0+8,ig) + &
+                       fac110 * absa(ind0+9,ig) + &
+                       fac010 * absa(ind0+10,ig))
+               ELSE
+                  tau_major = speccomb * &
+                       (fac000 * absa(ind0,ig) + &
+                       fac100 * absa(ind0+1,ig) + &
+                       fac010 * absa(ind0+9,ig) + &
+                       fac110 * absa(ind0+10,ig))
+               ENDIF
+
+               IF (specparm1 .lt. 0.125_rb) THEN
+                  tau_major1 = speccomb1 * &
+                       (fac001 * absa(ind1,ig) + &
+                       fac101 * absa(ind1+1,ig) + &
+                       fac201 * absa(ind1+2,ig) + &
+                       fac011 * absa(ind1+9,ig) + &
+                       fac111 * absa(ind1+10,ig) + &
+                       fac211 * absa(ind1+11,ig))
+               ELSE IF (specparm1 .gt. 0.875_rb) THEN
+                  tau_major1 = speccomb1 * &
+                       (fac201 * absa(ind1-1,ig) + &
+                       fac101 * absa(ind1,ig) + &
+                       fac001 * absa(ind1+1,ig) + &
+                       fac211 * absa(ind1+8,ig) + &
+                       fac111 * absa(ind1+9,ig) + &
+                       fac011 * absa(ind1+10,ig))
+               ELSE
+                  tau_major1 = speccomb1 * &
+                       (fac001 * absa(ind1,ig) + &
+                       fac101 * absa(ind1+1,ig) + &
+                       fac011 * absa(ind1+9,ig) + &
+                       fac111 * absa(ind1+10,ig))
+               ENDIF
+
+               taug(iplon,lay,ngs4+ig) = tau_major + tau_major1 &
+                    + tauself + taufor &
+                    + abso3*colo3(iplon,lay) &
+                    + wx(iplon,lay,1) * ccl4(ig)
+               fracs(iplon,lay,ngs4+ig) = fracrefa(ig,jpl) + fpl * &
+                    (fracrefa(ig,jpl+1)-fracrefa(ig,jpl))
+            ENDDO
+
+         ELSE
+
+            speccomb = colo3(iplon,lay) + rat_o3co2(iplon,lay)*colco2(iplon,lay)
+            specparm = colo3(iplon,lay)/speccomb
+            IF (specparm .ge. oneminus) specparm = oneminus
+            specmult = 4._rb*(specparm)
+            js = 1 + int(specmult)
+            fs = mod(specmult,1.0_rb)
+
+            speccomb1 = colo3(iplon,lay) + rat_o3co2_1(iplon,lay)*colco2(iplon,lay)
+            specparm1 = colo3(iplon,lay)/speccomb1
+            IF (specparm1 .ge. oneminus) specparm1 = oneminus
+            specmult1 = 4._rb*(specparm1)
+            js1 = 1 + int(specmult1)
+            fs1 = mod(specmult1,1.0_rb)
+
+            fac000 = (1._rb - fs) * fac00(iplon,lay)
+            fac010 = (1._rb - fs) * fac10(iplon,lay)
+            fac100 = fs * fac00(iplon,lay)
+            fac110 = fs * fac10(iplon,lay)
+            fac001 = (1._rb - fs1) * fac01(iplon,lay)
+            fac011 = (1._rb - fs1) * fac11(iplon,lay)
+            fac101 = fs1 * fac01(iplon,lay)
+            fac111 = fs1 * fac11(iplon,lay)
+
+            speccomb_planck = colo3(iplon,lay)+refrat_planck_b*colco2(iplon,lay)
+            specparm_planck = colo3(iplon,lay)/speccomb_planck
+            IF (specparm_planck .ge. oneminus) specparm_planck=oneminus
+            specmult_planck = 4._rb*specparm_planck
+            jpl= 1 + int(specmult_planck)
+            fpl = mod(specmult_planck,1.0_rb)
+
+            ind0 = ((jp(iplon,lay)-13)*5+(jt(iplon,lay)-1))*nspb(5) + js
+            ind1 = ((jp(iplon,lay)-12)*5+(jt1(iplon,lay)-1))*nspb(5) + js1
+
+            DO ig = 1, ng5
+               taug(iplon,lay,ngs4+ig) = speccomb * &
+                   (fac000 * absb(ind0,ig) + &
+                   fac100 * absb(ind0+1,ig) + &
+                   fac010 * absb(ind0+5,ig) + &
+                   fac110 * absb(ind0+6,ig)) &
+                   + speccomb1 * &
+                   (fac001 * absb(ind1,ig) + &
+                   fac101 * absb(ind1+1,ig) + &
+                   fac011 * absb(ind1+5,ig) + &
+                   fac111 * absb(ind1+6,ig))  &
+                   + wx(iplon,lay,1) * ccl4(ig)
+               fracs(iplon,lay,ngs4+ig) = fracrefb(ig,jpl) + fpl * &
+                   (fracrefb(ig,jpl+1)-fracrefb(ig,jpl))
+            ENDDO
+
+         ENDIF
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE taugb5_gpu
+
+!----------------------------------------------------------------------------
+
+      SUBROUTINE taugb6_gpu(ncol, nlayers, laytrop, jp, jt, jt1,       &
+                             colh2o, colco2, coldry,                   &
+                             indself, indfor, indminor,                &
+                             selffac, selffrac, forfac, forfrac,       &
+                             minorfrac, fac00, fac01, fac10, fac11,    &
+                             wx, ngptlw, taug, fracs)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrtm, only : ng6, ngs5
+      use rrlw_ref, only : chi_mls
+      use rrlw_kg06, only : fracrefa, absa, ka_mco2, &
+                             selfref, forref, cfc11adj, cfc12
+      use rrlw_wvn, only : nspa
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, ngptlw
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol)
+      INTEGER(kind=im), INTENT(IN) :: jp(ncol,nlayers), jt(ncol,nlayers), &
+                                       jt1(ncol,nlayers)
+      INTEGER(kind=im), INTENT(IN) :: indself(ncol,nlayers), &
+                                       indfor(ncol,nlayers), &
+                                       indminor(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: colh2o(ncol,nlayers), colco2(ncol,nlayers), &
+                                    coldry(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: selffac(ncol,nlayers), selffrac(ncol,nlayers), &
+                                    forfac(ncol,nlayers), forfrac(ncol,nlayers), &
+                                    minorfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                    fac10(ncol,nlayers), fac11(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: wx(ncol,nlayers,4)
+      REAL(kind=rb), INTENT(INOUT) :: taug(ncol,nlayers,ngptlw)
+      REAL(kind=rb), INTENT(INOUT) :: fracs(ncol,nlayers,ngptlw)
+
+      INTEGER(kind=im) :: iplon, lay, ind0, ind1, inds, indf, indm, ig
+      REAL(kind=rb) :: chi_co2, ratco2, adjfac, adjcolco2
+      REAL(kind=rb) :: tauself, taufor, absco2
+
+!$acc parallel loop collapse(2) &
+!$acc& private(ind0,ind1,inds,indf,indm,ig,chi_co2,ratco2,adjfac,adjcolco2, &
+!$acc& tauself,taufor,absco2) &
+!$acc& present(laytrop,jp,jt,jt1,colh2o,colco2,coldry,indself,indfor,indminor, &
+!$acc& selffac,selffrac,forfac,forfrac,minorfrac,fac00,fac01,fac10,fac11,wx, &
+!$acc& taug,fracs,fracrefa,absa,ka_mco2,selfref,forref,cfc11adj,cfc12,nspa,chi_mls)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+
+         IF ( lay <= laytrop(iplon) ) THEN
+
+! In atmospheres where the amount of CO2 is too great to be considered
+! a minor species, adjust the column amount of CO2 by an empirical factor
+! to obtain the proper contribution.
+            chi_co2 = colco2(iplon,lay)/(coldry(iplon,lay))
+            ratco2 = 1.e20_rb*chi_co2/chi_mls(2,jp(iplon,lay)+1)
+            IF (ratco2 .gt. 3.0_rb) THEN
+               adjfac = 2.0_rb+(ratco2-2.0_rb)**0.77_rb
+               adjcolco2 = adjfac*chi_mls(2,jp(iplon,lay)+1)*coldry(iplon,lay)*1.e-20_rb
+            ELSE
+               adjcolco2 = colco2(iplon,lay)
+            ENDIF
+
+            ind0 = ((jp(iplon,lay)-1)*5+(jt(iplon,lay)-1))*nspa(6) + 1
+            ind1 = (jp(iplon,lay)*5+(jt1(iplon,lay)-1))*nspa(6) + 1
+            inds = indself(iplon,lay)
+            indf = indfor(iplon,lay)
+            indm = indminor(iplon,lay)
+
+            DO ig = 1, ng6
+               tauself = selffac(iplon,lay) * (selfref(inds,ig) + selffrac(iplon,lay) * &
+                    (selfref(inds+1,ig) - selfref(inds,ig)))
+               taufor =  forfac(iplon,lay) * (forref(indf,ig) + forfrac(iplon,lay) * &
+                    (forref(indf+1,ig) - forref(indf,ig)))
+               absco2 =  (ka_mco2(indm,ig) + minorfrac(iplon,lay) * &
+                    (ka_mco2(indm+1,ig) - ka_mco2(indm,ig)))
+               taug(iplon,lay,ngs5+ig) = colh2o(iplon,lay) * &
+                   (fac00(iplon,lay) * absa(ind0,ig) + &
+                    fac10(iplon,lay) * absa(ind0+1,ig) + &
+                    fac01(iplon,lay) * absa(ind1,ig) + &
+                    fac11(iplon,lay) * absa(ind1+1,ig))  &
+                    + tauself + taufor &
+                    + adjcolco2 * absco2 &
+                    + wx(iplon,lay,2) * cfc11adj(ig) &
+                    + wx(iplon,lay,3) * cfc12(ig)
+               fracs(iplon,lay,ngs5+ig) = fracrefa(ig)
+            ENDDO
+
+         ELSE
+
+! Nothing important goes on above laytrop in this band.
+            DO ig = 1, ng6
+               taug(iplon,lay,ngs5+ig) = 0.0_rb &
+                    + wx(iplon,lay,2) * cfc11adj(ig) &
+                    + wx(iplon,lay,3) * cfc12(ig)
+               fracs(iplon,lay,ngs5+ig) = fracrefa(ig)
+            ENDDO
+
+         ENDIF
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE taugb6_gpu
+
+!----------------------------------------------------------------------------
+
+      SUBROUTINE taugb7_gpu(ncol, nlayers, laytrop, jp, jt, jt1,       &
+                             colh2o, colo3, colco2, coldry,            &
+                             rat_h2oo3, rat_h2oo3_1,                   &
+                             indself, indfor, indminor,                &
+                             selffac, selffrac, forfac, forfrac,       &
+                             minorfrac, fac00, fac01, fac10, fac11,    &
+                             ngptlw, taug, fracs)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrtm, only : ng7, ngs6
+      use rrlw_ref, only : chi_mls
+      use rrlw_con, only : oneminus
+      use rrlw_kg07, only : fracrefa, fracrefb, absa, absb, &
+                             ka_mco2, kb_mco2, selfref, forref
+      use rrlw_wvn, only : nspa, nspb
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, ngptlw
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol)
+      INTEGER(kind=im), INTENT(IN) :: jp(ncol,nlayers), jt(ncol,nlayers), &
+                                       jt1(ncol,nlayers)
+      INTEGER(kind=im), INTENT(IN) :: indself(ncol,nlayers), &
+                                       indfor(ncol,nlayers), &
+                                       indminor(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: colh2o(ncol,nlayers), colo3(ncol,nlayers), &
+                                    colco2(ncol,nlayers), coldry(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: rat_h2oo3(ncol,nlayers), rat_h2oo3_1(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: selffac(ncol,nlayers), selffrac(ncol,nlayers), &
+                                    forfac(ncol,nlayers), forfrac(ncol,nlayers), &
+                                    minorfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                    fac10(ncol,nlayers), fac11(ncol,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: taug(ncol,nlayers,ngptlw)
+      REAL(kind=rb), INTENT(INOUT) :: fracs(ncol,nlayers,ngptlw)
+
+      INTEGER(kind=im) :: iplon, lay, ind0, ind1, inds, indf, indm, ig
+      INTEGER(kind=im) :: js, js1, jmco2, jpl
+      REAL(kind=rb) :: speccomb, specparm, specmult, fs
+      REAL(kind=rb) :: speccomb1, specparm1, specmult1, fs1
+      REAL(kind=rb) :: speccomb_mco2, specparm_mco2, specmult_mco2, fmco2
+      REAL(kind=rb) :: speccomb_planck, specparm_planck, specmult_planck, fpl
+      REAL(kind=rb) :: p, p4, fk0, fk1, fk2
+      REAL(kind=rb) :: fac000, fac100, fac200, fac010, fac110, fac210
+      REAL(kind=rb) :: fac001, fac101, fac201, fac011, fac111, fac211
+      REAL(kind=rb) :: tauself, taufor, co2m1, co2m2, absco2
+      REAL(kind=rb) :: chi_co2, ratco2, adjfac, adjcolco2
+      REAL(kind=rb) :: refrat_planck_a, refrat_m_a
+      REAL(kind=rb) :: tau_major, tau_major1
+
+! P = 706.2620 mb
+      refrat_planck_a = chi_mls(1,3)/chi_mls(3,3)
+
+! P = 706.2720 mb
+      refrat_m_a = chi_mls(1,3)/chi_mls(3,3)
+
+!$acc parallel loop collapse(2) &
+!$acc& private(ind0,ind1,inds,indf,indm,ig,js,js1,jmco2,jpl,speccomb,specparm, &
+!$acc& specmult,fs,speccomb1,specparm1,specmult1,fs1,speccomb_mco2,specparm_mco2, &
+!$acc& specmult_mco2,fmco2,speccomb_planck,specparm_planck,specmult_planck,fpl, &
+!$acc& p,p4,fk0,fk1,fk2,fac000,fac100,fac200,fac010,fac110,fac210,fac001,fac101, &
+!$acc& fac201,fac011,fac111,fac211,tauself,taufor,co2m1,co2m2,absco2,chi_co2, &
+!$acc& ratco2,adjfac,adjcolco2,tau_major,tau_major1) &
+!$acc& present(laytrop,jp,jt,jt1,colh2o,colo3,colco2,coldry,rat_h2oo3,rat_h2oo3_1, &
+!$acc& indself,indfor,indminor,selffac,selffrac,forfac,forfrac,minorfrac,fac00, &
+!$acc& fac01,fac10,fac11,taug,fracs,fracrefa,fracrefb,absa,absb,ka_mco2,kb_mco2, &
+!$acc& selfref,forref,nspa,nspb,chi_mls)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+
+         IF ( lay <= laytrop(iplon) ) THEN
+
+            speccomb = colh2o(iplon,lay) + rat_h2oo3(iplon,lay)*colo3(iplon,lay)
+            specparm = colh2o(iplon,lay)/speccomb
+            IF (specparm .ge. oneminus) specparm = oneminus
+            specmult = 8._rb*(specparm)
+            js = 1 + int(specmult)
+            fs = mod(specmult,1.0_rb)
+
+            speccomb1 = colh2o(iplon,lay) + rat_h2oo3_1(iplon,lay)*colo3(iplon,lay)
+            specparm1 = colh2o(iplon,lay)/speccomb1
+            IF (specparm1 .ge. oneminus) specparm1 = oneminus
+            specmult1 = 8._rb*(specparm1)
+            js1 = 1 + int(specmult1)
+            fs1 = mod(specmult1,1.0_rb)
+
+            speccomb_mco2 = colh2o(iplon,lay) + refrat_m_a*colo3(iplon,lay)
+            specparm_mco2 = colh2o(iplon,lay)/speccomb_mco2
+            IF (specparm_mco2 .ge. oneminus) specparm_mco2 = oneminus
+            specmult_mco2 = 8._rb*specparm_mco2
+
+            jmco2 = 1 + int(specmult_mco2)
+            fmco2 = mod(specmult_mco2,1.0_rb)
+
+!  In atmospheres where the amount of CO2 is too great to be considered
+!  a minor species, adjust the column amount of CO2 by an empirical factor
+!  to obtain the proper contribution.
+            chi_co2 = colco2(iplon,lay)/(coldry(iplon,lay))
+            ratco2 = 1.e20*chi_co2/chi_mls(2,jp(iplon,lay)+1)
+            IF (ratco2 .gt. 3.0_rb) THEN
+               adjfac = 3.0_rb+(ratco2-3.0_rb)**0.79_rb
+               adjcolco2 = adjfac*chi_mls(2,jp(iplon,lay)+1)*coldry(iplon,lay)*1.e-20_rb
+            ELSE
+               adjcolco2 = colco2(iplon,lay)
+            ENDIF
+
+            speccomb_planck = colh2o(iplon,lay)+refrat_planck_a*colo3(iplon,lay)
+            specparm_planck = colh2o(iplon,lay)/speccomb_planck
+            IF (specparm_planck .ge. oneminus) specparm_planck=oneminus
+            specmult_planck = 8._rb*specparm_planck
+            jpl= 1 + int(specmult_planck)
+            fpl = mod(specmult_planck,1.0_rb)
+
+            ind0 = ((jp(iplon,lay)-1)*5+(jt(iplon,lay)-1))*nspa(7) + js
+            ind1 = (jp(iplon,lay)*5+(jt1(iplon,lay)-1))*nspa(7) + js1
+            inds = indself(iplon,lay)
+            indf = indfor(iplon,lay)
+            indm = indminor(iplon,lay)
+
+            IF (specparm .lt. 0.125_rb) THEN
+               p = fs - 1
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac000 = fk0*fac00(iplon,lay)
+               fac100 = fk1*fac00(iplon,lay)
+               fac200 = fk2*fac00(iplon,lay)
+               fac010 = fk0*fac10(iplon,lay)
+               fac110 = fk1*fac10(iplon,lay)
+               fac210 = fk2*fac10(iplon,lay)
+            ELSE IF (specparm .gt. 0.875_rb) THEN
+               p = -fs
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac000 = fk0*fac00(iplon,lay)
+               fac100 = fk1*fac00(iplon,lay)
+               fac200 = fk2*fac00(iplon,lay)
+               fac010 = fk0*fac10(iplon,lay)
+               fac110 = fk1*fac10(iplon,lay)
+               fac210 = fk2*fac10(iplon,lay)
+            ELSE
+               fac000 = (1._rb - fs) * fac00(iplon,lay)
+               fac010 = (1._rb - fs) * fac10(iplon,lay)
+               fac100 = fs * fac00(iplon,lay)
+               fac110 = fs * fac10(iplon,lay)
+            ENDIF
+            IF (specparm1 .lt. 0.125_rb) THEN
+               p = fs1 - 1
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac001 = fk0*fac01(iplon,lay)
+               fac101 = fk1*fac01(iplon,lay)
+               fac201 = fk2*fac01(iplon,lay)
+               fac011 = fk0*fac11(iplon,lay)
+               fac111 = fk1*fac11(iplon,lay)
+               fac211 = fk2*fac11(iplon,lay)
+            ELSE IF (specparm1 .gt. 0.875_rb) THEN
+               p = -fs1
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac001 = fk0*fac01(iplon,lay)
+               fac101 = fk1*fac01(iplon,lay)
+               fac201 = fk2*fac01(iplon,lay)
+               fac011 = fk0*fac11(iplon,lay)
+               fac111 = fk1*fac11(iplon,lay)
+               fac211 = fk2*fac11(iplon,lay)
+            ELSE
+               fac001 = (1._rb - fs1) * fac01(iplon,lay)
+               fac011 = (1._rb - fs1) * fac11(iplon,lay)
+               fac101 = fs1 * fac01(iplon,lay)
+               fac111 = fs1 * fac11(iplon,lay)
+            ENDIF
+
+            DO ig = 1, ng7
+               tauself = selffac(iplon,lay)* (selfref(inds,ig) + selffrac(iplon,lay) * &
+                    (selfref(inds+1,ig) - selfref(inds,ig)))
+               taufor = forfac(iplon,lay) * (forref(indf,ig) + forfrac(iplon,lay) * &
+                    (forref(indf+1,ig) - forref(indf,ig)))
+               co2m1 = ka_mco2(jmco2,indm,ig) + fmco2 * &
+                    (ka_mco2(jmco2+1,indm,ig) - ka_mco2(jmco2,indm,ig))
+               co2m2 = ka_mco2(jmco2,indm+1,ig) + fmco2 * &
+                    (ka_mco2(jmco2+1,indm+1,ig) - ka_mco2(jmco2,indm+1,ig))
+               absco2 = co2m1 + minorfrac(iplon,lay) * (co2m2 - co2m1)
+
+               IF (specparm .lt. 0.125_rb) THEN
+                  tau_major = speccomb * &
+                       (fac000 * absa(ind0,ig) + &
+                       fac100 * absa(ind0+1,ig) + &
+                       fac200 * absa(ind0+2,ig) + &
+                       fac010 * absa(ind0+9,ig) + &
+                       fac110 * absa(ind0+10,ig) + &
+                       fac210 * absa(ind0+11,ig))
+               ELSE IF (specparm .gt. 0.875_rb) THEN
+                  tau_major = speccomb * &
+                       (fac200 * absa(ind0-1,ig) + &
+                       fac100 * absa(ind0,ig) + &
+                       fac000 * absa(ind0+1,ig) + &
+                       fac210 * absa(ind0+8,ig) + &
+                       fac110 * absa(ind0+9,ig) + &
+                       fac010 * absa(ind0+10,ig))
+               ELSE
+                  tau_major = speccomb * &
+                       (fac000 * absa(ind0,ig) + &
+                       fac100 * absa(ind0+1,ig) + &
+                       fac010 * absa(ind0+9,ig) + &
+                       fac110 * absa(ind0+10,ig))
+               ENDIF
+
+               IF (specparm1 .lt. 0.125_rb) THEN
+                  tau_major1 = speccomb1 * &
+                       (fac001 * absa(ind1,ig) + &
+                       fac101 * absa(ind1+1,ig) + &
+                       fac201 * absa(ind1+2,ig) + &
+                       fac011 * absa(ind1+9,ig) + &
+                       fac111 * absa(ind1+10,ig) + &
+                       fac211 * absa(ind1+11,ig))
+               ELSE IF (specparm1 .gt. 0.875_rb) THEN
+                  tau_major1 = speccomb1 * &
+                       (fac201 * absa(ind1-1,ig) + &
+                       fac101 * absa(ind1,ig) + &
+                       fac001 * absa(ind1+1,ig) + &
+                       fac211 * absa(ind1+8,ig) + &
+                       fac111 * absa(ind1+9,ig) + &
+                       fac011 * absa(ind1+10,ig))
+               ELSE
+                  tau_major1 = speccomb1 * &
+                       (fac001 * absa(ind1,ig) + &
+                       fac101 * absa(ind1+1,ig) + &
+                       fac011 * absa(ind1+9,ig) + &
+                       fac111 * absa(ind1+10,ig))
+               ENDIF
+
+               taug(iplon,lay,ngs6+ig) = tau_major + tau_major1 &
+                    + tauself + taufor &
+                    + adjcolco2*absco2
+               fracs(iplon,lay,ngs6+ig) = fracrefa(ig,jpl) + fpl * &
+                    (fracrefa(ig,jpl+1)-fracrefa(ig,jpl))
+            ENDDO
+
+         ELSE
+
+!  In atmospheres where the amount of CO2 is too great to be considered
+!  a minor species, adjust the column amount of CO2 by an empirical factor
+!  to obtain the proper contribution.
+            chi_co2 = colco2(iplon,lay)/(coldry(iplon,lay))
+            ratco2 = 1.e20*chi_co2/chi_mls(2,jp(iplon,lay)+1)
+            IF (ratco2 .gt. 3.0_rb) THEN
+               adjfac = 2.0_rb+(ratco2-2.0_rb)**0.79_rb
+               adjcolco2 = adjfac*chi_mls(2,jp(iplon,lay)+1)*coldry(iplon,lay)*1.e-20_rb
+            ELSE
+               adjcolco2 = colco2(iplon,lay)
+            ENDIF
+
+            ind0 = ((jp(iplon,lay)-13)*5+(jt(iplon,lay)-1))*nspb(7) + 1
+            ind1 = ((jp(iplon,lay)-12)*5+(jt1(iplon,lay)-1))*nspb(7) + 1
+            indm = indminor(iplon,lay)
+
+            DO ig = 1, ng7
+               absco2 = kb_mco2(indm,ig) + minorfrac(iplon,lay) * &
+                    (kb_mco2(indm+1,ig) - kb_mco2(indm,ig))
+               taug(iplon,lay,ngs6+ig) = colo3(iplon,lay) * &
+                    (fac00(iplon,lay) * absb(ind0,ig) + &
+                    fac10(iplon,lay) * absb(ind0+1,ig) + &
+                    fac01(iplon,lay) * absb(ind1,ig) + &
+                    fac11(iplon,lay) * absb(ind1+1,ig)) &
+                    + adjcolco2 * absco2
+               fracs(iplon,lay,ngs6+ig) = fracrefb(ig)
+            ENDDO
+
+! Empirical modification to code to improve stratospheric cooling rates
+! for o3.  Revised to apply weighting for g-point reduction in this band.
+
+            taug(iplon,lay,ngs6+6)=taug(iplon,lay,ngs6+6)*0.92_rb
+            taug(iplon,lay,ngs6+7)=taug(iplon,lay,ngs6+7)*0.88_rb
+            taug(iplon,lay,ngs6+8)=taug(iplon,lay,ngs6+8)*1.07_rb
+            taug(iplon,lay,ngs6+9)=taug(iplon,lay,ngs6+9)*1.1_rb
+            taug(iplon,lay,ngs6+10)=taug(iplon,lay,ngs6+10)*0.99_rb
+            taug(iplon,lay,ngs6+11)=taug(iplon,lay,ngs6+11)*0.855_rb
+
+         ENDIF
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE taugb7_gpu
+      SUBROUTINE taugb8_gpu(ncol, nlayers, laytrop, jp, jt, jt1,        &
+                             pavel, colh2o, colco2, colo3, coln2o,      &
+                             coldry, wx,                                &
+                             indself, indfor, indminor,                 &
+                             selffac, selffrac, forfac, forfrac,        &
+                             minorfrac, fac00, fac01, fac10, fac11,     &
+                             ngptlw, taug, fracs)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrtm, only : ng8, ngs7
+      use rrlw_ref, only : chi_mls
+      use rrlw_kg08, only : fracrefa, fracrefb, absa, absb, &
+                            ka_mco2, ka_mn2o, ka_mo3, kb_mco2, kb_mn2o, &
+                            selfref, forref, cfc12, cfc22adj
+      use rrlw_wvn, only : nspa, nspb
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, ngptlw
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol)
+      INTEGER(kind=im), INTENT(IN) :: jp(ncol,nlayers), jt(ncol,nlayers), &
+                                       jt1(ncol,nlayers)
+      INTEGER(kind=im), INTENT(IN) :: indself(ncol,nlayers), &
+                                       indfor(ncol,nlayers), &
+                                       indminor(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: pavel(ncol,nlayers), colh2o(ncol,nlayers), &
+                                    colco2(ncol,nlayers), colo3(ncol,nlayers), &
+                                    coln2o(ncol,nlayers), coldry(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: wx(ncol,nlayers,4)
+      REAL(kind=rb), INTENT(IN) :: selffac(ncol,nlayers), selffrac(ncol,nlayers), &
+                                    forfac(ncol,nlayers), forfrac(ncol,nlayers), &
+                                    minorfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                    fac10(ncol,nlayers), fac11(ncol,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: taug(ncol,nlayers,ngptlw)
+      REAL(kind=rb), INTENT(INOUT) :: fracs(ncol,nlayers,ngptlw)
+
+      INTEGER(kind=im) :: iplon, lay, ind0, ind1, inds, indf, indm, ig
+      REAL(kind=rb) :: tauself, taufor, absco2, abso3, absn2o
+      REAL(kind=rb) :: chi_co2, ratco2, adjfac, adjcolco2
+
+!  Minor gas mapping level:
+!     lower - co2, p = 1053.63 mb, t = 294.2 k
+!     lower - o3,  p = 317.348 mb, t = 240.77 k
+!     lower - n2o, p = 706.2720 mb, t= 278.94 k
+!     lower - cfc12,cfc11
+!     upper - co2, p = 35.1632 mb, t = 223.28 k
+!     upper - n2o, p = 8.716e-2 mb, t = 226.03 k
+
+!$acc parallel loop collapse(2) &
+!$acc& private(ind0,ind1,inds,indf,indm,ig,tauself,taufor,absco2,abso3,absn2o, &
+!$acc& chi_co2,ratco2,adjfac,adjcolco2) &
+!$acc& present(laytrop,jp,jt,jt1,pavel,colh2o,colco2,colo3,coln2o,coldry,wx, &
+!$acc& indself,indfor,indminor,selffac,selffrac,forfac,forfrac,minorfrac, &
+!$acc& fac00,fac01,fac10,fac11,taug,fracs,fracrefa,fracrefb,absa,absb, &
+!$acc& ka_mco2,ka_mn2o,ka_mo3,kb_mco2,kb_mn2o,selfref,forref,cfc12,cfc22adj, &
+!$acc& chi_mls,nspa,nspb)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+
+         IF ( lay <= laytrop(iplon) ) THEN
+
+!  In atmospheres where the amount of CO2 is too great to be considered
+!  a minor species, adjust the column amount of CO2 by an empirical factor
+!  to obtain the proper contribution.
+            chi_co2 = colco2(iplon,lay)/(coldry(iplon,lay))
+            ratco2 = 1.e20_rb*chi_co2/chi_mls(2,jp(iplon,lay)+1)
+            IF (ratco2 .gt. 3.0_rb) THEN
+               adjfac = 2.0_rb+(ratco2-2.0_rb)**0.65_rb
+               adjcolco2 = adjfac*chi_mls(2,jp(iplon,lay)+1)*coldry(iplon,lay)*1.e-20_rb
+            ELSE
+               adjcolco2 = colco2(iplon,lay)
+            ENDIF
+
+            ind0 = ((jp(iplon,lay)-1)*5+(jt(iplon,lay)-1))*nspa(8) + 1
+            ind1 = (jp(iplon,lay)*5+(jt1(iplon,lay)-1))*nspa(8) + 1
+            inds = indself(iplon,lay)
+            indf = indfor(iplon,lay)
+            indm = indminor(iplon,lay)
+
+            DO ig = 1, ng8
+               tauself = selffac(iplon,lay) * (selfref(inds,ig) + selffrac(iplon,lay) * &
+                    (selfref(inds+1,ig) - selfref(inds,ig)))
+               taufor = forfac(iplon,lay) * (forref(indf,ig) + forfrac(iplon,lay) * &
+                    (forref(indf+1,ig) - forref(indf,ig)))
+               absco2 =  (ka_mco2(indm,ig) + minorfrac(iplon,lay) * &
+                    (ka_mco2(indm+1,ig) - ka_mco2(indm,ig)))
+               abso3 =  (ka_mo3(indm,ig) + minorfrac(iplon,lay) * &
+                    (ka_mo3(indm+1,ig) - ka_mo3(indm,ig)))
+               absn2o =  (ka_mn2o(indm,ig) + minorfrac(iplon,lay) * &
+                    (ka_mn2o(indm+1,ig) - ka_mn2o(indm,ig)))
+               taug(iplon,lay,ngs7+ig) = colh2o(iplon,lay) * &
+                    (fac00(iplon,lay) * absa(ind0,ig) + &
+                    fac10(iplon,lay) * absa(ind0+1,ig) + &
+                    fac01(iplon,lay) * absa(ind1,ig) +  &
+                    fac11(iplon,lay) * absa(ind1+1,ig)) &
+                    + tauself + taufor &
+                    + adjcolco2*absco2 &
+                    + colo3(iplon,lay) * abso3 &
+                    + coln2o(iplon,lay) * absn2o &
+                    + wx(iplon,lay,3) * cfc12(ig) &
+                    + wx(iplon,lay,4) * cfc22adj(ig)
+               fracs(iplon,lay,ngs7+ig) = fracrefa(ig)
+            ENDDO
+
+         ELSE
+
+!  In atmospheres where the amount of CO2 is too great to be considered
+!  a minor species, adjust the column amount of CO2 by an empirical factor
+!  to obtain the proper contribution.
+            chi_co2 = colco2(iplon,lay)/coldry(iplon,lay)
+            ratco2 = 1.e20_rb*chi_co2/chi_mls(2,jp(iplon,lay)+1)
+            IF (ratco2 .gt. 3.0_rb) THEN
+               adjfac = 2.0_rb+(ratco2-2.0_rb)**0.65_rb
+               adjcolco2 = adjfac*chi_mls(2,jp(iplon,lay)+1) * coldry(iplon,lay)*1.e-20_rb
+            ELSE
+               adjcolco2 = colco2(iplon,lay)
+            ENDIF
+
+            ind0 = ((jp(iplon,lay)-13)*5+(jt(iplon,lay)-1))*nspb(8) + 1
+            ind1 = ((jp(iplon,lay)-12)*5+(jt1(iplon,lay)-1))*nspb(8) + 1
+            indm = indminor(iplon,lay)
+
+            DO ig = 1, ng8
+               absco2 =  (kb_mco2(indm,ig) + minorfrac(iplon,lay) * &
+                    (kb_mco2(indm+1,ig) - kb_mco2(indm,ig)))
+               absn2o =  (kb_mn2o(indm,ig) + minorfrac(iplon,lay) * &
+                    (kb_mn2o(indm+1,ig) - kb_mn2o(indm,ig)))
+               taug(iplon,lay,ngs7+ig) = colo3(iplon,lay) * &
+                    (fac00(iplon,lay) * absb(ind0,ig) + &
+                    fac10(iplon,lay) * absb(ind0+1,ig) + &
+                    fac01(iplon,lay) * absb(ind1,ig) + &
+                    fac11(iplon,lay) * absb(ind1+1,ig)) &
+                    + adjcolco2*absco2 &
+                    + coln2o(iplon,lay)*absn2o &
+                    + wx(iplon,lay,3) * cfc12(ig) &
+                    + wx(iplon,lay,4) * cfc22adj(ig)
+               fracs(iplon,lay,ngs7+ig) = fracrefb(ig)
+            ENDDO
+
+         ENDIF
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE taugb8_gpu
+
+!----------------------------------------------------------------------------
+
+      SUBROUTINE taugb9_gpu(ncol, nlayers, laytrop, jp, jt, jt1,        &
+                             pavel, colh2o, colch4, coln2o, coldry,     &
+                             rat_h2och4, rat_h2och4_1,                  &
+                             indself, indfor, indminor,                 &
+                             selffac, selffrac, forfac, forfrac,        &
+                             minorfrac, fac00, fac01, fac10, fac11,     &
+                             ngptlw, taug, fracs)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrtm, only : ng9, ngs8
+      use rrlw_ref, only : chi_mls
+      use rrlw_con, only : oneminus
+      use rrlw_kg09, only : fracrefa, fracrefb, absa, absb, &
+                            ka_mn2o, kb_mn2o, selfref, forref
+      use rrlw_wvn, only : nspa, nspb
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, ngptlw
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol)
+      INTEGER(kind=im), INTENT(IN) :: jp(ncol,nlayers), jt(ncol,nlayers), &
+                                       jt1(ncol,nlayers)
+      INTEGER(kind=im), INTENT(IN) :: indself(ncol,nlayers), &
+                                       indfor(ncol,nlayers), &
+                                       indminor(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: pavel(ncol,nlayers), colh2o(ncol,nlayers), &
+                                    colch4(ncol,nlayers), coln2o(ncol,nlayers), &
+                                    coldry(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: rat_h2och4(ncol,nlayers), rat_h2och4_1(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: selffac(ncol,nlayers), selffrac(ncol,nlayers), &
+                                    forfac(ncol,nlayers), forfrac(ncol,nlayers), &
+                                    minorfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                    fac10(ncol,nlayers), fac11(ncol,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: taug(ncol,nlayers,ngptlw)
+      REAL(kind=rb), INTENT(INOUT) :: fracs(ncol,nlayers,ngptlw)
+
+      INTEGER(kind=im) :: iplon, lay, ind0, ind1, inds, indf, indm, ig
+      INTEGER(kind=im) :: js, js1, jmn2o, jpl
+      REAL(kind=rb) :: speccomb, specparm, specmult, fs
+      REAL(kind=rb) :: speccomb1, specparm1, specmult1, fs1
+      REAL(kind=rb) :: speccomb_mn2o, specparm_mn2o, specmult_mn2o, fmn2o
+      REAL(kind=rb) :: speccomb_planck, specparm_planck, specmult_planck, fpl
+      REAL(kind=rb) :: p, p4, fk0, fk1, fk2
+      REAL(kind=rb) :: fac000, fac100, fac200, fac010, fac110, fac210
+      REAL(kind=rb) :: fac001, fac101, fac201, fac011, fac111, fac211
+      REAL(kind=rb) :: tauself, taufor, n2om1, n2om2, absn2o
+      REAL(kind=rb) :: chi_n2o, ratn2o, adjfac, adjcoln2o
+      REAL(kind=rb) :: refrat_planck_a, refrat_m_a
+      REAL(kind=rb) :: tau_major, tau_major1
+
+!  Minor gas mapping level :
+!     lower - n2o, p = 706.272 mbar, t = 278.94 k
+!     upper - n2o, p = 95.58 mbar, t = 215.7 k
+
+! Calculate reference ratio to be used in calculation of Planck
+! fraction in lower/upper atmosphere.
+
+! P = 212 mb
+      refrat_planck_a = chi_mls(1,9)/chi_mls(6,9)
+
+! P = 706.272 mb
+      refrat_m_a = chi_mls(1,3)/chi_mls(6,3)
+
+!$acc parallel loop collapse(2) &
+!$acc& private(ind0,ind1,inds,indf,indm,ig,js,js1,jmn2o,jpl,speccomb,specparm, &
+!$acc& specmult,fs,speccomb1,specparm1,specmult1,fs1,speccomb_mn2o,specparm_mn2o, &
+!$acc& specmult_mn2o,fmn2o,speccomb_planck,specparm_planck,specmult_planck,fpl, &
+!$acc& p,p4,fk0,fk1,fk2,fac000,fac100,fac200,fac010,fac110,fac210,fac001,fac101, &
+!$acc& fac201,fac011,fac111,fac211,tauself,taufor,n2om1,n2om2,absn2o,chi_n2o, &
+!$acc& ratn2o,adjfac,adjcoln2o,tau_major,tau_major1) &
+!$acc& present(laytrop,jp,jt,jt1,pavel,colh2o,colch4,coln2o,coldry,rat_h2och4, &
+!$acc& rat_h2och4_1,indself,indfor,indminor,selffac,selffrac,forfac,forfrac, &
+!$acc& minorfrac,fac00,fac01,fac10,fac11,taug,fracs,fracrefa,fracrefb,absa,absb, &
+!$acc& ka_mn2o,kb_mn2o,selfref,forref,chi_mls,nspa,nspb)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+
+         IF ( lay <= laytrop(iplon) ) THEN
+
+            speccomb = colh2o(iplon,lay) + rat_h2och4(iplon,lay)*colch4(iplon,lay)
+            specparm = colh2o(iplon,lay)/speccomb
+            IF (specparm .ge. oneminus) specparm = oneminus
+            specmult = 8._rb*(specparm)
+            js = 1 + int(specmult)
+            fs = mod(specmult,1.0_rb)
+
+            speccomb1 = colh2o(iplon,lay) + rat_h2och4_1(iplon,lay)*colch4(iplon,lay)
+            specparm1 = colh2o(iplon,lay)/speccomb1
+            IF (specparm1 .ge. oneminus) specparm1 = oneminus
+            specmult1 = 8._rb*(specparm1)
+            js1 = 1 + int(specmult1)
+            fs1 = mod(specmult1,1.0_rb)
+
+            speccomb_mn2o = colh2o(iplon,lay) + refrat_m_a*colch4(iplon,lay)
+            specparm_mn2o = colh2o(iplon,lay)/speccomb_mn2o
+            IF (specparm_mn2o .ge. oneminus) specparm_mn2o = oneminus
+            specmult_mn2o = 8._rb*specparm_mn2o
+            jmn2o = 1 + int(specmult_mn2o)
+            fmn2o = mod(specmult_mn2o,1.0_rb)
+
+!  In atmospheres where the amount of N2O is too great to be considered
+!  a minor species, adjust the column amount of N2O by an empirical factor
+!  to obtain the proper contribution.
+            chi_n2o = coln2o(iplon,lay)/(coldry(iplon,lay))
+            ratn2o = 1.e20_rb*chi_n2o/chi_mls(4,jp(iplon,lay)+1)
+            IF (ratn2o .gt. 1.5_rb) THEN
+               adjfac = 0.5_rb+(ratn2o-0.5_rb)**0.65_rb
+               adjcoln2o = adjfac*chi_mls(4,jp(iplon,lay)+1)*coldry(iplon,lay)*1.e-20_rb
+            ELSE
+               adjcoln2o = coln2o(iplon,lay)
+            ENDIF
+
+            speccomb_planck = colh2o(iplon,lay)+refrat_planck_a*colch4(iplon,lay)
+            specparm_planck = colh2o(iplon,lay)/speccomb_planck
+            IF (specparm_planck .ge. oneminus) specparm_planck=oneminus
+            specmult_planck = 8._rb*specparm_planck
+            jpl= 1 + int(specmult_planck)
+            fpl = mod(specmult_planck,1.0_rb)
+
+            ind0 = ((jp(iplon,lay)-1)*5+(jt(iplon,lay)-1))*nspa(9) + js
+            ind1 = (jp(iplon,lay)*5+(jt1(iplon,lay)-1))*nspa(9) + js1
+            inds = indself(iplon,lay)
+            indf = indfor(iplon,lay)
+            indm = indminor(iplon,lay)
+
+            IF (specparm .lt. 0.125_rb) THEN
+               p = fs - 1
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac000 = fk0*fac00(iplon,lay)
+               fac100 = fk1*fac00(iplon,lay)
+               fac200 = fk2*fac00(iplon,lay)
+               fac010 = fk0*fac10(iplon,lay)
+               fac110 = fk1*fac10(iplon,lay)
+               fac210 = fk2*fac10(iplon,lay)
+            ELSE IF (specparm .gt. 0.875_rb) THEN
+               p = -fs
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac000 = fk0*fac00(iplon,lay)
+               fac100 = fk1*fac00(iplon,lay)
+               fac200 = fk2*fac00(iplon,lay)
+               fac010 = fk0*fac10(iplon,lay)
+               fac110 = fk1*fac10(iplon,lay)
+               fac210 = fk2*fac10(iplon,lay)
+            ELSE
+               fac000 = (1._rb - fs) * fac00(iplon,lay)
+               fac010 = (1._rb - fs) * fac10(iplon,lay)
+               fac100 = fs * fac00(iplon,lay)
+               fac110 = fs * fac10(iplon,lay)
+            ENDIF
+
+            IF (specparm1 .lt. 0.125_rb) THEN
+               p = fs1 - 1
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac001 = fk0*fac01(iplon,lay)
+               fac101 = fk1*fac01(iplon,lay)
+               fac201 = fk2*fac01(iplon,lay)
+               fac011 = fk0*fac11(iplon,lay)
+               fac111 = fk1*fac11(iplon,lay)
+               fac211 = fk2*fac11(iplon,lay)
+            ELSE IF (specparm1 .gt. 0.875_rb) THEN
+               p = -fs1
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac001 = fk0*fac01(iplon,lay)
+               fac101 = fk1*fac01(iplon,lay)
+               fac201 = fk2*fac01(iplon,lay)
+               fac011 = fk0*fac11(iplon,lay)
+               fac111 = fk1*fac11(iplon,lay)
+               fac211 = fk2*fac11(iplon,lay)
+            ELSE
+               fac001 = (1._rb - fs1) * fac01(iplon,lay)
+               fac011 = (1._rb - fs1) * fac11(iplon,lay)
+               fac101 = fs1 * fac01(iplon,lay)
+               fac111 = fs1 * fac11(iplon,lay)
+            ENDIF
+
+            DO ig = 1, ng9
+               tauself = selffac(iplon,lay)* (selfref(inds,ig) + selffrac(iplon,lay) * &
+                    (selfref(inds+1,ig) - selfref(inds,ig)))
+               taufor = forfac(iplon,lay) * (forref(indf,ig) + forfrac(iplon,lay) * &
+                    (forref(indf+1,ig) - forref(indf,ig)))
+               n2om1 = ka_mn2o(jmn2o,indm,ig) + fmn2o * &
+                    (ka_mn2o(jmn2o+1,indm,ig) - ka_mn2o(jmn2o,indm,ig))
+               n2om2 = ka_mn2o(jmn2o,indm+1,ig) + fmn2o * &
+                    (ka_mn2o(jmn2o+1,indm+1,ig) - ka_mn2o(jmn2o,indm+1,ig))
+               absn2o = n2om1 + minorfrac(iplon,lay) * (n2om2 - n2om1)
+
+               IF (specparm .lt. 0.125_rb) THEN
+                  tau_major = speccomb * &
+                       (fac000 * absa(ind0,ig) + &
+                       fac100 * absa(ind0+1,ig) + &
+                       fac200 * absa(ind0+2,ig) + &
+                       fac010 * absa(ind0+9,ig) + &
+                       fac110 * absa(ind0+10,ig) + &
+                       fac210 * absa(ind0+11,ig))
+               ELSE IF (specparm .gt. 0.875_rb) THEN
+                  tau_major = speccomb * &
+                       (fac200 * absa(ind0-1,ig) + &
+                       fac100 * absa(ind0,ig) + &
+                       fac000 * absa(ind0+1,ig) + &
+                       fac210 * absa(ind0+8,ig) + &
+                       fac110 * absa(ind0+9,ig) + &
+                       fac010 * absa(ind0+10,ig))
+               ELSE
+                  tau_major = speccomb * &
+                       (fac000 * absa(ind0,ig) + &
+                       fac100 * absa(ind0+1,ig) + &
+                       fac010 * absa(ind0+9,ig) + &
+                       fac110 * absa(ind0+10,ig))
+               ENDIF
+
+               IF (specparm1 .lt. 0.125_rb) THEN
+                  tau_major1 = speccomb1 * &
+                       (fac001 * absa(ind1,ig) + &
+                       fac101 * absa(ind1+1,ig) + &
+                       fac201 * absa(ind1+2,ig) + &
+                       fac011 * absa(ind1+9,ig) + &
+                       fac111 * absa(ind1+10,ig) + &
+                       fac211 * absa(ind1+11,ig))
+               ELSE IF (specparm1 .gt. 0.875_rb) THEN
+                  tau_major1 = speccomb1 * &
+                       (fac201 * absa(ind1-1,ig) + &
+                       fac101 * absa(ind1,ig) + &
+                       fac001 * absa(ind1+1,ig) + &
+                       fac211 * absa(ind1+8,ig) + &
+                       fac111 * absa(ind1+9,ig) + &
+                       fac011 * absa(ind1+10,ig))
+               ELSE
+                  tau_major1 = speccomb1 * &
+                       (fac001 * absa(ind1,ig) + &
+                       fac101 * absa(ind1+1,ig) + &
+                       fac011 * absa(ind1+9,ig) + &
+                       fac111 * absa(ind1+10,ig))
+               ENDIF
+
+               taug(iplon,lay,ngs8+ig) = tau_major + tau_major1 &
+                    + tauself + taufor &
+                    + adjcoln2o*absn2o
+               fracs(iplon,lay,ngs8+ig) = fracrefa(ig,jpl) + fpl * &
+                    (fracrefa(ig,jpl+1)-fracrefa(ig,jpl))
+            ENDDO
+
+         ELSE
+
+!  In atmospheres where the amount of N2O is too great to be considered
+!  a minor species, adjust the column amount of N2O by an empirical factor
+!  to obtain the proper contribution.
+            chi_n2o = coln2o(iplon,lay)/(coldry(iplon,lay))
+            ratn2o = 1.e20_rb*chi_n2o/chi_mls(4,jp(iplon,lay)+1)
+            IF (ratn2o .gt. 1.5_rb) THEN
+               adjfac = 0.5_rb+(ratn2o-0.5_rb)**0.65_rb
+               adjcoln2o = adjfac*chi_mls(4,jp(iplon,lay)+1)*coldry(iplon,lay)*1.e-20_rb
+            ELSE
+               adjcoln2o = coln2o(iplon,lay)
+            ENDIF
+
+            ind0 = ((jp(iplon,lay)-13)*5+(jt(iplon,lay)-1))*nspb(9) + 1
+            ind1 = ((jp(iplon,lay)-12)*5+(jt1(iplon,lay)-1))*nspb(9) + 1
+            indm = indminor(iplon,lay)
+
+            DO ig = 1, ng9
+               absn2o = kb_mn2o(indm,ig) + minorfrac(iplon,lay) * &
+                   (kb_mn2o(indm+1,ig) - kb_mn2o(indm,ig))
+               taug(iplon,lay,ngs8+ig) = colch4(iplon,lay) * &
+                    (fac00(iplon,lay) * absb(ind0,ig) + &
+                    fac10(iplon,lay) * absb(ind0+1,ig) + &
+                    fac01(iplon,lay) * absb(ind1,ig) +  &
+                    fac11(iplon,lay) * absb(ind1+1,ig)) &
+                    + adjcoln2o*absn2o
+               fracs(iplon,lay,ngs8+ig) = fracrefb(ig)
+            ENDDO
+
+         ENDIF
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE taugb9_gpu
+
+!----------------------------------------------------------------------------
+
+      SUBROUTINE taugb10_gpu(ncol, nlayers, laytrop, jp, jt, jt1,      &
+                              colh2o,                                  &
+                              indself, indfor,                         &
+                              selffac, selffrac, forfac, forfrac,      &
+                              fac00, fac01, fac10, fac11,              &
+                              ngptlw, taug, fracs)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrtm, only : ng10, ngs9
+      use rrlw_kg10, only : fracrefa, fracrefb, absa, absb, selfref, forref
+      use rrlw_wvn, only : nspa, nspb
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, ngptlw
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol)
+      INTEGER(kind=im), INTENT(IN) :: jp(ncol,nlayers), jt(ncol,nlayers), &
+                                       jt1(ncol,nlayers)
+      INTEGER(kind=im), INTENT(IN) :: indself(ncol,nlayers), indfor(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: colh2o(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: selffac(ncol,nlayers), selffrac(ncol,nlayers), &
+                                    forfac(ncol,nlayers), forfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                    fac10(ncol,nlayers), fac11(ncol,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: taug(ncol,nlayers,ngptlw)
+      REAL(kind=rb), INTENT(INOUT) :: fracs(ncol,nlayers,ngptlw)
+
+      INTEGER(kind=im) :: iplon, lay, ind0, ind1, inds, indf, ig
+      REAL(kind=rb) :: tauself, taufor
+
+!$acc parallel loop collapse(2) &
+!$acc& private(ind0,ind1,inds,indf,ig,tauself,taufor) &
+!$acc& present(laytrop,jp,jt,jt1,colh2o,indself,indfor,selffac,selffrac, &
+!$acc& forfac,forfrac,fac00,fac01,fac10,fac11,taug,fracs,fracrefa,fracrefb, &
+!$acc& absa,absb,selfref,forref,nspa,nspb)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+
+         IF ( lay <= laytrop(iplon) ) THEN
+
+            ind0 = ((jp(iplon,lay)-1)*5+(jt(iplon,lay)-1))*nspa(10) + 1
+            ind1 = (jp(iplon,lay)*5+(jt1(iplon,lay)-1))*nspa(10) + 1
+            inds = indself(iplon,lay)
+            indf = indfor(iplon,lay)
+
+            DO ig = 1, ng10
+               tauself = selffac(iplon,lay) * (selfref(inds,ig) + selffrac(iplon,lay) * &
+                    (selfref(inds+1,ig) - selfref(inds,ig)))
+               taufor = forfac(iplon,lay) * (forref(indf,ig) + forfrac(iplon,lay) * &
+                    (forref(indf+1,ig) - forref(indf,ig)))
+               taug(iplon,lay,ngs9+ig) = colh2o(iplon,lay) * &
+                    (fac00(iplon,lay) * absa(ind0,ig) + &
+                    fac10(iplon,lay) * absa(ind0+1,ig) + &
+                    fac01(iplon,lay) * absa(ind1,ig) + &
+                    fac11(iplon,lay) * absa(ind1+1,ig))  &
+                    + tauself + taufor
+               fracs(iplon,lay,ngs9+ig) = fracrefa(ig)
+            ENDDO
+
+         ELSE
+
+            ind0 = ((jp(iplon,lay)-13)*5+(jt(iplon,lay)-1))*nspb(10) + 1
+            ind1 = ((jp(iplon,lay)-12)*5+(jt1(iplon,lay)-1))*nspb(10) + 1
+            indf = indfor(iplon,lay)
+
+            DO ig = 1, ng10
+               taufor = forfac(iplon,lay) * (forref(indf,ig) + forfrac(iplon,lay) * &
+                    (forref(indf+1,ig) - forref(indf,ig)))
+               taug(iplon,lay,ngs9+ig) = colh2o(iplon,lay) * &
+                    (fac00(iplon,lay) * absb(ind0,ig) + &
+                    fac10(iplon,lay) * absb(ind0+1,ig) + &
+                    fac01(iplon,lay) * absb(ind1,ig) +  &
+                    fac11(iplon,lay) * absb(ind1+1,ig)) &
+                    + taufor
+               fracs(iplon,lay,ngs9+ig) = fracrefb(ig)
+            ENDDO
+
+         ENDIF
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE taugb10_gpu
+      SUBROUTINE taugb11_gpu(ncol, nlayers, laytrop, jp, jt, jt1,      &
+                             colh2o, colo2, scaleminor,                &
+                             indself, indfor, indminor,                &
+                             selffac, selffrac, forfac, forfrac,       &
+                             minorfrac, fac00, fac01, fac10, fac11,    &
+                             ngptlw, taug, fracs)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrtm, only : ng11, ngs10
+      use rrlw_kg11, only : fracrefa, fracrefb, absa, absb, ka_mo2, kb_mo2, &
+                             selfref, forref
+      use rrlw_wvn, only : nspa, nspb
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, ngptlw
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol)
+      INTEGER(kind=im), INTENT(IN) :: jp(ncol,nlayers), jt(ncol,nlayers), &
+                                       jt1(ncol,nlayers)
+      INTEGER(kind=im), INTENT(IN) :: indself(ncol,nlayers), &
+                                       indfor(ncol,nlayers), &
+                                       indminor(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: colh2o(ncol,nlayers), colo2(ncol,nlayers), &
+                                    scaleminor(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: selffac(ncol,nlayers), selffrac(ncol,nlayers), &
+                                    forfac(ncol,nlayers), forfrac(ncol,nlayers), &
+                                    minorfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                    fac10(ncol,nlayers), fac11(ncol,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: taug(ncol,nlayers,ngptlw)
+      REAL(kind=rb), INTENT(INOUT) :: fracs(ncol,nlayers,ngptlw)
+
+      INTEGER(kind=im) :: iplon, lay, ind0, ind1, inds, indf, indm, ig
+      REAL(kind=rb) :: scaleo2, tauself, taufor, tauo2
+
+!  Minor gas mapping level :
+!     lower - o2, p = 706.2720 mbar, t = 278.94 k
+!     upper - o2, p = 4.758820 mbarm t = 250.85 k
+
+!$acc parallel loop collapse(2) &
+!$acc& private(ind0,ind1,inds,indf,indm,ig,scaleo2,tauself,taufor,tauo2) &
+!$acc& present(laytrop,jp,jt,jt1,colh2o,colo2,scaleminor,indself,indfor,indminor, &
+!$acc& selffac,selffrac,forfac,forfrac,minorfrac,fac00,fac01,fac10,fac11, &
+!$acc& taug,fracs,fracrefa,fracrefb,absa,absb,ka_mo2,kb_mo2,selfref,forref,nspa,nspb)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+
+         IF ( lay <= laytrop(iplon) ) THEN
+
+            ind0 = ((jp(iplon,lay)-1)*5+(jt(iplon,lay)-1))*nspa(11) + 1
+            ind1 = (jp(iplon,lay)*5+(jt1(iplon,lay)-1))*nspa(11) + 1
+            inds = indself(iplon,lay)
+            indf = indfor(iplon,lay)
+            indm = indminor(iplon,lay)
+            scaleo2 = colo2(iplon,lay)*scaleminor(iplon,lay)
+            DO ig = 1, ng11
+               tauself = selffac(iplon,lay) * (selfref(inds,ig) + selffrac(iplon,lay) * &
+                    (selfref(inds+1,ig) - selfref(inds,ig)))
+               taufor = forfac(iplon,lay) * (forref(indf,ig) + forfrac(iplon,lay) * &
+                    (forref(indf+1,ig) - forref(indf,ig)))
+               tauo2 =  scaleo2 * (ka_mo2(indm,ig) + minorfrac(iplon,lay) * &
+                    (ka_mo2(indm+1,ig) - ka_mo2(indm,ig)))
+               taug(iplon,lay,ngs10+ig) = colh2o(iplon,lay) * &
+                    (fac00(iplon,lay) * absa(ind0,ig) + &
+                    fac10(iplon,lay) * absa(ind0+1,ig) + &
+                    fac01(iplon,lay) * absa(ind1,ig) + &
+                    fac11(iplon,lay) * absa(ind1+1,ig)) &
+                    + tauself + taufor &
+                    + tauo2
+               fracs(iplon,lay,ngs10+ig) = fracrefa(ig)
+            ENDDO
+
+         ELSE
+
+            ind0 = ((jp(iplon,lay)-13)*5+(jt(iplon,lay)-1))*nspb(11) + 1
+            ind1 = ((jp(iplon,lay)-12)*5+(jt1(iplon,lay)-1))*nspb(11) + 1
+            indf = indfor(iplon,lay)
+            indm = indminor(iplon,lay)
+            scaleo2 = colo2(iplon,lay)*scaleminor(iplon,lay)
+            DO ig = 1, ng11
+               taufor = forfac(iplon,lay) * (forref(indf,ig) + forfrac(iplon,lay) * &
+                    (forref(indf+1,ig) - forref(indf,ig)))
+               tauo2 =  scaleo2 * (kb_mo2(indm,ig) + minorfrac(iplon,lay) * &
+                    (kb_mo2(indm+1,ig) - kb_mo2(indm,ig)))
+               taug(iplon,lay,ngs10+ig) = colh2o(iplon,lay) * &
+                    (fac00(iplon,lay) * absb(ind0,ig) + &
+                    fac10(iplon,lay) * absb(ind0+1,ig) + &
+                    fac01(iplon,lay) * absb(ind1,ig) + &
+                    fac11(iplon,lay) * absb(ind1+1,ig)) &
+                    + taufor &
+                    + tauo2
+               fracs(iplon,lay,ngs10+ig) = fracrefb(ig)
+            ENDDO
+
+         ENDIF
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE taugb11_gpu
+
+!----------------------------------------------------------------------------
+
+      SUBROUTINE taugb12_gpu(ncol, nlayers, laytrop, jp, jt, jt1,      &
+                             colh2o, colco2, rat_h2oco2, rat_h2oco2_1, &
+                             indself, indfor,                          &
+                             selffac, selffrac, forfac, forfrac,       &
+                             fac00, fac01, fac10, fac11,               &
+                             ngptlw, taug, fracs)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrtm, only : ng12, ngs11
+      use rrlw_con, only : oneminus
+      use rrlw_ref, only : chi_mls
+      use rrlw_kg12, only : fracrefa, absa, selfref, forref
+      use rrlw_wvn, only : nspa
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, ngptlw
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol)
+      INTEGER(kind=im), INTENT(IN) :: jp(ncol,nlayers), jt(ncol,nlayers), &
+                                       jt1(ncol,nlayers)
+      INTEGER(kind=im), INTENT(IN) :: indself(ncol,nlayers), indfor(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: colh2o(ncol,nlayers), colco2(ncol,nlayers), &
+                                    rat_h2oco2(ncol,nlayers), rat_h2oco2_1(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: selffac(ncol,nlayers), selffrac(ncol,nlayers), &
+                                    forfac(ncol,nlayers), forfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                    fac10(ncol,nlayers), fac11(ncol,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: taug(ncol,nlayers,ngptlw)
+      REAL(kind=rb), INTENT(INOUT) :: fracs(ncol,nlayers,ngptlw)
+
+      INTEGER(kind=im) :: iplon, lay, ind0, ind1, inds, indf, ig
+      INTEGER(kind=im) :: js, js1, jpl
+      REAL(kind=rb) :: speccomb, specparm, specmult, fs
+      REAL(kind=rb) :: speccomb1, specparm1, specmult1, fs1
+      REAL(kind=rb) :: speccomb_planck, specparm_planck, specmult_planck, fpl
+      REAL(kind=rb) :: p, p4, fk0, fk1, fk2
+      REAL(kind=rb) :: fac000, fac100, fac200, fac010, fac110, fac210
+      REAL(kind=rb) :: fac001, fac101, fac201, fac011, fac111, fac211
+      REAL(kind=rb) :: tauself, taufor
+      REAL(kind=rb) :: refrat_planck_a
+      REAL(kind=rb) :: tau_major, tau_major1
+
+! Calculate reference ratio to be used in calculation of Planck
+! fraction in lower/upper atmosphere.
+! P =   174.164 mb
+      refrat_planck_a = chi_mls(1,10)/chi_mls(2,10)
+
+!$acc parallel loop collapse(2) &
+!$acc& private(ind0,ind1,inds,indf,ig,js,js1,jpl,speccomb,specparm,specmult,fs, &
+!$acc& speccomb1,specparm1,specmult1,fs1,speccomb_planck,specparm_planck, &
+!$acc& specmult_planck,fpl,p,p4,fk0,fk1,fk2,fac000,fac100,fac200,fac010,fac110, &
+!$acc& fac210,fac001,fac101,fac201,fac011,fac111,fac211,tauself,taufor, &
+!$acc& tau_major,tau_major1) &
+!$acc& present(laytrop,jp,jt,jt1,colh2o,colco2,rat_h2oco2,rat_h2oco2_1,indself, &
+!$acc& indfor,selffac,selffrac,forfac,forfrac,fac00,fac01,fac10,fac11,taug,fracs, &
+!$acc& fracrefa,absa,selfref,forref,chi_mls,nspa)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+
+         IF ( lay <= laytrop(iplon) ) THEN
+
+            speccomb = colh2o(iplon,lay) + rat_h2oco2(iplon,lay)*colco2(iplon,lay)
+            specparm = colh2o(iplon,lay)/speccomb
+            if (specparm .ge. oneminus) specparm = oneminus
+            specmult = 8._rb*(specparm)
+            js = 1 + int(specmult)
+            fs = mod(specmult,1.0_rb)
+
+            speccomb1 = colh2o(iplon,lay) + rat_h2oco2_1(iplon,lay)*colco2(iplon,lay)
+            specparm1 = colh2o(iplon,lay)/speccomb1
+            if (specparm1 .ge. oneminus) specparm1 = oneminus
+            specmult1 = 8._rb*(specparm1)
+            js1 = 1 + int(specmult1)
+            fs1 = mod(specmult1,1.0_rb)
+
+            speccomb_planck = colh2o(iplon,lay)+refrat_planck_a*colco2(iplon,lay)
+            specparm_planck = colh2o(iplon,lay)/speccomb_planck
+            if (specparm_planck .ge. oneminus) specparm_planck=oneminus
+            specmult_planck = 8._rb*specparm_planck
+            jpl= 1 + int(specmult_planck)
+            fpl = mod(specmult_planck,1.0_rb)
+
+            ind0 = ((jp(iplon,lay)-1)*5+(jt(iplon,lay)-1))*nspa(12) + js
+            ind1 = (jp(iplon,lay)*5+(jt1(iplon,lay)-1))*nspa(12) + js1
+            inds = indself(iplon,lay)
+            indf = indfor(iplon,lay)
+
+            if (specparm .lt. 0.125_rb) then
+               p = fs - 1
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac000 = fk0*fac00(iplon,lay)
+               fac100 = fk1*fac00(iplon,lay)
+               fac200 = fk2*fac00(iplon,lay)
+               fac010 = fk0*fac10(iplon,lay)
+               fac110 = fk1*fac10(iplon,lay)
+               fac210 = fk2*fac10(iplon,lay)
+            else if (specparm .gt. 0.875_rb) then
+               p = -fs
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac000 = fk0*fac00(iplon,lay)
+               fac100 = fk1*fac00(iplon,lay)
+               fac200 = fk2*fac00(iplon,lay)
+               fac010 = fk0*fac10(iplon,lay)
+               fac110 = fk1*fac10(iplon,lay)
+               fac210 = fk2*fac10(iplon,lay)
+            else
+               fac000 = (1._rb - fs) * fac00(iplon,lay)
+               fac010 = (1._rb - fs) * fac10(iplon,lay)
+               fac100 = fs * fac00(iplon,lay)
+               fac110 = fs * fac10(iplon,lay)
+            endif
+
+            if (specparm1 .lt. 0.125_rb) then
+               p = fs1 - 1
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac001 = fk0*fac01(iplon,lay)
+               fac101 = fk1*fac01(iplon,lay)
+               fac201 = fk2*fac01(iplon,lay)
+               fac011 = fk0*fac11(iplon,lay)
+               fac111 = fk1*fac11(iplon,lay)
+               fac211 = fk2*fac11(iplon,lay)
+            else if (specparm1 .gt. 0.875_rb) then
+               p = -fs1
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac001 = fk0*fac01(iplon,lay)
+               fac101 = fk1*fac01(iplon,lay)
+               fac201 = fk2*fac01(iplon,lay)
+               fac011 = fk0*fac11(iplon,lay)
+               fac111 = fk1*fac11(iplon,lay)
+               fac211 = fk2*fac11(iplon,lay)
+            else
+               fac001 = (1._rb - fs1) * fac01(iplon,lay)
+               fac011 = (1._rb - fs1) * fac11(iplon,lay)
+               fac101 = fs1 * fac01(iplon,lay)
+               fac111 = fs1 * fac11(iplon,lay)
+            endif
+
+            DO ig = 1, ng12
+               tauself = selffac(iplon,lay)* (selfref(inds,ig) + selffrac(iplon,lay) * &
+                    (selfref(inds+1,ig) - selfref(inds,ig)))
+               taufor = forfac(iplon,lay) * (forref(indf,ig) + forfrac(iplon,lay) * &
+                    (forref(indf+1,ig) - forref(indf,ig)))
+
+               if (specparm .lt. 0.125_rb) then
+                  tau_major = speccomb * &
+                       (fac000 * absa(ind0,ig) + &
+                       fac100 * absa(ind0+1,ig) + &
+                       fac200 * absa(ind0+2,ig) + &
+                       fac010 * absa(ind0+9,ig) + &
+                       fac110 * absa(ind0+10,ig) + &
+                       fac210 * absa(ind0+11,ig))
+               else if (specparm .gt. 0.875_rb) then
+                  tau_major = speccomb * &
+                       (fac200 * absa(ind0-1,ig) + &
+                       fac100 * absa(ind0,ig) + &
+                       fac000 * absa(ind0+1,ig) + &
+                       fac210 * absa(ind0+8,ig) + &
+                       fac110 * absa(ind0+9,ig) + &
+                       fac010 * absa(ind0+10,ig))
+               else
+                  tau_major = speccomb * &
+                       (fac000 * absa(ind0,ig) + &
+                       fac100 * absa(ind0+1,ig) + &
+                       fac010 * absa(ind0+9,ig) + &
+                       fac110 * absa(ind0+10,ig))
+               endif
+
+               if (specparm1 .lt. 0.125_rb) then
+                  tau_major1 = speccomb1 * &
+                       (fac001 * absa(ind1,ig) + &
+                       fac101 * absa(ind1+1,ig) + &
+                       fac201 * absa(ind1+2,ig) + &
+                       fac011 * absa(ind1+9,ig) + &
+                       fac111 * absa(ind1+10,ig) + &
+                       fac211 * absa(ind1+11,ig))
+               else if (specparm1 .gt. 0.875_rb) then
+                  tau_major1 = speccomb1 * &
+                       (fac201 * absa(ind1-1,ig) + &
+                       fac101 * absa(ind1,ig) + &
+                       fac001 * absa(ind1+1,ig) + &
+                       fac211 * absa(ind1+8,ig) + &
+                       fac111 * absa(ind1+9,ig) + &
+                       fac011 * absa(ind1+10,ig))
+               else
+                  tau_major1 = speccomb1 * &
+                       (fac001 * absa(ind1,ig) + &
+                       fac101 * absa(ind1+1,ig) + &
+                       fac011 * absa(ind1+9,ig) + &
+                       fac111 * absa(ind1+10,ig))
+               endif
+
+               taug(iplon,lay,ngs11+ig) = tau_major + tau_major1 &
+                    + tauself + taufor
+               fracs(iplon,lay,ngs11+ig) = fracrefa(ig,jpl) + fpl * &
+                    (fracrefa(ig,jpl+1)-fracrefa(ig,jpl))
+            ENDDO
+
+         ELSE
+
+            DO ig = 1, ng12
+               taug(iplon,lay,ngs11+ig) = 0.0_rb
+               fracs(iplon,lay,ngs11+ig) = 0.0_rb
+            ENDDO
+
+         ENDIF
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE taugb12_gpu
+
+!----------------------------------------------------------------------------
+
+      SUBROUTINE taugb13_gpu(ncol, nlayers, laytrop, jp, jt, jt1,      &
+                             colh2o, coln2o, colco2, coldry, colco,    &
+                             colo3, rat_h2on2o, rat_h2on2o_1,          &
+                             indself, indfor, indminor,                &
+                             selffac, selffrac, forfac, forfrac,       &
+                             minorfrac, fac00, fac01, fac10, fac11,    &
+                             ngptlw, taug, fracs)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrtm, only : ng13, ngs12
+      use rrlw_con, only : oneminus
+      use rrlw_ref, only : chi_mls
+      use rrlw_kg13, only : fracrefa, fracrefb, absa, &
+                             ka_mco2, ka_mco, kb_mo3, selfref, forref
+      use rrlw_wvn, only : nspa
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, ngptlw
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol)
+      INTEGER(kind=im), INTENT(IN) :: jp(ncol,nlayers), jt(ncol,nlayers), &
+                                       jt1(ncol,nlayers)
+      INTEGER(kind=im), INTENT(IN) :: indself(ncol,nlayers), &
+                                       indfor(ncol,nlayers), &
+                                       indminor(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: colh2o(ncol,nlayers), coln2o(ncol,nlayers), &
+                                    colco2(ncol,nlayers), coldry(ncol,nlayers), &
+                                    colco(ncol,nlayers), colo3(ncol,nlayers), &
+                                    rat_h2on2o(ncol,nlayers), rat_h2on2o_1(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: selffac(ncol,nlayers), selffrac(ncol,nlayers), &
+                                    forfac(ncol,nlayers), forfrac(ncol,nlayers), &
+                                    minorfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                    fac10(ncol,nlayers), fac11(ncol,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: taug(ncol,nlayers,ngptlw)
+      REAL(kind=rb), INTENT(INOUT) :: fracs(ncol,nlayers,ngptlw)
+
+      INTEGER(kind=im) :: iplon, lay, ind0, ind1, inds, indf, indm, ig
+      INTEGER(kind=im) :: js, js1, jmco2, jmco, jpl
+      REAL(kind=rb) :: speccomb, specparm, specmult, fs
+      REAL(kind=rb) :: speccomb1, specparm1, specmult1, fs1
+      REAL(kind=rb) :: speccomb_mco2, specparm_mco2, specmult_mco2, fmco2
+      REAL(kind=rb) :: speccomb_mco, specparm_mco, specmult_mco, fmco
+      REAL(kind=rb) :: speccomb_planck, specparm_planck, specmult_planck, fpl
+      REAL(kind=rb) :: p, p4, fk0, fk1, fk2
+      REAL(kind=rb) :: fac000, fac100, fac200, fac010, fac110, fac210
+      REAL(kind=rb) :: fac001, fac101, fac201, fac011, fac111, fac211
+      REAL(kind=rb) :: tauself, taufor, co2m1, co2m2, absco2
+      REAL(kind=rb) :: com1, com2, absco, abso3
+      REAL(kind=rb) :: chi_co2, ratco2, adjfac, adjcolco2
+      REAL(kind=rb) :: refrat_planck_a, refrat_m_a, refrat_m_a3
+      REAL(kind=rb) :: tau_major, tau_major1
+
+! Calculate reference ratio to be used in calculation of Planck
+! fraction in lower/upper atmosphere.
+! P = 473.420 mb (Level 5)
+      refrat_planck_a = chi_mls(1,5)/chi_mls(4,5)
+! P = 1053. (Level 1)
+      refrat_m_a = chi_mls(1,1)/chi_mls(4,1)
+! P = 706. (Level 3)
+      refrat_m_a3 = chi_mls(1,3)/chi_mls(4,3)
+
+!$acc parallel loop collapse(2) &
+!$acc& private(ind0,ind1,inds,indf,indm,ig,js,js1,jmco2,jmco,jpl,speccomb, &
+!$acc& specparm,specmult,fs,speccomb1,specparm1,specmult1,fs1,speccomb_mco2, &
+!$acc& specparm_mco2,specmult_mco2,fmco2,speccomb_mco,specparm_mco,specmult_mco, &
+!$acc& fmco,speccomb_planck,specparm_planck,specmult_planck,fpl,p,p4,fk0,fk1,fk2, &
+!$acc& fac000,fac100,fac200,fac010,fac110,fac210,fac001,fac101,fac201,fac011, &
+!$acc& fac111,fac211,tauself,taufor,co2m1,co2m2,absco2,com1,com2,absco,abso3, &
+!$acc& chi_co2,ratco2,adjfac,adjcolco2,tau_major,tau_major1) &
+!$acc& present(laytrop,jp,jt,jt1,colh2o,coln2o,colco2,coldry,colco,colo3, &
+!$acc& rat_h2on2o,rat_h2on2o_1,indself,indfor,indminor,selffac,selffrac,forfac, &
+!$acc& forfrac,minorfrac,fac00,fac01,fac10,fac11,taug,fracs,fracrefa,fracrefb, &
+!$acc& absa,ka_mco2,ka_mco,kb_mo3,selfref,forref,chi_mls,nspa)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+
+         IF ( lay <= laytrop(iplon) ) THEN
+
+            speccomb = colh2o(iplon,lay) + rat_h2on2o(iplon,lay)*coln2o(iplon,lay)
+            specparm = colh2o(iplon,lay)/speccomb
+            if (specparm .ge. oneminus) specparm = oneminus
+            specmult = 8._rb*(specparm)
+            js = 1 + int(specmult)
+            fs = mod(specmult,1.0_rb)
+
+            speccomb1 = colh2o(iplon,lay) + rat_h2on2o_1(iplon,lay)*coln2o(iplon,lay)
+            specparm1 = colh2o(iplon,lay)/speccomb1
+            if (specparm1 .ge. oneminus) specparm1 = oneminus
+            specmult1 = 8._rb*(specparm1)
+            js1 = 1 + int(specmult1)
+            fs1 = mod(specmult1,1.0_rb)
+
+            speccomb_mco2 = colh2o(iplon,lay) + refrat_m_a*coln2o(iplon,lay)
+            specparm_mco2 = colh2o(iplon,lay)/speccomb_mco2
+            if (specparm_mco2 .ge. oneminus) specparm_mco2 = oneminus
+            specmult_mco2 = 8._rb*specparm_mco2
+            jmco2 = 1 + int(specmult_mco2)
+            fmco2 = mod(specmult_mco2,1.0_rb)
+
+!  In atmospheres where the amount of CO2 is too great to be considered
+!  a minor species, adjust the column amount of CO2 by an empirical factor
+!  to obtain the proper contribution.
+            chi_co2 = colco2(iplon,lay)/(coldry(iplon,lay))
+            ratco2 = 1.e20_rb*chi_co2/3.55e-4_rb
+            if (ratco2 .gt. 3.0_rb) then
+               adjfac = 2.0_rb+(ratco2-2.0_rb)**0.68_rb
+               adjcolco2 = adjfac*3.55e-4*coldry(iplon,lay)*1.e-20_rb
+            else
+               adjcolco2 = colco2(iplon,lay)
+            endif
+
+            speccomb_mco = colh2o(iplon,lay) + refrat_m_a3*coln2o(iplon,lay)
+            specparm_mco = colh2o(iplon,lay)/speccomb_mco
+            if (specparm_mco .ge. oneminus) specparm_mco = oneminus
+            specmult_mco = 8._rb*specparm_mco
+            jmco = 1 + int(specmult_mco)
+            fmco = mod(specmult_mco,1.0_rb)
+
+            speccomb_planck = colh2o(iplon,lay)+refrat_planck_a*coln2o(iplon,lay)
+            specparm_planck = colh2o(iplon,lay)/speccomb_planck
+            if (specparm_planck .ge. oneminus) specparm_planck=oneminus
+            specmult_planck = 8._rb*specparm_planck
+            jpl= 1 + int(specmult_planck)
+            fpl = mod(specmult_planck,1.0_rb)
+
+            ind0 = ((jp(iplon,lay)-1)*5+(jt(iplon,lay)-1))*nspa(13) + js
+            ind1 = (jp(iplon,lay)*5+(jt1(iplon,lay)-1))*nspa(13) + js1
+            inds = indself(iplon,lay)
+            indf = indfor(iplon,lay)
+            indm = indminor(iplon,lay)
+
+            if (specparm .lt. 0.125_rb) then
+               p = fs - 1
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac000 = fk0*fac00(iplon,lay)
+               fac100 = fk1*fac00(iplon,lay)
+               fac200 = fk2*fac00(iplon,lay)
+               fac010 = fk0*fac10(iplon,lay)
+               fac110 = fk1*fac10(iplon,lay)
+               fac210 = fk2*fac10(iplon,lay)
+            else if (specparm .gt. 0.875_rb) then
+               p = -fs
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac000 = fk0*fac00(iplon,lay)
+               fac100 = fk1*fac00(iplon,lay)
+               fac200 = fk2*fac00(iplon,lay)
+               fac010 = fk0*fac10(iplon,lay)
+               fac110 = fk1*fac10(iplon,lay)
+               fac210 = fk2*fac10(iplon,lay)
+            else
+               fac000 = (1._rb - fs) * fac00(iplon,lay)
+               fac010 = (1._rb - fs) * fac10(iplon,lay)
+               fac100 = fs * fac00(iplon,lay)
+               fac110 = fs * fac10(iplon,lay)
+            endif
+
+            if (specparm1 .lt. 0.125_rb) then
+               p = fs1 - 1
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac001 = fk0*fac01(iplon,lay)
+               fac101 = fk1*fac01(iplon,lay)
+               fac201 = fk2*fac01(iplon,lay)
+               fac011 = fk0*fac11(iplon,lay)
+               fac111 = fk1*fac11(iplon,lay)
+               fac211 = fk2*fac11(iplon,lay)
+            else if (specparm1 .gt. 0.875_rb) then
+               p = -fs1
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac001 = fk0*fac01(iplon,lay)
+               fac101 = fk1*fac01(iplon,lay)
+               fac201 = fk2*fac01(iplon,lay)
+               fac011 = fk0*fac11(iplon,lay)
+               fac111 = fk1*fac11(iplon,lay)
+               fac211 = fk2*fac11(iplon,lay)
+            else
+               fac001 = (1._rb - fs1) * fac01(iplon,lay)
+               fac011 = (1._rb - fs1) * fac11(iplon,lay)
+               fac101 = fs1 * fac01(iplon,lay)
+               fac111 = fs1 * fac11(iplon,lay)
+            endif
+
+            DO ig = 1, ng13
+               tauself = selffac(iplon,lay)* (selfref(inds,ig) + selffrac(iplon,lay) * &
+                    (selfref(inds+1,ig) - selfref(inds,ig)))
+               taufor = forfac(iplon,lay) * (forref(indf,ig) + forfrac(iplon,lay) * &
+                    (forref(indf+1,ig) - forref(indf,ig)))
+               co2m1 = ka_mco2(jmco2,indm,ig) + fmco2 * &
+                    (ka_mco2(jmco2+1,indm,ig) - ka_mco2(jmco2,indm,ig))
+               co2m2 = ka_mco2(jmco2,indm+1,ig) + fmco2 * &
+                    (ka_mco2(jmco2+1,indm+1,ig) - ka_mco2(jmco2,indm+1,ig))
+               absco2 = co2m1 + minorfrac(iplon,lay) * (co2m2 - co2m1)
+               com1 = ka_mco(jmco,indm,ig) + fmco * &
+                    (ka_mco(jmco+1,indm,ig) - ka_mco(jmco,indm,ig))
+               com2 = ka_mco(jmco,indm+1,ig) + fmco * &
+                    (ka_mco(jmco+1,indm+1,ig) - ka_mco(jmco,indm+1,ig))
+               absco = com1 + minorfrac(iplon,lay) * (com2 - com1)
+
+               if (specparm .lt. 0.125_rb) then
+                  tau_major = speccomb * &
+                       (fac000 * absa(ind0,ig) + &
+                       fac100 * absa(ind0+1,ig) + &
+                       fac200 * absa(ind0+2,ig) + &
+                       fac010 * absa(ind0+9,ig) + &
+                       fac110 * absa(ind0+10,ig) + &
+                       fac210 * absa(ind0+11,ig))
+               else if (specparm .gt. 0.875_rb) then
+                  tau_major = speccomb * &
+                       (fac200 * absa(ind0-1,ig) + &
+                       fac100 * absa(ind0,ig) + &
+                       fac000 * absa(ind0+1,ig) + &
+                       fac210 * absa(ind0+8,ig) + &
+                       fac110 * absa(ind0+9,ig) + &
+                       fac010 * absa(ind0+10,ig))
+               else
+                  tau_major = speccomb * &
+                       (fac000 * absa(ind0,ig) + &
+                       fac100 * absa(ind0+1,ig) + &
+                       fac010 * absa(ind0+9,ig) + &
+                       fac110 * absa(ind0+10,ig))
+               endif
+
+               if (specparm1 .lt. 0.125_rb) then
+                  tau_major1 = speccomb1 * &
+                       (fac001 * absa(ind1,ig) + &
+                       fac101 * absa(ind1+1,ig) + &
+                       fac201 * absa(ind1+2,ig) + &
+                       fac011 * absa(ind1+9,ig) + &
+                       fac111 * absa(ind1+10,ig) + &
+                       fac211 * absa(ind1+11,ig))
+               else if (specparm1 .gt. 0.875_rb) then
+                  tau_major1 = speccomb1 * &
+                       (fac201 * absa(ind1-1,ig) + &
+                       fac101 * absa(ind1,ig) + &
+                       fac001 * absa(ind1+1,ig) + &
+                       fac211 * absa(ind1+8,ig) + &
+                       fac111 * absa(ind1+9,ig) + &
+                       fac011 * absa(ind1+10,ig))
+               else
+                  tau_major1 = speccomb1 * &
+                       (fac001 * absa(ind1,ig) + &
+                       fac101 * absa(ind1+1,ig) + &
+                       fac011 * absa(ind1+9,ig) + &
+                       fac111 * absa(ind1+10,ig))
+               endif
+
+               taug(iplon,lay,ngs12+ig) = tau_major + tau_major1 &
+                    + tauself + taufor &
+                    + adjcolco2*absco2 &
+                    + colco(iplon,lay)*absco
+               fracs(iplon,lay,ngs12+ig) = fracrefa(ig,jpl) + fpl * &
+                    (fracrefa(ig,jpl+1)-fracrefa(ig,jpl))
+            ENDDO
+
+         ELSE
+
+            indm = indminor(iplon,lay)
+            DO ig = 1, ng13
+               abso3 = kb_mo3(indm,ig) + minorfrac(iplon,lay) * &
+                    (kb_mo3(indm+1,ig) - kb_mo3(indm,ig))
+               taug(iplon,lay,ngs12+ig) = colo3(iplon,lay)*abso3
+               fracs(iplon,lay,ngs12+ig) =  fracrefb(ig)
+            ENDDO
+
+         ENDIF
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE taugb13_gpu
+      SUBROUTINE taugb14_gpu(ncol, nlayers, laytrop, jp, jt, jt1,      &
+                              colco2,                                  &
+                              indself, indfor,                         &
+                              selffac, selffrac, forfac, forfrac,      &
+                              fac00, fac01, fac10, fac11,              &
+                              ngptlw, taug, fracs)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrtm, only : ng14, ngs13
+      use rrlw_kg14, only : fracrefa, fracrefb, absa, absb, selfref, forref
+      use rrlw_wvn, only : nspa, nspb
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, ngptlw
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol)
+      INTEGER(kind=im), INTENT(IN) :: jp(ncol,nlayers), jt(ncol,nlayers), &
+                                       jt1(ncol,nlayers)
+      INTEGER(kind=im), INTENT(IN) :: indself(ncol,nlayers), indfor(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: colco2(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: selffac(ncol,nlayers), selffrac(ncol,nlayers), &
+                                    forfac(ncol,nlayers), forfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                    fac10(ncol,nlayers), fac11(ncol,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: taug(ncol,nlayers,ngptlw)
+      REAL(kind=rb), INTENT(INOUT) :: fracs(ncol,nlayers,ngptlw)
+
+      INTEGER(kind=im) :: iplon, lay, ind0, ind1, inds, indf, ig
+      REAL(kind=rb) :: tauself, taufor
+
+!  band 14:  2250-2380 cm-1 (low - co2; high - co2)
+
+!$acc parallel loop collapse(2) &
+!$acc& private(ind0,ind1,inds,indf,ig,tauself,taufor) &
+!$acc& present(laytrop,jp,jt,jt1,colco2,indself,indfor,selffac,selffrac,forfac, &
+!$acc& forfrac,fac00,fac01,fac10,fac11,taug,fracs,fracrefa,fracrefb,absa,absb, &
+!$acc& selfref,forref,nspa,nspb)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+
+         IF ( lay <= laytrop(iplon) ) THEN
+
+            ind0 = ((jp(iplon,lay)-1)*5+(jt(iplon,lay)-1))*nspa(14) + 1
+            ind1 = (jp(iplon,lay)*5+(jt1(iplon,lay)-1))*nspa(14) + 1
+            inds = indself(iplon,lay)
+            indf = indfor(iplon,lay)
+            DO ig = 1, ng14
+               tauself = selffac(iplon,lay) * (selfref(inds,ig) + selffrac(iplon,lay) * &
+                    (selfref(inds+1,ig) - selfref(inds,ig)))
+               taufor =  forfac(iplon,lay) * (forref(indf,ig) + forfrac(iplon,lay) * &
+                    (forref(indf+1,ig) - forref(indf,ig)))
+               taug(iplon,lay,ngs13+ig) = colco2(iplon,lay) * &
+                    (fac00(iplon,lay) * absa(ind0,ig) + &
+                    fac10(iplon,lay) * absa(ind0+1,ig) + &
+                    fac01(iplon,lay) * absa(ind1,ig) + &
+                    fac11(iplon,lay) * absa(ind1+1,ig)) &
+                    + tauself + taufor
+               fracs(iplon,lay,ngs13+ig) = fracrefa(ig)
+            ENDDO
+
+         ELSE
+
+            ind0 = ((jp(iplon,lay)-13)*5+(jt(iplon,lay)-1))*nspb(14) + 1
+            ind1 = ((jp(iplon,lay)-12)*5+(jt1(iplon,lay)-1))*nspb(14) + 1
+            DO ig = 1, ng14
+               taug(iplon,lay,ngs13+ig) = colco2(iplon,lay) * &
+                    (fac00(iplon,lay) * absb(ind0,ig) + &
+                    fac10(iplon,lay) * absb(ind0+1,ig) + &
+                    fac01(iplon,lay) * absb(ind1,ig) + &
+                    fac11(iplon,lay) * absb(ind1+1,ig))
+               fracs(iplon,lay,ngs13+ig) = fracrefb(ig)
+            ENDDO
+
+         ENDIF
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE taugb14_gpu
+
+!-------------------------------------------------------------------------------
+
+      SUBROUTINE taugb15_gpu(ncol, nlayers, laytrop, jp, jt, jt1,      &
+                              coln2o, colco2, colbrd,                  &
+                              rat_n2oco2, rat_n2oco2_1,                &
+                              indself, indfor, indminor,               &
+                              selffac, selffrac, forfac, forfrac,      &
+                              minorfrac, scaleminor,                   &
+                              fac00, fac01, fac10, fac11,              &
+                              ngptlw, taug, fracs)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrtm, only : ng15, ngs14
+      use rrlw_ref, only : chi_mls
+      use rrlw_con, only : oneminus
+      use rrlw_kg15, only : fracrefa, absa, ka_mn2, selfref, forref
+      use rrlw_wvn, only : nspa
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, ngptlw
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol)
+      INTEGER(kind=im), INTENT(IN) :: jp(ncol,nlayers), jt(ncol,nlayers), &
+                                       jt1(ncol,nlayers)
+      INTEGER(kind=im), INTENT(IN) :: indself(ncol,nlayers), indfor(ncol,nlayers), &
+                                       indminor(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: coln2o(ncol,nlayers), colco2(ncol,nlayers), &
+                                    colbrd(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: rat_n2oco2(ncol,nlayers), rat_n2oco2_1(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: selffac(ncol,nlayers), selffrac(ncol,nlayers), &
+                                    forfac(ncol,nlayers), forfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: minorfrac(ncol,nlayers), scaleminor(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                    fac10(ncol,nlayers), fac11(ncol,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: taug(ncol,nlayers,ngptlw)
+      REAL(kind=rb), INTENT(INOUT) :: fracs(ncol,nlayers,ngptlw)
+
+      INTEGER(kind=im) :: iplon, lay, ind0, ind1, inds, indf, indm, ig
+      INTEGER(kind=im) :: js, js1, jmn2, jpl
+      REAL(kind=rb) :: speccomb, specparm, specmult, fs
+      REAL(kind=rb) :: speccomb1, specparm1, specmult1, fs1
+      REAL(kind=rb) :: speccomb_mn2, specparm_mn2, specmult_mn2, fmn2
+      REAL(kind=rb) :: speccomb_planck, specparm_planck, specmult_planck, fpl
+      REAL(kind=rb) :: p, p4, fk0, fk1, fk2
+      REAL(kind=rb) :: fac000, fac100, fac200, fac010, fac110, fac210
+      REAL(kind=rb) :: fac001, fac101, fac201, fac011, fac111, fac211
+      REAL(kind=rb) :: scalen2, tauself, taufor, n2m1, n2m2, taun2
+      REAL(kind=rb) :: refrat_planck_a, refrat_m_a
+      REAL(kind=rb) :: tau_major, tau_major1
+
+!  band 15:  2380-2600 cm-1 (low - n2o,co2; low minor - n2)
+!                           (high - nothing)
+!  Minor gas mapping level : Lower - Nitrogen Continuum, P = 1053., T = 294.
+!  refrat_planck_a/refrat_m_a are fixed (chi_mls-derived) constants, identical
+!  for every column -- computed once on the host, exactly as in the original.
+
+! P = 1053. mb (Level 1)
+      refrat_planck_a = chi_mls(4,1)/chi_mls(2,1)
+! P = 1053.
+      refrat_m_a = chi_mls(4,1)/chi_mls(2,1)
+
+!$acc parallel loop collapse(2) &
+!$acc& private(ind0,ind1,inds,indf,indm,ig,js,js1,jmn2,jpl,speccomb,specparm, &
+!$acc& specmult,fs,speccomb1,specparm1,specmult1,fs1,speccomb_mn2,specparm_mn2, &
+!$acc& specmult_mn2,fmn2,speccomb_planck,specparm_planck,specmult_planck,fpl, &
+!$acc& p,p4,fk0,fk1,fk2,fac000,fac100,fac200,fac010,fac110,fac210,fac001,fac101, &
+!$acc& fac201,fac011,fac111,fac211,scalen2,tauself,taufor,n2m1,n2m2,taun2, &
+!$acc& tau_major,tau_major1) &
+!$acc& present(laytrop,jp,jt,jt1,coln2o,colco2,colbrd,rat_n2oco2,rat_n2oco2_1, &
+!$acc& indself,indfor,indminor,selffac,selffrac,forfac,forfrac,minorfrac, &
+!$acc& scaleminor,fac00,fac01,fac10,fac11,taug,fracs,fracrefa,absa,ka_mn2, &
+!$acc& selfref,forref,nspa)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+
+         IF ( lay <= laytrop(iplon) ) THEN
+
+            speccomb = coln2o(iplon,lay) + rat_n2oco2(iplon,lay)*colco2(iplon,lay)
+            specparm = coln2o(iplon,lay)/speccomb
+            IF (specparm .ge. oneminus) specparm = oneminus
+            specmult = 8._rb*(specparm)
+            js = 1 + int(specmult)
+            fs = mod(specmult,1.0_rb)
+
+            speccomb1 = coln2o(iplon,lay) + rat_n2oco2_1(iplon,lay)*colco2(iplon,lay)
+            specparm1 = coln2o(iplon,lay)/speccomb1
+            IF (specparm1 .ge. oneminus) specparm1 = oneminus
+            specmult1 = 8._rb*(specparm1)
+            js1 = 1 + int(specmult1)
+            fs1 = mod(specmult1,1.0_rb)
+
+            speccomb_mn2 = coln2o(iplon,lay) + refrat_m_a*colco2(iplon,lay)
+            specparm_mn2 = coln2o(iplon,lay)/speccomb_mn2
+            IF (specparm_mn2 .ge. oneminus) specparm_mn2 = oneminus
+            specmult_mn2 = 8._rb*specparm_mn2
+            jmn2 = 1 + int(specmult_mn2)
+            fmn2 = mod(specmult_mn2,1.0_rb)
+
+            speccomb_planck = coln2o(iplon,lay)+refrat_planck_a*colco2(iplon,lay)
+            specparm_planck = coln2o(iplon,lay)/speccomb_planck
+            IF (specparm_planck .ge. oneminus) specparm_planck=oneminus
+            specmult_planck = 8._rb*specparm_planck
+            jpl= 1 + int(specmult_planck)
+            fpl = mod(specmult_planck,1.0_rb)
+
+            ind0 = ((jp(iplon,lay)-1)*5+(jt(iplon,lay)-1))*nspa(15) + js
+            ind1 = (jp(iplon,lay)*5+(jt1(iplon,lay)-1))*nspa(15) + js1
+            inds = indself(iplon,lay)
+            indf = indfor(iplon,lay)
+            indm = indminor(iplon,lay)
+
+            scalen2 = colbrd(iplon,lay)*scaleminor(iplon,lay)
+
+            IF (specparm .lt. 0.125_rb) THEN
+               p = fs - 1
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac000 = fk0*fac00(iplon,lay)
+               fac100 = fk1*fac00(iplon,lay)
+               fac200 = fk2*fac00(iplon,lay)
+               fac010 = fk0*fac10(iplon,lay)
+               fac110 = fk1*fac10(iplon,lay)
+               fac210 = fk2*fac10(iplon,lay)
+            ELSE IF (specparm .gt. 0.875_rb) THEN
+               p = -fs
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac000 = fk0*fac00(iplon,lay)
+               fac100 = fk1*fac00(iplon,lay)
+               fac200 = fk2*fac00(iplon,lay)
+               fac010 = fk0*fac10(iplon,lay)
+               fac110 = fk1*fac10(iplon,lay)
+               fac210 = fk2*fac10(iplon,lay)
+            ELSE
+               fac000 = (1._rb - fs) * fac00(iplon,lay)
+               fac010 = (1._rb - fs) * fac10(iplon,lay)
+               fac100 = fs * fac00(iplon,lay)
+               fac110 = fs * fac10(iplon,lay)
+            ENDIF
+            IF (specparm1 .lt. 0.125_rb) THEN
+               p = fs1 - 1
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac001 = fk0*fac01(iplon,lay)
+               fac101 = fk1*fac01(iplon,lay)
+               fac201 = fk2*fac01(iplon,lay)
+               fac011 = fk0*fac11(iplon,lay)
+               fac111 = fk1*fac11(iplon,lay)
+               fac211 = fk2*fac11(iplon,lay)
+            ELSE IF (specparm1 .gt. 0.875_rb) THEN
+               p = -fs1
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac001 = fk0*fac01(iplon,lay)
+               fac101 = fk1*fac01(iplon,lay)
+               fac201 = fk2*fac01(iplon,lay)
+               fac011 = fk0*fac11(iplon,lay)
+               fac111 = fk1*fac11(iplon,lay)
+               fac211 = fk2*fac11(iplon,lay)
+            ELSE
+               fac001 = (1._rb - fs1) * fac01(iplon,lay)
+               fac011 = (1._rb - fs1) * fac11(iplon,lay)
+               fac101 = fs1 * fac01(iplon,lay)
+               fac111 = fs1 * fac11(iplon,lay)
+            ENDIF
+
+            DO ig = 1, ng15
+               tauself = selffac(iplon,lay)* (selfref(inds,ig) + selffrac(iplon,lay) * &
+                    (selfref(inds+1,ig) - selfref(inds,ig)))
+               taufor =  forfac(iplon,lay) * (forref(indf,ig) + forfrac(iplon,lay) * &
+                    (forref(indf+1,ig) - forref(indf,ig)))
+               n2m1 = ka_mn2(jmn2,indm,ig) + fmn2 * &
+                    (ka_mn2(jmn2+1,indm,ig) - ka_mn2(jmn2,indm,ig))
+               n2m2 = ka_mn2(jmn2,indm+1,ig) + fmn2 * &
+                    (ka_mn2(jmn2+1,indm+1,ig) - ka_mn2(jmn2,indm+1,ig))
+               taun2 = scalen2 * (n2m1 + minorfrac(iplon,lay) * (n2m2 - n2m1))
+
+               IF (specparm .lt. 0.125_rb) THEN
+                  tau_major = speccomb * &
+                       (fac000 * absa(ind0,ig) + &
+                       fac100 * absa(ind0+1,ig) + &
+                       fac200 * absa(ind0+2,ig) + &
+                       fac010 * absa(ind0+9,ig) + &
+                       fac110 * absa(ind0+10,ig) + &
+                       fac210 * absa(ind0+11,ig))
+               ELSE IF (specparm .gt. 0.875_rb) THEN
+                  tau_major = speccomb * &
+                       (fac200 * absa(ind0-1,ig) + &
+                       fac100 * absa(ind0,ig) + &
+                       fac000 * absa(ind0+1,ig) + &
+                       fac210 * absa(ind0+8,ig) + &
+                       fac110 * absa(ind0+9,ig) + &
+                       fac010 * absa(ind0+10,ig))
+               ELSE
+                  tau_major = speccomb * &
+                       (fac000 * absa(ind0,ig) + &
+                       fac100 * absa(ind0+1,ig) + &
+                       fac010 * absa(ind0+9,ig) + &
+                       fac110 * absa(ind0+10,ig))
+               ENDIF
+
+               IF (specparm1 .lt. 0.125_rb) THEN
+                  tau_major1 = speccomb1 * &
+                       (fac001 * absa(ind1,ig) + &
+                       fac101 * absa(ind1+1,ig) + &
+                       fac201 * absa(ind1+2,ig) + &
+                       fac011 * absa(ind1+9,ig) + &
+                       fac111 * absa(ind1+10,ig) + &
+                       fac211 * absa(ind1+11,ig))
+               ELSE IF (specparm1 .gt. 0.875_rb) THEN
+                  tau_major1 = speccomb1 * &
+                       (fac201 * absa(ind1-1,ig) + &
+                       fac101 * absa(ind1,ig) + &
+                       fac001 * absa(ind1+1,ig) + &
+                       fac211 * absa(ind1+8,ig) + &
+                       fac111 * absa(ind1+9,ig) + &
+                       fac011 * absa(ind1+10,ig))
+               ELSE
+                  tau_major1 = speccomb1 * &
+                       (fac001 * absa(ind1,ig) + &
+                       fac101 * absa(ind1+1,ig) + &
+                       fac011 * absa(ind1+9,ig) + &
+                       fac111 * absa(ind1+10,ig))
+               ENDIF
+
+               taug(iplon,lay,ngs14+ig) = tau_major + tau_major1 &
+                    + tauself + taufor &
+                    + taun2
+               fracs(iplon,lay,ngs14+ig) = fracrefa(ig,jpl) + fpl * &
+                    (fracrefa(ig,jpl+1)-fracrefa(ig,jpl))
+            ENDDO
+
+         ELSE
+
+! Upper atmosphere: band 15 has no absorption above the tropopause in RRTMG --
+! verbatim from the original, which just zeroes both outputs here.
+            DO ig = 1, ng15
+               taug(iplon,lay,ngs14+ig) = 0.0_rb
+               fracs(iplon,lay,ngs14+ig) = 0.0_rb
+            ENDDO
+
+         ENDIF
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE taugb15_gpu
+
+!-------------------------------------------------------------------------------
+
+      SUBROUTINE taugb16_gpu(ncol, nlayers, laytrop, jp, jt, jt1,      &
+                              colh2o, colch4,                          &
+                              rat_h2och4, rat_h2och4_1,                &
+                              indself, indfor,                         &
+                              selffac, selffrac, forfac, forfrac,      &
+                              fac00, fac01, fac10, fac11,              &
+                              ngptlw, taug, fracs)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrtm, only : ng16, ngs15
+      use rrlw_ref, only : chi_mls
+      use rrlw_con, only : oneminus
+      use rrlw_kg16, only : fracrefa, fracrefb, absa, absb, selfref, forref
+      use rrlw_wvn, only : nspa, nspb
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, ngptlw
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol)
+      INTEGER(kind=im), INTENT(IN) :: jp(ncol,nlayers), jt(ncol,nlayers), &
+                                       jt1(ncol,nlayers)
+      INTEGER(kind=im), INTENT(IN) :: indself(ncol,nlayers), indfor(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: colh2o(ncol,nlayers), colch4(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: rat_h2och4(ncol,nlayers), rat_h2och4_1(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: selffac(ncol,nlayers), selffrac(ncol,nlayers), &
+                                    forfac(ncol,nlayers), forfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                    fac10(ncol,nlayers), fac11(ncol,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: taug(ncol,nlayers,ngptlw)
+      REAL(kind=rb), INTENT(INOUT) :: fracs(ncol,nlayers,ngptlw)
+
+      INTEGER(kind=im) :: iplon, lay, ind0, ind1, inds, indf, ig
+      INTEGER(kind=im) :: js, js1, jpl
+      REAL(kind=rb) :: speccomb, specparm, specmult, fs
+      REAL(kind=rb) :: speccomb1, specparm1, specmult1, fs1
+      REAL(kind=rb) :: speccomb_planck, specparm_planck, specmult_planck, fpl
+      REAL(kind=rb) :: p, p4, fk0, fk1, fk2
+      REAL(kind=rb) :: fac000, fac100, fac200, fac010, fac110, fac210
+      REAL(kind=rb) :: fac001, fac101, fac201, fac011, fac111, fac211
+      REAL(kind=rb) :: tauself, taufor
+      REAL(kind=rb) :: refrat_planck_a
+      REAL(kind=rb) :: tau_major, tau_major1
+
+!  band 16:  2600-3250 cm-1 (low key- h2o,ch4; high key - ch4)
+!  refrat_planck_a is a fixed (chi_mls-derived) constant, identical for every
+!  column -- computed once on the host, exactly as in the original.
+
+! P = 387. mb (Level 6)
+      refrat_planck_a = chi_mls(1,6)/chi_mls(6,6)
+
+!$acc parallel loop collapse(2) &
+!$acc& private(ind0,ind1,inds,indf,ig,js,js1,jpl,speccomb,specparm,specmult,fs, &
+!$acc& speccomb1,specparm1,specmult1,fs1,speccomb_planck,specparm_planck, &
+!$acc& specmult_planck,fpl,p,p4,fk0,fk1,fk2,fac000,fac100,fac200,fac010,fac110, &
+!$acc& fac210,fac001,fac101,fac201,fac011,fac111,fac211,tauself,taufor,tau_major, &
+!$acc& tau_major1) &
+!$acc& present(laytrop,jp,jt,jt1,colh2o,colch4,rat_h2och4,rat_h2och4_1,indself, &
+!$acc& indfor,selffac,selffrac,forfac,forfrac,fac00,fac01,fac10,fac11,taug,fracs, &
+!$acc& fracrefa,fracrefb,absa,absb,selfref,forref,nspa,nspb)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+
+         IF ( lay <= laytrop(iplon) ) THEN
+
+            speccomb = colh2o(iplon,lay) + rat_h2och4(iplon,lay)*colch4(iplon,lay)
+            specparm = colh2o(iplon,lay)/speccomb
+            IF (specparm .ge. oneminus) specparm = oneminus
+            specmult = 8._rb*(specparm)
+            js = 1 + int(specmult)
+            fs = mod(specmult,1.0_rb)
+
+            speccomb1 = colh2o(iplon,lay) + rat_h2och4_1(iplon,lay)*colch4(iplon,lay)
+            specparm1 = colh2o(iplon,lay)/speccomb1
+            IF (specparm1 .ge. oneminus) specparm1 = oneminus
+            specmult1 = 8._rb*(specparm1)
+            js1 = 1 + int(specmult1)
+            fs1 = mod(specmult1,1.0_rb)
+
+            speccomb_planck = colh2o(iplon,lay)+refrat_planck_a*colch4(iplon,lay)
+            specparm_planck = colh2o(iplon,lay)/speccomb_planck
+            IF (specparm_planck .ge. oneminus) specparm_planck=oneminus
+            specmult_planck = 8._rb*specparm_planck
+            jpl= 1 + int(specmult_planck)
+            fpl = mod(specmult_planck,1.0_rb)
+
+            ind0 = ((jp(iplon,lay)-1)*5+(jt(iplon,lay)-1))*nspa(16) + js
+            ind1 = (jp(iplon,lay)*5+(jt1(iplon,lay)-1))*nspa(16) + js1
+            inds = indself(iplon,lay)
+            indf = indfor(iplon,lay)
+
+            IF (specparm .lt. 0.125_rb) THEN
+               p = fs - 1
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac000 = fk0*fac00(iplon,lay)
+               fac100 = fk1*fac00(iplon,lay)
+               fac200 = fk2*fac00(iplon,lay)
+               fac010 = fk0*fac10(iplon,lay)
+               fac110 = fk1*fac10(iplon,lay)
+               fac210 = fk2*fac10(iplon,lay)
+            ELSE IF (specparm .gt. 0.875_rb) THEN
+               p = -fs
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac000 = fk0*fac00(iplon,lay)
+               fac100 = fk1*fac00(iplon,lay)
+               fac200 = fk2*fac00(iplon,lay)
+               fac010 = fk0*fac10(iplon,lay)
+               fac110 = fk1*fac10(iplon,lay)
+               fac210 = fk2*fac10(iplon,lay)
+            ELSE
+               fac000 = (1._rb - fs) * fac00(iplon,lay)
+               fac010 = (1._rb - fs) * fac10(iplon,lay)
+               fac100 = fs * fac00(iplon,lay)
+               fac110 = fs * fac10(iplon,lay)
+            ENDIF
+
+            IF (specparm1 .lt. 0.125_rb) THEN
+               p = fs1 - 1
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac001 = fk0*fac01(iplon,lay)
+               fac101 = fk1*fac01(iplon,lay)
+               fac201 = fk2*fac01(iplon,lay)
+               fac011 = fk0*fac11(iplon,lay)
+               fac111 = fk1*fac11(iplon,lay)
+               fac211 = fk2*fac11(iplon,lay)
+            ELSE IF (specparm1 .gt. 0.875_rb) THEN
+               p = -fs1
+               p4 = p**4
+               fk0 = p4
+               fk1 = 1 - p - 2.0_rb*p4
+               fk2 = p + p4
+               fac001 = fk0*fac01(iplon,lay)
+               fac101 = fk1*fac01(iplon,lay)
+               fac201 = fk2*fac01(iplon,lay)
+               fac011 = fk0*fac11(iplon,lay)
+               fac111 = fk1*fac11(iplon,lay)
+               fac211 = fk2*fac11(iplon,lay)
+            ELSE
+               fac001 = (1._rb - fs1) * fac01(iplon,lay)
+               fac011 = (1._rb - fs1) * fac11(iplon,lay)
+               fac101 = fs1 * fac01(iplon,lay)
+               fac111 = fs1 * fac11(iplon,lay)
+            ENDIF
+
+            DO ig = 1, ng16
+               tauself = selffac(iplon,lay)* (selfref(inds,ig) + selffrac(iplon,lay) * &
+                    (selfref(inds+1,ig) - selfref(inds,ig)))
+               taufor =  forfac(iplon,lay) * (forref(indf,ig) + forfrac(iplon,lay) * &
+                    (forref(indf+1,ig) - forref(indf,ig)))
+
+               IF (specparm .lt. 0.125_rb) THEN
+                  tau_major = speccomb * &
+                       (fac000 * absa(ind0,ig) + &
+                       fac100 * absa(ind0+1,ig) + &
+                       fac200 * absa(ind0+2,ig) + &
+                       fac010 * absa(ind0+9,ig) + &
+                       fac110 * absa(ind0+10,ig) + &
+                       fac210 * absa(ind0+11,ig))
+               ELSE IF (specparm .gt. 0.875_rb) THEN
+                  tau_major = speccomb * &
+                       (fac200 * absa(ind0-1,ig) + &
+                       fac100 * absa(ind0,ig) + &
+                       fac000 * absa(ind0+1,ig) + &
+                       fac210 * absa(ind0+8,ig) + &
+                       fac110 * absa(ind0+9,ig) + &
+                       fac010 * absa(ind0+10,ig))
+               ELSE
+                  tau_major = speccomb * &
+                       (fac000 * absa(ind0,ig) + &
+                       fac100 * absa(ind0+1,ig) + &
+                       fac010 * absa(ind0+9,ig) + &
+                       fac110 * absa(ind0+10,ig))
+               ENDIF
+
+               IF (specparm1 .lt. 0.125_rb) THEN
+                  tau_major1 = speccomb1 * &
+                       (fac001 * absa(ind1,ig) + &
+                       fac101 * absa(ind1+1,ig) + &
+                       fac201 * absa(ind1+2,ig) + &
+                       fac011 * absa(ind1+9,ig) + &
+                       fac111 * absa(ind1+10,ig) + &
+                       fac211 * absa(ind1+11,ig))
+               ELSE IF (specparm1 .gt. 0.875_rb) THEN
+                  tau_major1 = speccomb1 * &
+                       (fac201 * absa(ind1-1,ig) + &
+                       fac101 * absa(ind1,ig) + &
+                       fac001 * absa(ind1+1,ig) + &
+                       fac211 * absa(ind1+8,ig) + &
+                       fac111 * absa(ind1+9,ig) + &
+                       fac011 * absa(ind1+10,ig))
+               ELSE
+                  tau_major1 = speccomb1 * &
+                       (fac001 * absa(ind1,ig) + &
+                       fac101 * absa(ind1+1,ig) + &
+                       fac011 * absa(ind1+9,ig) + &
+                       fac111 * absa(ind1+10,ig))
+               ENDIF
+
+               taug(iplon,lay,ngs15+ig) = tau_major + tau_major1 &
+                    + tauself + taufor
+               fracs(iplon,lay,ngs15+ig) = fracrefa(ig,jpl) + fpl * &
+                    (fracrefa(ig,jpl+1)-fracrefa(ig,jpl))
+            ENDDO
+
+         ELSE
+
+            ind0 = ((jp(iplon,lay)-13)*5+(jt(iplon,lay)-1))*nspb(16) + 1
+            ind1 = ((jp(iplon,lay)-12)*5+(jt1(iplon,lay)-1))*nspb(16) + 1
+            DO ig = 1, ng16
+               taug(iplon,lay,ngs15+ig) = colch4(iplon,lay) * &
+                    (fac00(iplon,lay) * absb(ind0,ig) + &
+                    fac10(iplon,lay) * absb(ind0+1,ig) + &
+                    fac01(iplon,lay) * absb(ind1,ig) + &
+                    fac11(iplon,lay) * absb(ind1+1,ig))
+               fracs(iplon,lay,ngs15+ig) = fracrefb(ig)
+            ENDDO
+
+         ENDIF
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE taugb16_gpu
+
+!-------------------------------------------------------------------------------
+!  taumol_gpu -- calls taugb1_gpu..taugb16_gpu in sequence, mirroring the
+!  original taumol's plain sequential "call taugb1" .. "call taugb16" (no
+!  arguments, host association) with explicit ncol-major arguments instead.
+!  Each taugbN_gpu is its own standalone kernel launch (collapse(2) over
+!  column x layer); there is no cross-band dependency, so 16 sequential
+!  launches is correct and matches the original's sequential structure.
+      SUBROUTINE taumol_gpu(ncol, nlayers, pavel, wx, coldry,          &
+                        laytrop, jp, jt, jt1,                          &
+                        colh2o, colco2, colo3, coln2o, colco, colch4, colo2, &
+                        colbrd, fac00, fac01, fac10, fac11,             &
+                        rat_h2oco2, rat_h2oco2_1, rat_h2oo3, rat_h2oo3_1, &
+                        rat_h2on2o, rat_h2on2o_1, rat_h2och4, rat_h2och4_1, &
+                        rat_n2oco2, rat_n2oco2_1, rat_o3co2, rat_o3co2_1, &
+                        selffac, selffrac, indself, forfac, forfrac, indfor, &
+                        minorfrac, scaleminor, scaleminorn2, indminor,  &
+                        ngptlw, fracs, taug)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, ngptlw
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol)
+      INTEGER(kind=im), INTENT(IN) :: jp(ncol,nlayers), jt(ncol,nlayers), &
+                                       jt1(ncol,nlayers)
+      INTEGER(kind=im), INTENT(IN) :: indself(ncol,nlayers), &
+                                       indfor(ncol,nlayers), &
+                                       indminor(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: pavel(ncol,nlayers), coldry(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: wx(ncol,nlayers,4)
+      REAL(kind=rb), INTENT(IN) :: colh2o(ncol,nlayers), colco2(ncol,nlayers), &
+                                    colo3(ncol,nlayers), coln2o(ncol,nlayers), &
+                                    colco(ncol,nlayers), colch4(ncol,nlayers), &
+                                    colo2(ncol,nlayers), colbrd(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                    fac10(ncol,nlayers), fac11(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: rat_h2oco2(ncol,nlayers), rat_h2oco2_1(ncol,nlayers), &
+                                    rat_h2oo3(ncol,nlayers), rat_h2oo3_1(ncol,nlayers), &
+                                    rat_h2on2o(ncol,nlayers), rat_h2on2o_1(ncol,nlayers), &
+                                    rat_h2och4(ncol,nlayers), rat_h2och4_1(ncol,nlayers), &
+                                    rat_n2oco2(ncol,nlayers), rat_n2oco2_1(ncol,nlayers), &
+                                    rat_o3co2(ncol,nlayers), rat_o3co2_1(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: selffac(ncol,nlayers), selffrac(ncol,nlayers), &
+                                    forfac(ncol,nlayers), forfrac(ncol,nlayers), &
+                                    minorfrac(ncol,nlayers), scaleminor(ncol,nlayers), &
+                                    scaleminorn2(ncol,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: fracs(ncol,nlayers,ngptlw)
+      REAL(kind=rb), INTENT(INOUT) :: taug(ncol,nlayers,ngptlw)
+
+      CALL taugb1_gpu(ncol, nlayers, laytrop, jp, jt, jt1, &
+                       pavel, colh2o, colbrd, scaleminorn2, &
+                       indself, indfor, indminor, &
+                       selffac, selffrac, forfac, forfrac, &
+                       minorfrac, fac00, fac01, fac10, fac11, &
+                       ngptlw, taug, fracs)
+
+      CALL taugb2_gpu(ncol, nlayers, laytrop, jp, jt, jt1, &
+                       pavel, colh2o, indself, indfor, &
+                       selffac, selffrac, forfac, forfrac, &
+                       fac00, fac01, fac10, fac11, &
+                       ngptlw, taug, fracs)
+
+      CALL taugb3_gpu(ncol, nlayers, laytrop, jp, jt, jt1, &
+                       colh2o, colco2, coldry, coln2o, &
+                       rat_h2oco2, rat_h2oco2_1, &
+                       indself, indfor, indminor, &
+                       selffac, selffrac, forfac, forfrac, minorfrac, &
+                       fac00, fac01, fac10, fac11, &
+                       ngptlw, taug, fracs)
+
+      CALL taugb4_gpu(ncol, nlayers, laytrop, jp, jt, jt1, &
+                       colh2o, colco2, colo3, &
+                       rat_h2oco2, rat_h2oco2_1, rat_o3co2, rat_o3co2_1, &
+                       indself, indfor, selffac, selffrac, forfac, forfrac, &
+                       fac00, fac01, fac10, fac11, &
+                       ngptlw, taug, fracs)
+
+      CALL taugb5_gpu(ncol, nlayers, laytrop, jp, jt, jt1, &
+                       colh2o, colco2, colo3, &
+                       rat_h2oco2, rat_h2oco2_1, rat_o3co2, rat_o3co2_1, &
+                       indself, indfor, indminor, &
+                       selffac, selffrac, forfac, forfrac, minorfrac, &
+                       fac00, fac01, fac10, fac11, wx, &
+                       ngptlw, taug, fracs)
+
+      CALL taugb6_gpu(ncol, nlayers, laytrop, jp, jt, jt1, &
+                       colh2o, colco2, coldry, &
+                       indself, indfor, indminor, &
+                       selffac, selffrac, forfac, forfrac, minorfrac, &
+                       fac00, fac01, fac10, fac11, wx, &
+                       ngptlw, taug, fracs)
+
+      CALL taugb7_gpu(ncol, nlayers, laytrop, jp, jt, jt1, &
+                       colh2o, colo3, colco2, coldry, &
+                       rat_h2oo3, rat_h2oo3_1, &
+                       indself, indfor, indminor, &
+                       selffac, selffrac, forfac, forfrac, minorfrac, &
+                       fac00, fac01, fac10, fac11, &
+                       ngptlw, taug, fracs)
+
+      CALL taugb8_gpu(ncol, nlayers, laytrop, jp, jt, jt1, &
+                       pavel, colh2o, colco2, colo3, coln2o, coldry, wx, &
+                       indself, indfor, indminor, &
+                       selffac, selffrac, forfac, forfrac, minorfrac, &
+                       fac00, fac01, fac10, fac11, &
+                       ngptlw, taug, fracs)
+
+      CALL taugb9_gpu(ncol, nlayers, laytrop, jp, jt, jt1, &
+                       pavel, colh2o, colch4, coln2o, coldry, &
+                       rat_h2och4, rat_h2och4_1, &
+                       indself, indfor, indminor, &
+                       selffac, selffrac, forfac, forfrac, minorfrac, &
+                       fac00, fac01, fac10, fac11, &
+                       ngptlw, taug, fracs)
+
+      CALL taugb10_gpu(ncol, nlayers, laytrop, jp, jt, jt1, &
+                       colh2o, indself, indfor, &
+                       selffac, selffrac, forfac, forfrac, &
+                       fac00, fac01, fac10, fac11, &
+                       ngptlw, taug, fracs)
+
+      CALL taugb11_gpu(ncol, nlayers, laytrop, jp, jt, jt1, &
+                       colh2o, colo2, scaleminor, &
+                       indself, indfor, indminor, &
+                       selffac, selffrac, forfac, forfrac, minorfrac, &
+                       fac00, fac01, fac10, fac11, &
+                       ngptlw, taug, fracs)
+
+      CALL taugb12_gpu(ncol, nlayers, laytrop, jp, jt, jt1, &
+                       colh2o, colco2, rat_h2oco2, rat_h2oco2_1, &
+                       indself, indfor, selffac, selffrac, forfac, forfrac, &
+                       fac00, fac01, fac10, fac11, &
+                       ngptlw, taug, fracs)
+
+      CALL taugb13_gpu(ncol, nlayers, laytrop, jp, jt, jt1, &
+                       colh2o, coln2o, colco2, coldry, colco, colo3, &
+                       rat_h2on2o, rat_h2on2o_1, &
+                       indself, indfor, indminor, &
+                       selffac, selffrac, forfac, forfrac, minorfrac, &
+                       fac00, fac01, fac10, fac11, &
+                       ngptlw, taug, fracs)
+
+      CALL taugb14_gpu(ncol, nlayers, laytrop, jp, jt, jt1, &
+                       colco2, indself, indfor, &
+                       selffac, selffrac, forfac, forfrac, &
+                       fac00, fac01, fac10, fac11, &
+                       ngptlw, taug, fracs)
+
+      CALL taugb15_gpu(ncol, nlayers, laytrop, jp, jt, jt1, &
+                       coln2o, colco2, colbrd, rat_n2oco2, rat_n2oco2_1, &
+                       indself, indfor, indminor, &
+                       selffac, selffrac, forfac, forfrac, minorfrac, scaleminor, &
+                       fac00, fac01, fac10, fac11, &
+                       ngptlw, taug, fracs)
+
+      CALL taugb16_gpu(ncol, nlayers, laytrop, jp, jt, jt1, &
+                       colh2o, colch4, rat_h2och4, rat_h2och4_1, &
+                       indself, indfor, selffac, selffrac, forfac, forfrac, &
+                       fac00, fac01, fac10, fac11, &
+                       ngptlw, taug, fracs)
+
+      END SUBROUTINE taumol_gpu
+
+      END MODULE rrtmg_lw_taumol_gpu
+#endif
+
 !     path:      $Source: /cvsroot/NWP/WRFV3/phys/module_ra_rrtmg_lw.F,v $
 !     author:    $Author: trn $
 !     revision:  $Revision: 1.3 $
@@ -10968,7 +15076,7 @@ contains
                       selffac, selffrac, indself, forfac, forfrac, indfor, &
                       minorfrac, scaleminor, scaleminorn2, indminor)
 
-!  Calculate the gaseous optical depths and Planck fractions for 
+!  Calculate the gaseous optical depths and Planck fractions for
 !  each longwave spectral band.
 
          call taumol(nlayers, pavel, wx, coldry, &

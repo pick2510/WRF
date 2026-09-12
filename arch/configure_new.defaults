@@ -236,13 +236,14 @@ CC              =       CONFIGURE_CC
 LD              =       $(FC)
 RWORDSIZE       =       CONFIGURE_RWORDSIZE
 PROMOTION       =       -r$(RWORDSIZE) -i4
-ARCH_LOCAL      =       -DNONSTANDARD_SYSTEM_SUBR -DWRF_GPU_DYN -DWRF_USE_CLM
+ARCH_LOCAL      =       -DNONSTANDARD_SYSTEM_SUBR -DWRF_GPU_DYN -DWRF_GPU_RAD -DWRF_USE_CLM
 # Recent glibc distributions ship SunRPC through libtirpc.
 CFLAGS_LOCAL    =       -O3 -I/usr/include/tirpc
-LDFLAGS_LOCAL   =       -ltirpc $(GPU_DYN_FLAGS)
+LDFLAGS_LOCAL   =       -ltirpc $(GPU_DYN_FLAGS) $(GPU_RAD_FLAGS)
 CPLUSPLUSLIB    =
 ESMF_LDFLAG     =       $(CPLUSPLUSLIB)
-GPU_DYN_FLAGS   =       -acc -gpu=cc120
+GPU_DYN_FLAGS   =       -acc -gpu=cc120 -Kieee
+GPU_RAD_FLAGS   =       -acc -gpu=cc120 -Kieee
 FCOPTIM         =       -O3
 FCREDUCEDOPT    =       $(FCOPTIM)
 FCNOOPT         =       -O0
