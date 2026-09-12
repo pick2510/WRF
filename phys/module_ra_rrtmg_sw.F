@@ -2391,6 +2391,432 @@
 
       end module rrtmg_sw_cldprmc
 
+#ifdef WRF_GPU_RAD
+!-------------------------------------------------------------------------------
+!  GPU (OpenACC) port of cldprmc_sw, RRTMG-SW's per-column McICA cloud optical
+!  property calculation -- see plan.md "GPU Port: RRTMG Radiation" and the LW
+!  cldprmc_gpu header comment (module_ra_rrtmg_lw.F) for the general
+!  restructuring rationale, which carries over directly: this is a plain
+!  collapse(3) over (column, g-point, layer), every cell independent, no
+!  troposphere/stratosphere split. The original CPU cldprmc_sw above is
+!  untouched.
+!
+!  SW uses the 16:29 band-numbering convention (jpb1=16, jpb2=29) throughout
+!  -- preserved exactly here, not renumbered.
+!
+!  STOP/wrf_error_fatal hoisting: unlike LW's cldprmc, several of SW's
+!  physical-bounds checks guard *computed* quantities (extcoice, ssacoice,
+!  gice, fdelta, ...) rather than the raw input radius alone, and the
+!  iceflag=1 (Ebert-Curry) branch in particular has no raw-radius bound at
+!  all in the original -- only checks on the values computed from it. To
+!  preserve the exact same fatal-on-out-of-range behavior on the host,
+!  cldprmc_sw_prep_gpu below does not just re-check the raw radius bounds
+!  that are explicit STOPs in the original (radice for iceflag=2/>=3, radsno
+!  for iceflag=5, radliq for liqflag=1) -- it also recomputes the small
+!  scalar derived quantities that original iceflag=1 and iceflag>=3/snow
+!  branches STOP on (extcoice/ssacoice/gice for iceflag=1; fdelta for
+!  iceflag>=3 and snow) and validates those too, since these are cheap
+!  per-cell scalar table lookups/interpolations, not per-gang scratch
+!  arrays, and the branch has no earlier bound to lean on. The downstream
+!  checks that guard values built from an *already validated*, already
+!  table-interpolated radius bound (iceflag=2's extcoice/ssacoice/gice, and
+!  liqflag=1's extcoliq/ssacoliq/gliq) are treated as guaranteed-safe once
+!  the radius bound holds and the table is valid, matching the judgment call
+!  already made in the LW cldprmc_gpu port -- these are not re-derived.
+!
+!  inflag=1 is not implemented in the original (unconditional STOP) and
+!  remains so here, reported by the host pre-validation. inflag=0 (delta-M
+!  rescaling of an already-supplied optical depth) has no bound checks and
+!  needs no pre-validation; it is handled directly in the device kernel.
+!-------------------------------------------------------------------------------
+      MODULE rrtmg_sw_cldprmc_gpu
+
+      CONTAINS
+
+      SUBROUTINE cldprmc_sw_prep_gpu(ncol, nlayers, inflag, iceflag, liqflag, &
+                                      cldfmc, ciwpmc, clwpmc, cswpmc, &
+                                      reicmc, relqmc, resnmc, taucmc)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrsw, only : ngptsw
+      use rrsw_cld, only : extice3, ssaice3, asyice3, fdlice3, &
+                            abari, bbari, cbari, dbari, ebari, fbari
+      use rrsw_wvn, only : wavenum2, ngb
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, inflag, iceflag, liqflag
+      REAL(kind=rb), INTENT(IN) :: cldfmc(ncol,ngptsw,nlayers)
+      REAL(kind=rb), INTENT(IN) :: ciwpmc(ncol,ngptsw,nlayers), &
+                                    clwpmc(ncol,ngptsw,nlayers), &
+                                    cswpmc(ncol,ngptsw,nlayers)
+      REAL(kind=rb), INTENT(IN) :: reicmc(ncol,nlayers), relqmc(ncol,nlayers), &
+                                    resnmc(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: taucmc(ncol,ngptsw,nlayers)
+
+      INTEGER(kind=im) :: iplon, lay, ig, ib, icx, index
+      REAL(kind=rb) :: cwp, radice, radliq, radsno, factor, fint
+      REAL(kind=rb) :: extcoice, ssacoice, gice, fdelta
+      REAL(kind=rb), PARAMETER :: eps = 1.e-06_rb
+      REAL(kind=rb), PARAMETER :: cldmin = 1.e-20_rb
+      CHARACTER*80 :: errmess
+
+      IF (inflag .eq. 1) THEN
+         CALL wrf_error_fatal('cldprmc_sw_prep_gpu: INFLAG = 1 OPTION NOT AVAILABLE WITH MCICA')
+      ENDIF
+      IF (inflag .lt. 2) RETURN
+
+      DO iplon = 1, ncol
+         DO lay = 1, nlayers
+            DO ig = 1, ngptsw
+               cwp = ciwpmc(iplon,ig,lay) + clwpmc(iplon,ig,lay) + cswpmc(iplon,ig,lay)
+               IF (cldfmc(iplon,ig,lay) .lt. cldmin) CYCLE
+               IF (cwp .lt. cldmin .and. taucmc(iplon,ig,lay) .lt. cldmin) CYCLE
+
+               radice = reicmc(iplon,lay)
+
+               IF ((ciwpmc(iplon,ig,lay)+cswpmc(iplon,ig,lay)) .ne. 0.0_rb) THEN
+                  IF (iceflag .eq. 1) THEN
+                     ib = ngb(ig)
+                     icx = 5
+                     IF (wavenum2(ib) .gt. 1.43e04_rb) THEN
+                        icx = 1
+                     ELSEIF (wavenum2(ib) .gt. 7.7e03_rb) THEN
+                        icx = 2
+                     ELSEIF (wavenum2(ib) .gt. 5.3e03_rb) THEN
+                        icx = 3
+                     ELSEIF (wavenum2(ib) .gt. 4.0e03_rb) THEN
+                        icx = 4
+                     ELSEIF (wavenum2(ib) .ge. 2.5e03_rb) THEN
+                        icx = 5
+                     ENDIF
+                     extcoice = (abari(icx) + bbari(icx)/radice)
+                     ssacoice = 1._rb - cbari(icx) - dbari(icx) * radice
+                     gice = ebari(icx) + fbari(icx) * radice
+                     IF (gice .ge. 1._rb) gice = 1._rb - eps
+                     IF (extcoice .lt. 0.0_rb) &
+                        CALL wrf_error_fatal('cldprmc_sw_prep_gpu: ICE EXTINCTION LESS THAN 0.0')
+                     IF (ssacoice .gt. 1.0_rb) &
+                        CALL wrf_error_fatal('cldprmc_sw_prep_gpu: ICE SSA GRTR THAN 1.0')
+                     IF (ssacoice .lt. 0.0_rb) &
+                        CALL wrf_error_fatal('cldprmc_sw_prep_gpu: ICE SSA LESS THAN 0.0')
+                     IF (gice .gt. 1.0_rb) &
+                        CALL wrf_error_fatal('cldprmc_sw_prep_gpu: ICE ASYM GRTR THAN 1.0')
+                     IF (gice .lt. 0.0_rb) &
+                        CALL wrf_error_fatal('cldprmc_sw_prep_gpu: ICE ASYM LESS THAN 0.0')
+
+                  ELSEIF (iceflag .eq. 2) THEN
+                     IF (radice .lt. 5.0_rb .or. radice .gt. 131.0_rb) &
+                        CALL wrf_error_fatal('cldprmc_sw_prep_gpu: ICE RADIUS OUT OF BOUNDS')
+
+                  ELSEIF (iceflag .ge. 3) THEN
+                     IF (radice .lt. 5.0_rb .or. radice .gt. 140.0_rb) THEN
+                        WRITE(errmess,'(A,i5,i5,f8.2,f8.2)') &
+                           'cldprmc_sw_prep_gpu: ICE GENERALIZED EFFECTIVE SIZE OUT OF BOUNDS', &
+                           ig, lay, ciwpmc(iplon,ig,lay), radice
+                        CALL wrf_error_fatal(errmess)
+                     ENDIF
+                     factor = (radice - 2._rb)/3._rb
+                     index = int(factor)
+                     IF (index .eq. 46) index = 45
+                     fint = factor - float(index)
+                     ib = ngb(ig)
+                     fdelta = fdlice3(index,ib) + fint * &
+                              (fdlice3(index+1,ib) - fdlice3(index,ib))
+                     IF (fdelta .lt. 0.0_rb) &
+                        CALL wrf_error_fatal('cldprmc_sw_prep_gpu: FDELTA LESS THAN 0.0')
+                     IF (fdelta .gt. 1.0_rb) &
+                        CALL wrf_error_fatal('cldprmc_sw_prep_gpu: FDELTA GT THAN 1.0')
+                  ENDIF
+               ENDIF
+
+               IF (cswpmc(iplon,ig,lay) .gt. 0.0_rb .and. iceflag .eq. 5) THEN
+                  radsno = resnmc(iplon,lay)
+                  IF (radsno .lt. 5.0_rb .or. radsno .gt. 140.0_rb) THEN
+                     WRITE(errmess,'(A,i5,i5,f8.2,f8.2)') &
+                        'cldprmc_sw_prep_gpu: SNOW GENERALIZED EFFECTIVE SIZE OUT OF BOUNDS', &
+                        ig, lay, cswpmc(iplon,ig,lay), radsno
+                     CALL wrf_error_fatal(errmess)
+                  ENDIF
+                  factor = (radsno - 2._rb)/3._rb
+                  index = int(factor)
+                  IF (index .eq. 46) index = 45
+                  fint = factor - float(index)
+                  ib = ngb(ig)
+                  fdelta = fdlice3(index,ib) + fint * &
+                           (fdlice3(index+1,ib) - fdlice3(index,ib))
+                  IF (fdelta .lt. 0.0_rb) &
+                     CALL wrf_error_fatal('cldprmc_sw_prep_gpu: SNOW FDELTA LESS THAN 0.0')
+                  IF (fdelta .gt. 1.0_rb) &
+                     CALL wrf_error_fatal('cldprmc_sw_prep_gpu: SNOW FDELTA GT THAN 1.0')
+               ENDIF
+
+               IF (clwpmc(iplon,ig,lay) .ne. 0.0_rb .and. liqflag .eq. 1) THEN
+                  radliq = relqmc(iplon,lay)
+                  IF (radliq .lt. 1.5_rb .or. radliq .gt. 60._rb) &
+                     CALL wrf_error_fatal('cldprmc_sw_prep_gpu: LIQUID EFFECTIVE RADIUS OUT OF BOUNDS')
+               ENDIF
+
+            ENDDO
+         ENDDO
+      ENDDO
+
+      END SUBROUTINE cldprmc_sw_prep_gpu
+
+      SUBROUTINE cldprmc_sw_gpu(ncol, nlayers, inflag, iceflag, liqflag, &
+                                 cldfmc, ciwpmc, clwpmc, cswpmc, &
+                                 reicmc, relqmc, resnmc, &
+                                 taormc, taucmc, ssacmc, asmcmc, fsfcmc)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrsw, only : ngptsw
+      use rrsw_cld, only : extliq1, ssaliq1, asyliq1, &
+                            extice2, ssaice2, asyice2, &
+                            extice3, ssaice3, asyice3, fdlice3, &
+                            abari, bbari, cbari, dbari, ebari, fbari
+      use rrsw_wvn, only : wavenum2, ngb
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, inflag, iceflag, liqflag
+      REAL(kind=rb), INTENT(IN) :: cldfmc(ncol,ngptsw,nlayers)
+      REAL(kind=rb), INTENT(IN) :: ciwpmc(ncol,ngptsw,nlayers), &
+                                    clwpmc(ncol,ngptsw,nlayers), &
+                                    cswpmc(ncol,ngptsw,nlayers)
+      REAL(kind=rb), INTENT(IN) :: reicmc(ncol,nlayers), relqmc(ncol,nlayers), &
+                                    resnmc(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: fsfcmc(ncol,ngptsw,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: taucmc(ncol,ngptsw,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: ssacmc(ncol,ngptsw,nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: asmcmc(ncol,ngptsw,nlayers)
+      REAL(kind=rb), INTENT(OUT) :: taormc(ncol,ngptsw,nlayers)
+
+      INTEGER(kind=im) :: iplon, lay, ig, ib, icx, istr, index
+      REAL(kind=rb) :: cwp, radice, radliq, radsno, factor, fint
+      REAL(kind=rb) :: extcoice, ssacoice, gice, forwice, fdelta
+      REAL(kind=rb) :: extcoliq, ssacoliq, gliq, forwliq
+      REAL(kind=rb) :: extcosno, ssacosno, gsno, forwsno
+      REAL(kind=rb) :: taucldorig_a, taucloud_a, ssacloud_a, ffp, ffp1, ffpssa
+      REAL(kind=rb) :: tauiceorig, scatice, ssaice, tauice
+      REAL(kind=rb) :: tauliqorig, scatliq, ssaliq, tauliq
+      REAL(kind=rb) :: tausnoorig, scatsno, ssasno, tausno
+      REAL(kind=rb), PARAMETER :: eps = 1.e-06_rb
+      REAL(kind=rb), PARAMETER :: cldmin = 1.e-20_rb
+
+!$acc parallel loop collapse(3) &
+!$acc   private(cwp, radice, radliq, radsno, factor, fint) &
+!$acc   private(extcoice, ssacoice, gice, forwice, fdelta) &
+!$acc   private(extcoliq, ssacoliq, gliq, forwliq) &
+!$acc   private(extcosno, ssacosno, gsno, forwsno) &
+!$acc   private(taucldorig_a, taucloud_a, ssacloud_a, ffp, ffp1, ffpssa) &
+!$acc   private(tauiceorig, scatice, ssaice, tauice) &
+!$acc   private(tauliqorig, scatliq, ssaliq, tauliq) &
+!$acc   private(tausnoorig, scatsno, ssasno, tausno) &
+!$acc   private(ib, icx, istr, index) &
+!$acc   present(cldfmc, ciwpmc, clwpmc, cswpmc, reicmc, relqmc, resnmc, fsfcmc) &
+!$acc   present(taucmc, ssacmc, asmcmc, taormc) &
+!$acc   present(extliq1, ssaliq1, asyliq1, extice2, ssaice2, asyice2) &
+!$acc   present(extice3, ssaice3, asyice3, fdlice3) &
+!$acc   present(abari, bbari, cbari, dbari, ebari, fbari) &
+!$acc   present(wavenum2, ngb)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+      DO ig = 1, ngptsw
+
+         taormc(iplon,ig,lay) = taucmc(iplon,ig,lay)
+
+         cwp = ciwpmc(iplon,ig,lay) + clwpmc(iplon,ig,lay) + cswpmc(iplon,ig,lay)
+
+         IF (cldfmc(iplon,ig,lay) .ge. cldmin .and. &
+            (cwp .ge. cldmin .or. taucmc(iplon,ig,lay) .ge. cldmin)) THEN
+
+            IF (inflag .eq. 0) THEN
+! Cloud optical properties already defined in taucmc/ssacmc/asmcmc are
+! unscaled; apply delta-M scaling here (Henyey-Greenstein approximation).
+               taucldorig_a = taucmc(iplon,ig,lay)
+               ffp = fsfcmc(iplon,ig,lay)
+               ffp1 = 1.0_rb - ffp
+               ffpssa = 1.0_rb - ffp * ssacmc(iplon,ig,lay)
+               ssacloud_a = ffp1 * ssacmc(iplon,ig,lay) / ffpssa
+               taucloud_a = ffpssa * taucldorig_a
+
+               taormc(iplon,ig,lay) = taucldorig_a
+               ssacmc(iplon,ig,lay) = ssacloud_a
+               taucmc(iplon,ig,lay) = taucloud_a
+               asmcmc(iplon,ig,lay) = (asmcmc(iplon,ig,lay) - ffp) / ffp1
+
+            ELSEIF (inflag .ge. 2) THEN
+               radice = reicmc(iplon,lay)
+
+               extcoice = 0.0_rb; ssacoice = 0.0_rb; gice = 0.0_rb; forwice = 0.0_rb
+               extcosno = 0.0_rb; ssacosno = 0.0_rb; gsno = 0.0_rb; forwsno = 0.0_rb
+
+               IF ((ciwpmc(iplon,ig,lay)+cswpmc(iplon,ig,lay)) .ne. 0.0_rb) THEN
+
+                  IF (iceflag .eq. 1) THEN
+                     ib = ngb(ig)
+                     icx = 5
+                     IF (wavenum2(ib) .gt. 1.43e04_rb) THEN
+                        icx = 1
+                     ELSEIF (wavenum2(ib) .gt. 7.7e03_rb) THEN
+                        icx = 2
+                     ELSEIF (wavenum2(ib) .gt. 5.3e03_rb) THEN
+                        icx = 3
+                     ELSEIF (wavenum2(ib) .gt. 4.0e03_rb) THEN
+                        icx = 4
+                     ELSEIF (wavenum2(ib) .ge. 2.5e03_rb) THEN
+                        icx = 5
+                     ENDIF
+                     extcoice = (abari(icx) + bbari(icx)/radice)
+                     ssacoice = 1._rb - cbari(icx) - dbari(icx) * radice
+                     gice = ebari(icx) + fbari(icx) * radice
+                     IF (gice .ge. 1._rb) gice = 1._rb - eps
+                     forwice = gice*gice
+
+                  ELSEIF (iceflag .eq. 2) THEN
+                     factor = (radice - 2._rb)/3._rb
+                     index = int(factor)
+                     IF (index .eq. 43) index = 42
+                     fint = factor - float(index)
+                     ib = ngb(ig)
+                     extcoice = extice2(index,ib) + fint * &
+                                (extice2(index+1,ib) - extice2(index,ib))
+                     ssacoice = ssaice2(index,ib) + fint * &
+                                (ssaice2(index+1,ib) - ssaice2(index,ib))
+                     gice = asyice2(index,ib) + fint * &
+                            (asyice2(index+1,ib) - asyice2(index,ib))
+                     forwice = gice*gice
+
+                  ELSEIF (iceflag .ge. 3) THEN
+                     factor = (radice - 2._rb)/3._rb
+                     index = int(factor)
+                     IF (index .eq. 46) index = 45
+                     fint = factor - float(index)
+                     ib = ngb(ig)
+                     extcoice = extice3(index,ib) + fint * &
+                                (extice3(index+1,ib) - extice3(index,ib))
+                     ssacoice = ssaice3(index,ib) + fint * &
+                                (ssaice3(index+1,ib) - ssaice3(index,ib))
+                     gice = asyice3(index,ib) + fint * &
+                            (asyice3(index+1,ib) - asyice3(index,ib))
+                     fdelta = fdlice3(index,ib) + fint * &
+                              (fdlice3(index+1,ib) - fdlice3(index,ib))
+                     forwice = fdelta + 0.5_rb / ssacoice
+! See Fu 1996 p. 2067
+                     IF (forwice .gt. gice) forwice = gice
+                  ENDIF
+               ENDIF
+
+               IF (cswpmc(iplon,ig,lay).gt.0.0_rb .and. iceflag .eq. 5) THEN
+                  radsno = resnmc(iplon,lay)
+                  factor = (radsno - 2._rb)/3._rb
+                  index = int(factor)
+                  IF (index .eq. 46) index = 45
+                  fint = factor - float(index)
+                  ib = ngb(ig)
+                  extcosno = extice3(index,ib) + fint * &
+                             (extice3(index+1,ib) - extice3(index,ib))
+                  ssacosno = ssaice3(index,ib) + fint * &
+                             (ssaice3(index+1,ib) - ssaice3(index,ib))
+                  gsno = asyice3(index,ib) + fint * &
+                         (asyice3(index+1,ib) - asyice3(index,ib))
+                  fdelta = fdlice3(index,ib) + fint * &
+                           (fdlice3(index+1,ib) - fdlice3(index,ib))
+                  forwsno = fdelta + 0.5_rb / ssacosno
+                  IF (forwsno .gt. gsno) forwsno = gsno
+               ENDIF
+
+! Calculation of absorption coefficients due to water clouds.
+               extcoliq = 0.0_rb; ssacoliq = 0.0_rb; gliq = 0.0_rb; forwliq = 0.0_rb
+               IF (clwpmc(iplon,ig,lay) .ne. 0.0_rb .and. liqflag .eq. 1) THEN
+                  radliq = relqmc(iplon,lay)
+                  index = int(radliq - 1.5_rb)
+                  IF (index .eq. 0) index = 1
+                  IF (index .eq. 58) index = 57
+                  fint = radliq - 1.5_rb - float(index)
+                  ib = ngb(ig)
+                  extcoliq = extliq1(index,ib) + fint * &
+                             (extliq1(index+1,ib) - extliq1(index,ib))
+                  ssacoliq = ssaliq1(index,ib) + fint * &
+                             (ssaliq1(index+1,ib) - ssaliq1(index,ib))
+                  IF (fint .lt. 0._rb .and. ssacoliq .gt. 1._rb) &
+                     ssacoliq = ssaliq1(index,ib)
+                  gliq = asyliq1(index,ib) + fint * &
+                         (asyliq1(index+1,ib) - asyliq1(index,ib))
+                  forwliq = gliq*gliq
+               ENDIF
+
+               IF (iceflag .lt. 5) THEN
+                  tauliqorig = clwpmc(iplon,ig,lay) * extcoliq
+                  tauiceorig = ciwpmc(iplon,ig,lay) * extcoice
+                  taormc(iplon,ig,lay) = tauliqorig + tauiceorig
+
+                  ssaliq = ssacoliq * (1._rb - forwliq) / (1._rb - forwliq * ssacoliq)
+                  tauliq = (1._rb - forwliq * ssacoliq) * tauliqorig
+                  ssaice = ssacoice * (1._rb - forwice) / (1._rb - forwice * ssacoice)
+                  tauice = (1._rb - forwice * ssacoice) * tauiceorig
+                  scatliq = ssaliq * tauliq
+                  scatice = ssaice * tauice
+                  scatsno = 0.0_rb
+                  taucmc(iplon,ig,lay) = tauliq + tauice
+               ELSE
+                  tauliqorig = clwpmc(iplon,ig,lay) * extcoliq
+                  tauiceorig = ciwpmc(iplon,ig,lay) * extcoice
+                  tausnoorig = cswpmc(iplon,ig,lay) * extcosno
+                  taormc(iplon,ig,lay) = tauliqorig + tauiceorig + tausnoorig
+
+                  ssaliq = ssacoliq * (1._rb - forwliq) / (1._rb - forwliq * ssacoliq)
+                  tauliq = (1._rb - forwliq * ssacoliq) * tauliqorig
+                  ssaice = ssacoice * (1._rb - forwice) / (1._rb - forwice * ssacoice)
+                  tauice = (1._rb - forwice * ssacoice) * tauiceorig
+                  ssasno = ssacosno * (1._rb - forwsno) / (1._rb - forwsno * ssacosno)
+                  tausno = (1._rb - forwsno * ssacosno) * tausnoorig
+                  scatliq = ssaliq * tauliq
+                  scatice = ssaice * tauice
+                  scatsno = ssasno * tausno
+                  taucmc(iplon,ig,lay) = tauliq + tauice + tausno
+               ENDIF
+
+               IF (taucmc(iplon,ig,lay).eq.0.) taucmc(iplon,ig,lay) = cldmin
+               IF (scatice.eq.0.) scatice = cldmin
+               IF (scatsno.eq.0.) scatsno = cldmin
+
+               IF (iceflag .lt. 5) THEN
+                  ssacmc(iplon,ig,lay) = (scatliq + scatice) / taucmc(iplon,ig,lay)
+               ELSE
+                  ssacmc(iplon,ig,lay) = (scatliq + scatice + scatsno) / taucmc(iplon,ig,lay)
+               ENDIF
+
+               IF (iceflag .eq. 3 .or. iceflag.eq.4) THEN
+                  istr = 1
+                  asmcmc(iplon,ig,lay) = (1.0_rb/(scatliq+scatice)) * &
+                     (scatliq*(gliq**istr - forwliq) / (1.0_rb - forwliq) + &
+                      scatice * ((gice-forwice)/(1.0_rb - forwice))**istr)
+               ELSEIF (iceflag .eq. 5) THEN
+                  istr = 1
+                  asmcmc(iplon,ig,lay) = (1.0_rb/(scatliq+scatice+scatsno)) * &
+                     (scatliq*(gliq**istr - forwliq)/(1.0_rb - forwliq) + &
+                      scatice * ((gice-forwice)/(1.0_rb - forwice)) + &
+                      scatsno * ((gsno-forwsno)/(1.0_rb - forwsno))**istr)
+               ELSE
+                  istr = 1
+                  asmcmc(iplon,ig,lay) = (scatliq * (gliq**istr - forwliq) / (1.0_rb - forwliq) + &
+                     scatice * (gice**istr - forwice) / (1.0_rb - forwice)) / (scatliq + scatice)
+               ENDIF
+
+            ENDIF
+
+         ENDIF
+
+      ENDDO
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE cldprmc_sw_gpu
+
+      END MODULE rrtmg_sw_cldprmc_gpu
+#endif
+
 !     path:      $Source: /cvsroot/NWP/WRFV3/phys/module_ra_rrtmg_sw.F,v $
 !     author:    $Author: trn $
 !     revision:  $Revision: 1.3 $
