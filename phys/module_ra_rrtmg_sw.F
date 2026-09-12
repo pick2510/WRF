@@ -3128,6 +3128,180 @@
 
       end module rrtmg_sw_reftra
 
+#ifdef WRF_GPU_RAD
+! ncol- and g-point-batched OpenACC port of rrtmg_sw_reftra's reftra_sw.
+! Per-layer two-stream reflectance/transmittance is purely elementwise (no
+! recurrence across layers or g-points), so the whole thing collapses to a
+! single collapse(3) kernel over (column, layer, g-point) -- unlike
+! vrtqdr_sw below, which is a genuine sequential recurrence over layers.
+! kmodts is hardwired to 2 (PIFM) since that is the only value WRF's caller
+! (spcvmc_sw) ever sets.
+      MODULE rrtmg_sw_reftra_gpu
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use rrsw_tbl, only : tblint, bpade, od_lo, exp_tbl
+
+      IMPLICIT NONE
+
+      CONTAINS
+
+      SUBROUTINE reftra_sw_gpu(ncol, nlayers, ngpt, lrtchk, pgg, prmuz, ptau, pw, &
+                                pref, prefd, ptra, ptrad)
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, ngpt
+      LOGICAL, INTENT(IN) :: lrtchk(ncol,nlayers,ngpt)
+      REAL(kind=rb), INTENT(IN) :: pgg(ncol,nlayers,ngpt), ptau(ncol,nlayers,ngpt), pw(ncol,nlayers,ngpt)
+      REAL(kind=rb), INTENT(IN) :: prmuz(ncol)
+      REAL(kind=rb), INTENT(INOUT) :: pref(ncol,nlayers+1,ngpt), prefd(ncol,nlayers+1,ngpt)
+      REAL(kind=rb), INTENT(INOUT) :: ptra(ncol,nlayers+1,ngpt), ptrad(ncol,nlayers+1,ngpt)
+
+      INTEGER(kind=im) :: iplon, jk, ig, itind
+      REAL(kind=rb) :: tblind
+      REAL(kind=rb) :: za, za1, za2
+      REAL(kind=rb) :: zbeta, zdend, zdenr, zdent
+      REAL(kind=rb) :: ze1, ze2, zem1, zem2, zemm, zep1, zep2
+      REAL(kind=rb) :: zg, zg3, zgamma1, zgamma2, zgamma3, zgamma4, zgt
+      REAL(kind=rb) :: zr1, zr2, zr3, zr4, zr5
+      REAL(kind=rb) :: zrk, zrk2, zrkg, zrm1, zrp, zrp1, zrpp
+      REAL(kind=rb) :: zsr3, zt1, zt2, zt3, zt4, zt5, zto1
+      REAL(kind=rb) :: zw, zwcrit, zwo, denom
+
+      REAL(kind=rb), PARAMETER :: eps = 1.e-08_rb
+
+      zsr3 = sqrt(3._rb)
+      zwcrit = 0.9999995_rb
+
+!$acc parallel loop collapse(3) &
+!$acc   private(tblind, itind, za, za1, za2, zbeta, zdend, zdenr, zdent) &
+!$acc   private(ze1, ze2, zem1, zem2, zemm, zep1, zep2) &
+!$acc   private(zg, zg3, zgamma1, zgamma2, zgamma3, zgamma4, zgt) &
+!$acc   private(zr1, zr2, zr3, zr4, zr5, zrk, zrk2, zrkg, zrm1, zrp, zrp1, zrpp) &
+!$acc   private(zsr3, zt1, zt2, zt3, zt4, zt5, zto1, zw, zwo, denom) &
+!$acc   present(lrtchk, pgg, ptau, pw, prmuz, pref, prefd, ptra, ptrad, exp_tbl)
+      DO ig = 1, ngpt
+      DO jk = 1, nlayers
+      DO iplon = 1, ncol
+         IF (.not. lrtchk(iplon,jk,ig)) THEN
+            pref(iplon,jk,ig) = 0._rb
+            ptra(iplon,jk,ig) = 1._rb
+            prefd(iplon,jk,ig) = 0._rb
+            ptrad(iplon,jk,ig) = 1._rb
+         ELSE
+            zto1 = ptau(iplon,jk,ig)
+            zw   = pw(iplon,jk,ig)
+            zg   = pgg(iplon,jk,ig)
+
+            zg3 = 3._rb * zg
+            zgamma1 = (8._rb - zw * (5._rb + zg3)) * 0.25_rb
+            zgamma2 =  3._rb *(zw * (1._rb - zg )) * 0.25_rb
+            zgamma3 = (2._rb - zg3 * prmuz(iplon)) * 0.25_rb
+            zgamma4 = 1._rb - zgamma3
+
+            denom = max((1._rb - (1._rb - zw) * (zg / (1._rb - zg))**2), 1.0E-30_rb)
+            zwo = zw / denom
+
+            IF (zwo .ge. zwcrit) THEN
+! Conservative scattering
+               za  = zgamma1 * prmuz(iplon)
+               za1 = za - zgamma3
+               zgt = zgamma1 * zto1
+
+               ze1 = min(zto1 / prmuz(iplon), 500._rb)
+               IF (ze1 .le. od_lo) THEN
+                  ze2 = 1._rb - ze1 + 0.5_rb * ze1 * ze1
+               ELSE
+                  tblind = ze1 / (bpade + ze1)
+                  itind = tblint * tblind + 0.5_rb
+                  ze2 = exp_tbl(itind)
+               ENDIF
+
+               pref(iplon,jk,ig) = (zgt - za1 * (1._rb - ze2)) / (1._rb + zgt)
+               ptra(iplon,jk,ig) = 1._rb - pref(iplon,jk,ig)
+
+               prefd(iplon,jk,ig) = zgt / (1._rb + zgt)
+               ptrad(iplon,jk,ig) = 1._rb - prefd(iplon,jk,ig)
+
+               IF (ze2 .eq. 1.0_rb) THEN
+                  pref(iplon,jk,ig) = 0.0_rb
+                  ptra(iplon,jk,ig) = 1.0_rb
+                  prefd(iplon,jk,ig) = 0.0_rb
+                  ptrad(iplon,jk,ig) = 1.0_rb
+               ENDIF
+
+            ELSE
+! Non-conservative scattering
+               za1 = zgamma1 * zgamma4 + zgamma2 * zgamma3
+               za2 = zgamma1 * zgamma3 + zgamma2 * zgamma4
+               zrk = sqrt(zgamma1**2 - zgamma2**2)
+               zrp = zrk * prmuz(iplon)
+               zrp1 = 1._rb + zrp
+               zrm1 = 1._rb - zrp
+               zrk2 = 2._rb * zrk
+               zrpp = 1._rb - zrp*zrp
+               zrkg = zrk + zgamma1
+               zr1  = zrm1 * (za2 + zrk * zgamma3)
+               zr2  = zrp1 * (za2 - zrk * zgamma3)
+               zr3  = zrk2 * (zgamma3 - za2 * prmuz(iplon))
+               zr4  = zrpp * zrkg
+               zr5  = zrpp * (zrk - zgamma1)
+               zt1  = zrp1 * (za1 + zrk * zgamma4)
+               zt2  = zrm1 * (za1 - zrk * zgamma4)
+               zt3  = zrk2 * (zgamma4 + za1 * prmuz(iplon))
+               zt4  = zr4
+               zt5  = zr5
+
+               zbeta = (zgamma1 - zrk) / zrkg
+
+               ze1 = min(zrk * zto1, 500._rb)
+               ze2 = min(zto1 / prmuz(iplon), 500._rb)
+
+               IF (ze1 .le. od_lo) THEN
+                  zem1 = 1._rb - ze1 + 0.5_rb * ze1 * ze1
+                  zep1 = 1._rb / zem1
+               ELSE
+                  tblind = ze1 / (bpade + ze1)
+                  itind = tblint * tblind + 0.5_rb
+                  zem1 = exp_tbl(itind)
+                  zep1 = 1._rb / zem1
+               ENDIF
+
+               IF (ze2 .le. od_lo) THEN
+                  zem2 = 1._rb - ze2 + 0.5_rb * ze2 * ze2
+                  zep2 = 1._rb / zem2
+               ELSE
+                  tblind = ze2 / (bpade + ze2)
+                  itind = tblint * tblind + 0.5_rb
+                  zem2 = exp_tbl(itind)
+                  zep2 = 1._rb / zem2
+               ENDIF
+
+               zdenr = zr4*zep1 + zr5*zem1
+               zdent = zt4*zep1 + zt5*zem1
+               IF (zdenr .ge. -eps .and. zdenr .le. eps) THEN
+                  pref(iplon,jk,ig) = eps
+                  ptra(iplon,jk,ig) = zem2
+               ELSE
+                  pref(iplon,jk,ig) = zw * (zr1*zep1 - zr2*zem1 - zr3*zem2) / zdenr
+                  ptra(iplon,jk,ig) = zem2 - zem2 * zw * (zt1*zep1 - zt2*zem1 - zt3*zep2) / zdent
+               ENDIF
+
+               zemm = zem1*zem1
+               zdend = 1._rb / ((1._rb - zbeta*zemm) * zrkg)
+               prefd(iplon,jk,ig) = zgamma2 * (1._rb - zemm) * zdend
+               ptrad(iplon,jk,ig) = zrk2*zem1*zdend
+
+            ENDIF
+         ENDIF
+      ENDDO
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE reftra_sw_gpu
+
+      END MODULE rrtmg_sw_reftra_gpu
+#endif
+
 !     path:      $Source: /cvsroot/NWP/WRFV3/phys/module_ra_rrtmg_sw.F,v $
 !     author:    $Author: trn $
 !     revision:  $Revision: 1.3 $
@@ -10270,6 +10444,110 @@
 
       end module rrtmg_sw_vrtqdr
 
+#ifdef WRF_GPU_RAD
+! ncol- and g-point-batched OpenACC port of rrtmg_sw_vrtqdr's vrtqdr_sw.
+! This is a genuine sequential recurrence over layers (adding-doubling: a
+! bottom-to-top pass building prup/prupd, then a top-to-bottom pass building
+! ztdn/prdnd), independent per (column, g-point) -- same category as LW's
+! rtrnmc up/down sweep, so it is parallelized gang-style over (column,
+! g-point) with `!$acc loop seq` over layers for each pass.
+      MODULE rrtmg_sw_vrtqdr_gpu
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrsw, only : mxlay
+
+      IMPLICIT NONE
+
+      CONTAINS
+
+      SUBROUTINE vrtqdr_sw_gpu(ncol, klev, ngpt, &
+                                pref, prefd, ptra, ptrad, &
+                                pdbt, ptdbt, pfd, pfu)
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, klev, ngpt
+      REAL(kind=rb), INTENT(IN) :: pref(ncol,klev+1,ngpt), prefd(ncol,klev+1,ngpt)
+      REAL(kind=rb), INTENT(IN) :: ptra(ncol,klev+1,ngpt), ptrad(ncol,klev+1,ngpt)
+      REAL(kind=rb), INTENT(IN) :: pdbt(ncol,klev+1,ngpt), ptdbt(ncol,klev+1,ngpt)
+      REAL(kind=rb), INTENT(OUT) :: pfd(ncol,klev+1,ngpt), pfu(ncol,klev+1,ngpt)
+
+      INTEGER(kind=im) :: iplon, ig, ikp, ikx, jk
+      REAL(kind=rb) :: zreflect
+      REAL(kind=rb) :: ztdn(mxlay+1), prdnd(mxlay+1), prup(mxlay+1), prupd(mxlay+1)
+
+!$acc parallel loop collapse(2) &
+!$acc   private(zreflect, ikp, ikx, ztdn, prdnd, prup, prupd) &
+!$acc   present(pref, prefd, ptra, ptrad, pdbt, ptdbt, pfd, pfu)
+      DO ig = 1, ngpt
+      DO iplon = 1, ncol
+
+! Surface boundary for the upward reflectance operators: in the original,
+! prup/prupd are intent(inout) and the caller pre-sets
+! prup(klev+1)=pref(klev+1) (=palbp/palbd, the surface albedo) before
+! calling vrtqdr_sw -- the recurrence below only ever fills indices
+! 1..klev, relying on that pre-set boundary at klev+1 in the final
+! up/down-welling flux loop. Since prup/prupd are local arrays here (not
+! caller-shared), that boundary must be set explicitly.
+         prup(klev+1) = pref(iplon,klev+1,ig)
+         prupd(klev+1) = prefd(iplon,klev+1,ig)
+
+! Link lowest layer with surface
+         zreflect = 1._rb / (1._rb - prefd(iplon,klev+1,ig) * prefd(iplon,klev,ig))
+         prup(klev) = pref(iplon,klev,ig) + (ptrad(iplon,klev,ig) * &
+                    ((ptra(iplon,klev,ig) - pdbt(iplon,klev,ig)) * prefd(iplon,klev+1,ig) + &
+                      pdbt(iplon,klev,ig) * pref(iplon,klev+1,ig))) * zreflect
+         prupd(klev) = prefd(iplon,klev,ig) + ptrad(iplon,klev,ig) * ptrad(iplon,klev,ig) * &
+                       prefd(iplon,klev+1,ig) * zreflect
+
+! Pass from bottom to top
+!$acc loop seq
+         DO jk = 1, klev-1
+            ikp = klev+1-jk
+            ikx = ikp-1
+            zreflect = 1._rb / (1._rb - prupd(ikp) * prefd(iplon,ikx,ig))
+            prup(ikx) = pref(iplon,ikx,ig) + (ptrad(iplon,ikx,ig) * &
+                      ((ptra(iplon,ikx,ig) - pdbt(iplon,ikx,ig)) * prupd(ikp) + &
+                        pdbt(iplon,ikx,ig) * prup(ikp))) * zreflect
+            prupd(ikx) = prefd(iplon,ikx,ig) + ptrad(iplon,ikx,ig) * ptrad(iplon,ikx,ig) * &
+                         prupd(ikp) * zreflect
+         ENDDO
+
+! Upper boundary conditions
+         ztdn(1) = 1._rb
+         prdnd(1) = 0._rb
+         ztdn(2) = ptra(iplon,1,ig)
+         prdnd(2) = prefd(iplon,1,ig)
+
+! Pass from top to bottom
+!$acc loop seq
+         DO jk = 2, klev
+            ikp = jk+1
+            zreflect = 1._rb / (1._rb - prefd(iplon,jk,ig) * prdnd(jk))
+            ztdn(ikp) = ptdbt(iplon,jk,ig) * ptra(iplon,jk,ig) + &
+                       (ptrad(iplon,jk,ig) * ((ztdn(jk) - ptdbt(iplon,jk,ig)) + &
+                        ptdbt(iplon,jk,ig) * pref(iplon,jk,ig) * prdnd(jk))) * zreflect
+            prdnd(ikp) = prefd(iplon,jk,ig) + ptrad(iplon,jk,ig) * ptrad(iplon,jk,ig) * &
+                         prdnd(jk) * zreflect
+         ENDDO
+
+! Up and down-welling fluxes at levels
+!$acc loop seq
+         DO jk = 1, klev+1
+            zreflect = 1._rb / (1._rb - prdnd(jk) * prupd(jk))
+            pfu(iplon,jk,ig) = (ptdbt(iplon,jk,ig) * prup(jk) + &
+                         (ztdn(jk) - ptdbt(iplon,jk,ig)) * prupd(jk)) * zreflect
+            pfd(iplon,jk,ig) = ptdbt(iplon,jk,ig) + (ztdn(jk) - ptdbt(iplon,jk,ig) + &
+                         ptdbt(iplon,jk,ig) * prup(jk) * prdnd(jk)) * zreflect
+         ENDDO
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE vrtqdr_sw_gpu
+
+      END MODULE rrtmg_sw_vrtqdr_gpu
+#endif
+
 !     path:      $Source: /cvsroot/NWP/WRFV3/phys/module_ra_rrtmg_sw.F,v $
 !     author:    $Author: trn $
 !     revision:  $Revision: 1.3 $
@@ -10870,6 +11148,532 @@
       end subroutine spcvmc_sw
 
       end module rrtmg_sw_spcvmc
+
+#ifdef WRF_GPU_RAD
+! ncol-batched OpenACC port of rrtmg_sw_spcvmc's spcvmc_sw -- the SW
+! two-stream adding-doubling spectral loop that turns per-g-point gaseous
+! optical depths (from taumol_sw_driver_gpu) plus cloud/aerosol optical
+! properties into broadband/UV/near-IR fluxes.
+!
+! Structural notes (see also reftra_sw_gpu/vrtqdr_sw_gpu above):
+! - WRF's only call shape has istart=jpb1(16), iend=jpb2(29), icpr=1 (always,
+!   by the time spcvmc_sw is called -- cldprmc_sw has already run) and
+!   iout=0 (so the g-point counter iw simply runs 1..ngptsw with no
+!   mid-loop reset). This lets the original nested band/g-point loop
+!   (jb=16..29, jg=1..ngc(ibm)) flatten to a single ig=1..ngptsw loop using
+!   rrsw_wvn's ngb(ig) band lookup, exactly like LW's rtrnmc_gpu uses
+!   ngb(igc). The icpr==0 branch (cloud properties not delta-scaled) is
+!   dead for WRF's call shape and is not ported, matching the
+!   layswtch/laylow omission precedent in setcoef_sw_gpu.
+! - Per-layer optical-property assembly (clear/total-sky tau/omega/g,
+!   pre-delta-scaling direct-beam factors) is purely elementwise in
+!   (column, layer, g-point) -- no recurrence -- so it is one collapse(3)
+!   kernel (spcvmc_sw_prep_gpu).
+! - The pre-delta-scaling cumulative direct-beam transmittance
+!   (ztdbt_nodel/ztdbtc_nodel) and, later, the post-delta-scaling cumulative
+!   direct-beam transmittance (ztdbt/ztdbtc) are each a genuine top-down
+!   running-product recurrence over layers, independent per (column,
+!   g-point) -- same category as laysolfr/laytrop's scan kernels, done here
+!   with `!$acc loop seq` per (column,g-point) since the recurrence itself
+!   (not just a search) must execute in order.
+! - reftra_sw_gpu (elementwise) and vrtqdr_sw_gpu (genuine recurrence) are
+!   reused directly with the g-point axis threaded through, rather than
+!   re-inlining their logic here.
+! - The final level loop atomic-accumulates each g-point's weighted
+!   contribution into the shared per-(column,level) flux arrays, exactly
+!   like rtrnmc_gpu's urad/drad atomic-update accumulation -- valid because
+!   the underlying math is a plain sum over g-points weighted by
+!   adjflux*sfluxzen*prmu0.
+      MODULE rrtmg_sw_spcvmc_gpu
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrsw, only : nbndsw, ngptsw, jpband
+      use rrsw_tbl, only : tblint, bpade, od_lo, exp_tbl
+      use rrtmg_sw_reftra_gpu, only : reftra_sw_gpu
+      use rrtmg_sw_vrtqdr_gpu, only : vrtqdr_sw_gpu
+
+      IMPLICIT NONE
+
+      CONTAINS
+
+      SUBROUTINE spcvmc_sw_zero_gpu(ncol, nlayers, &
+                        pbbfd, pbbfu, pbbcd, pbbcu, puvfd, puvcd, pnifd, pnicd, &
+                        pbbfddir, pbbcddir, puvfddir, puvcddir, pnifddir, pnicddir)
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers
+      REAL(kind=rb), INTENT(OUT) :: pbbfd(ncol,nlayers+1), pbbfu(ncol,nlayers+1)
+      REAL(kind=rb), INTENT(OUT) :: pbbcd(ncol,nlayers+1), pbbcu(ncol,nlayers+1)
+      REAL(kind=rb), INTENT(OUT) :: puvfd(ncol,nlayers+1), puvcd(ncol,nlayers+1)
+      REAL(kind=rb), INTENT(OUT) :: pnifd(ncol,nlayers+1), pnicd(ncol,nlayers+1)
+      REAL(kind=rb), INTENT(OUT) :: pbbfddir(ncol,nlayers+1), pbbcddir(ncol,nlayers+1)
+      REAL(kind=rb), INTENT(OUT) :: puvfddir(ncol,nlayers+1), puvcddir(ncol,nlayers+1)
+      REAL(kind=rb), INTENT(OUT) :: pnifddir(ncol,nlayers+1), pnicddir(ncol,nlayers+1)
+
+      INTEGER(kind=im) :: iplon, jk
+
+!$acc parallel loop collapse(2) &
+!$acc   present(pbbfd, pbbfu, pbbcd, pbbcu, puvfd, puvcd, pnifd, pnicd) &
+!$acc   present(pbbfddir, pbbcddir, puvfddir, puvcddir, pnifddir, pnicddir)
+      DO iplon = 1, ncol
+      DO jk = 1, nlayers+1
+         pbbcd(iplon,jk) = 0._rb
+         pbbcu(iplon,jk) = 0._rb
+         pbbfd(iplon,jk) = 0._rb
+         pbbfu(iplon,jk) = 0._rb
+         pbbcddir(iplon,jk) = 0._rb
+         pbbfddir(iplon,jk) = 0._rb
+         puvcd(iplon,jk) = 0._rb
+         puvfd(iplon,jk) = 0._rb
+         puvcddir(iplon,jk) = 0._rb
+         puvfddir(iplon,jk) = 0._rb
+         pnicd(iplon,jk) = 0._rb
+         pnifd(iplon,jk) = 0._rb
+         pnicddir(iplon,jk) = 0._rb
+         pnifddir(iplon,jk) = 0._rb
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE spcvmc_sw_zero_gpu
+
+! Elementwise per-(column,layer,g-point) assembly of clear/total-sky
+! two-stream inputs, plus the pre-delta-scaling direct-beam factors. Also
+! sets the surface (layer nlayers+1) boundary reflectance/transmittance,
+! which is identical for the clear and total-sky branches (both simply take
+! the surface albedo).
+      SUBROUTINE spcvmc_sw_prep_gpu(ncol, nlayers, palbd, palbp, &
+                        pcldfmc, ptaucmc, pasycmc, pomgcmc, ptaormc, &
+                        ptaua, pasya, pomga, prmu0, zsflxzen, ztaug, ztaur, &
+                        lrtchkcld, zgcc, zomcc, ztauc, zgco, zomco, ztauo, &
+                        zdbtc_nodel, zdbt_nodel, &
+                        zrefc, zrefdc, ztrac, ztradc, zrefo, zrefdo, ztrao, ztrado)
+
+      use rrsw_wvn, only : ngb
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers
+      REAL(kind=rb), INTENT(IN) :: palbd(ncol,nbndsw), palbp(ncol,nbndsw)
+      REAL(kind=rb), INTENT(IN) :: pcldfmc(ncol,nlayers,ngptsw), ptaucmc(ncol,nlayers,ngptsw)
+      REAL(kind=rb), INTENT(IN) :: pasycmc(ncol,nlayers,ngptsw), pomgcmc(ncol,nlayers,ngptsw)
+      REAL(kind=rb), INTENT(IN) :: ptaormc(ncol,nlayers,ngptsw)
+      REAL(kind=rb), INTENT(IN) :: ptaua(ncol,nlayers,nbndsw), pasya(ncol,nlayers,nbndsw), pomga(ncol,nlayers,nbndsw)
+      REAL(kind=rb), INTENT(IN) :: prmu0(ncol)
+      REAL(kind=rb), INTENT(IN) :: zsflxzen(ncol,ngptsw)
+      REAL(kind=rb), INTENT(IN) :: ztaug(ncol,nlayers,ngptsw), ztaur(ncol,nlayers,ngptsw)
+      LOGICAL, INTENT(OUT) :: lrtchkcld(ncol,nlayers,ngptsw)
+      REAL(kind=rb), INTENT(OUT) :: zgcc(ncol,nlayers,ngptsw), zomcc(ncol,nlayers,ngptsw), ztauc(ncol,nlayers,ngptsw)
+      REAL(kind=rb), INTENT(OUT) :: zgco(ncol,nlayers,ngptsw), zomco(ncol,nlayers,ngptsw), ztauo(ncol,nlayers,ngptsw)
+      REAL(kind=rb), INTENT(OUT) :: zdbtc_nodel(ncol,nlayers+1,ngptsw), zdbt_nodel(ncol,nlayers+1,ngptsw)
+      REAL(kind=rb), INTENT(OUT) :: zrefc(ncol,nlayers+1,ngptsw), zrefdc(ncol,nlayers+1,ngptsw)
+      REAL(kind=rb), INTENT(OUT) :: ztrac(ncol,nlayers+1,ngptsw), ztradc(ncol,nlayers+1,ngptsw)
+      REAL(kind=rb), INTENT(OUT) :: zrefo(ncol,nlayers+1,ngptsw), zrefdo(ncol,nlayers+1,ngptsw)
+      REAL(kind=rb), INTENT(OUT) :: ztrao(ncol,nlayers+1,ngptsw), ztrado(ncol,nlayers+1,ngptsw)
+
+      INTEGER(kind=im) :: iplon, jk, ig, ikl, ibm, itind
+      REAL(kind=rb) :: zclear, zcloud, zf, zwf, ze1, zdbtmc, zdbtmo, tauorig, tblind
+      REAL(kind=rb), PARAMETER :: repclc = 1.e-12_rb
+
+!$acc parallel loop collapse(3) &
+!$acc   private(ikl, ibm, itind, zclear, zcloud, zf, zwf, ze1, zdbtmc, zdbtmo, tauorig, tblind) &
+!$acc   present(palbd, palbp, pcldfmc, ptaucmc, pasycmc, pomgcmc, ptaormc) &
+!$acc   present(ptaua, pasya, pomga, prmu0, ztaug, ztaur) &
+!$acc   present(lrtchkcld, zgcc, zomcc, ztauc, zgco, zomco, ztauo) &
+!$acc   present(zdbtc_nodel, zdbt_nodel, exp_tbl, ngb)
+      DO ig = 1, ngptsw
+      DO jk = 1, nlayers
+      DO iplon = 1, ncol
+         ibm = ngb(ig) - 15
+         ikl = nlayers+1-jk
+
+         lrtchkcld(iplon,jk,ig) = (pcldfmc(iplon,ikl,ig) .gt. repclc)
+
+         ztauc(iplon,jk,ig) = ztaur(iplon,ikl,ig) + ztaug(iplon,ikl,ig) + ptaua(iplon,ikl,ibm)
+         zomcc(iplon,jk,ig) = ztaur(iplon,ikl,ig) + ptaua(iplon,ikl,ibm) * pomga(iplon,ikl,ibm)
+         zgcc(iplon,jk,ig) = pasya(iplon,ikl,ibm) * pomga(iplon,ikl,ibm) * ptaua(iplon,ikl,ibm) / zomcc(iplon,jk,ig)
+         zomcc(iplon,jk,ig) = zomcc(iplon,jk,ig) / ztauc(iplon,jk,ig)
+
+         zclear = 1.0_rb - pcldfmc(iplon,ikl,ig)
+         zcloud = pcldfmc(iplon,ikl,ig)
+
+         ze1 = ztauc(iplon,jk,ig) / prmu0(iplon)
+         IF (ze1 .le. od_lo) THEN
+            zdbtmc = 1._rb - ze1 + 0.5_rb * ze1 * ze1
+         ELSE
+            tblind = ze1 / (bpade + ze1)
+            itind = tblint * tblind + 0.5_rb
+            zdbtmc = exp_tbl(itind)
+         ENDIF
+
+         tauorig = ztauc(iplon,jk,ig) + ptaormc(iplon,ikl,ig)
+         ze1 = tauorig / prmu0(iplon)
+         IF (ze1 .le. od_lo) THEN
+            zdbtmo = 1._rb - ze1 + 0.5_rb * ze1 * ze1
+         ELSE
+            tblind = ze1 / (bpade + ze1)
+            itind = tblint * tblind + 0.5_rb
+            zdbtmo = exp_tbl(itind)
+         ENDIF
+
+         zdbtc_nodel(iplon,jk,ig) = zdbtmc
+         zdbt_nodel(iplon,jk,ig) = zclear*zdbtmc + zcloud*zdbtmo
+
+! Delta scaling - clear
+         zf = zgcc(iplon,jk,ig) * zgcc(iplon,jk,ig)
+         zwf = zomcc(iplon,jk,ig) * zf
+         ztauc(iplon,jk,ig) = (1.0_rb - zwf) * ztauc(iplon,jk,ig)
+         zomcc(iplon,jk,ig) = (zomcc(iplon,jk,ig) - zwf) / (1.0_rb - zwf)
+         zgcc(iplon,jk,ig) = (zgcc(iplon,jk,ig) - zf) / (1.0_rb - zf)
+
+! Total sky optical parameters (icpr=1 always for WRF's call shape: cloud
+! properties already delta-scaled by cldprmc_sw)
+         ztauo(iplon,jk,ig) = ztauc(iplon,jk,ig) + ptaucmc(iplon,ikl,ig)
+         zomco(iplon,jk,ig) = ztauc(iplon,jk,ig) * zomcc(iplon,jk,ig) + ptaucmc(iplon,ikl,ig) * pomgcmc(iplon,ikl,ig)
+         zgco(iplon,jk,ig) = (ptaucmc(iplon,ikl,ig) * pomgcmc(iplon,ikl,ig) * pasycmc(iplon,ikl,ig) + &
+                              ztauc(iplon,jk,ig) * zomcc(iplon,jk,ig) * zgcc(iplon,jk,ig)) / zomco(iplon,jk,ig)
+         zomco(iplon,jk,ig) = zomco(iplon,jk,ig) / ztauo(iplon,jk,ig)
+      ENDDO
+      ENDDO
+      ENDDO
+
+!$acc parallel loop collapse(2) private(ibm) &
+!$acc   present(palbd, palbp, zrefc, zrefdc, ztrac, ztradc, zrefo, zrefdo, ztrao, ztrado, ngb)
+      DO ig = 1, ngptsw
+      DO iplon = 1, ncol
+         ibm = ngb(ig) - 15
+         zrefc(iplon,nlayers+1,ig) = palbp(iplon,ibm)
+         zrefdc(iplon,nlayers+1,ig) = palbd(iplon,ibm)
+         ztrac(iplon,nlayers+1,ig) = 0._rb
+         ztradc(iplon,nlayers+1,ig) = 0._rb
+         zrefo(iplon,nlayers+1,ig) = palbp(iplon,ibm)
+         zrefdo(iplon,nlayers+1,ig) = palbd(iplon,ibm)
+         ztrao(iplon,nlayers+1,ig) = 0._rb
+         ztrado(iplon,nlayers+1,ig) = 0._rb
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE spcvmc_sw_prep_gpu
+
+! Top-down cumulative-product recurrence, independent per (column,
+! g-point): pxdbt_nodel(1)=1, pxdbt_nodel(jk+1)=pxdbt(jk)*pxdbt_nodel(jk).
+! Used both for the pre-delta-scaling direct-beam transmittance
+! (zdbt_nodel/zdbtc_nodel -> ztdbt_nodel/ztdbtc_nodel) and, after reftra's
+! combine step, for the post-delta-scaling one (zdbt/zdbtc -> ztdbt/ztdbtc).
+      SUBROUTINE spcvmc_sw_cumprod_gpu(ncol, nlayers, pxdbtc, pxdbt, ptdbtc, ptdbt)
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers
+      REAL(kind=rb), INTENT(IN) :: pxdbtc(ncol,nlayers+1,ngptsw), pxdbt(ncol,nlayers+1,ngptsw)
+      REAL(kind=rb), INTENT(OUT) :: ptdbtc(ncol,nlayers+1,ngptsw), ptdbt(ncol,nlayers+1,ngptsw)
+
+      INTEGER(kind=im) :: iplon, ig, jk
+
+!$acc parallel loop collapse(2) present(pxdbtc, pxdbt, ptdbtc, ptdbt)
+      DO ig = 1, ngptsw
+      DO iplon = 1, ncol
+         ptdbtc(iplon,1,ig) = 1.0_rb
+         ptdbt(iplon,1,ig) = 1.0_rb
+!$acc loop seq
+         DO jk = 1, nlayers
+            ptdbtc(iplon,jk+1,ig) = pxdbtc(iplon,jk,ig) * ptdbtc(iplon,jk,ig)
+            ptdbt(iplon,jk+1,ig) = pxdbt(iplon,jk,ig) * ptdbt(iplon,jk,ig)
+         ENDDO
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE spcvmc_sw_cumprod_gpu
+
+! Combine clear/cloudy reftra output into total-sky reflectance/
+! transmittance (elementwise per layer), and compute the post-delta-scaling
+! layer-mean direct-beam transmittance (zdbtc/zdbt, again elementwise --
+! the cumulative product itself is done separately by
+! spcvmc_sw_cumprod_gpu).
+      SUBROUTINE spcvmc_sw_combine_gpu(ncol, nlayers, pcldfmc, ztauc, ztauo, prmu0, palbd, palbp, &
+                        zrefc, zrefdc, ztrac, ztradc, zrefo, zrefdo, ztrao, ztrado, &
+                        zref, zrefd, ztra, ztrad, zdbtc, zdbt)
+
+      use rrsw_wvn, only : ngb
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers
+      REAL(kind=rb), INTENT(IN) :: pcldfmc(ncol,nlayers,ngptsw)
+      REAL(kind=rb), INTENT(IN) :: ztauc(ncol,nlayers,ngptsw), ztauo(ncol,nlayers,ngptsw)
+      REAL(kind=rb), INTENT(IN) :: prmu0(ncol)
+      REAL(kind=rb), INTENT(IN) :: palbd(ncol,nbndsw), palbp(ncol,nbndsw)
+      REAL(kind=rb), INTENT(IN) :: zrefc(ncol,nlayers+1,ngptsw), zrefdc(ncol,nlayers+1,ngptsw)
+      REAL(kind=rb), INTENT(IN) :: ztrac(ncol,nlayers+1,ngptsw), ztradc(ncol,nlayers+1,ngptsw)
+      REAL(kind=rb), INTENT(IN) :: zrefo(ncol,nlayers+1,ngptsw), zrefdo(ncol,nlayers+1,ngptsw)
+      REAL(kind=rb), INTENT(IN) :: ztrao(ncol,nlayers+1,ngptsw), ztrado(ncol,nlayers+1,ngptsw)
+      REAL(kind=rb), INTENT(OUT) :: zref(ncol,nlayers+1,ngptsw), zrefd(ncol,nlayers+1,ngptsw)
+      REAL(kind=rb), INTENT(OUT) :: ztra(ncol,nlayers+1,ngptsw), ztrad(ncol,nlayers+1,ngptsw)
+      REAL(kind=rb), INTENT(OUT) :: zdbtc(ncol,nlayers+1,ngptsw), zdbt(ncol,nlayers+1,ngptsw)
+
+      INTEGER(kind=im) :: iplon, jk, ig, itind, ig_band
+      REAL(kind=rb) :: zclear, zcloud, ze1, zdbtmc, zdbtmo, tblind
+
+!$acc parallel loop collapse(3) &
+!$acc   private(itind, zclear, zcloud, ze1, zdbtmc, zdbtmo, tblind) &
+!$acc   present(pcldfmc, ztauc, ztauo, prmu0, zrefc, zrefdc, ztrac, ztradc) &
+!$acc   present(zrefo, zrefdo, ztrao, ztrado, zref, zrefd, ztra, ztrad) &
+!$acc   present(zdbtc, zdbt, exp_tbl)
+      DO ig = 1, ngptsw
+      DO jk = 1, nlayers
+      DO iplon = 1, ncol
+         zclear = 1.0_rb - pcldfmc(iplon,nlayers+1-jk,ig)
+         zcloud = pcldfmc(iplon,nlayers+1-jk,ig)
+
+         zref(iplon,jk,ig) = zclear*zrefc(iplon,jk,ig) + zcloud*zrefo(iplon,jk,ig)
+         zrefd(iplon,jk,ig) = zclear*zrefdc(iplon,jk,ig) + zcloud*zrefdo(iplon,jk,ig)
+         ztra(iplon,jk,ig) = zclear*ztrac(iplon,jk,ig) + zcloud*ztrao(iplon,jk,ig)
+         ztrad(iplon,jk,ig) = zclear*ztradc(iplon,jk,ig) + zcloud*ztrado(iplon,jk,ig)
+
+         ze1 = ztauc(iplon,jk,ig) / prmu0(iplon)
+         IF (ze1 .le. od_lo) THEN
+            zdbtmc = 1._rb - ze1 + 0.5_rb * ze1 * ze1
+         ELSE
+            tblind = ze1 / (bpade + ze1)
+            itind = tblint * tblind + 0.5_rb
+            zdbtmc = exp_tbl(itind)
+         ENDIF
+         zdbtc(iplon,jk,ig) = zdbtmc
+
+         ze1 = ztauo(iplon,jk,ig) / prmu0(iplon)
+         IF (ze1 .le. od_lo) THEN
+            zdbtmo = 1._rb - ze1 + 0.5_rb * ze1 * ze1
+         ELSE
+            tblind = ze1 / (bpade + ze1)
+            itind = tblint * tblind + 0.5_rb
+            zdbtmo = exp_tbl(itind)
+         ENDIF
+         zdbt(iplon,jk,ig) = zclear*zdbtmc + zcloud*zdbtmo
+      ENDDO
+      ENDDO
+      ENDDO
+
+! Total-sky surface boundary: matches the clear-sky boundary exactly (both
+! are simply the surface albedo -- see spcvmc_sw's zref(klev+1)=palbp(ibm)
+! etc., set directly and NOT as a clear/cloud-weighted combination).
+!$acc parallel loop collapse(2) private(ig_band) present(palbd, palbp, zref, zrefd, ztra, ztrad, ngb)
+      DO ig = 1, ngptsw
+      DO iplon = 1, ncol
+         ig_band = ngb(ig) - 15
+         zref(iplon,nlayers+1,ig) = palbp(iplon,ig_band)
+         zrefd(iplon,nlayers+1,ig) = palbd(iplon,ig_band)
+         ztra(iplon,nlayers+1,ig) = 0._rb
+         ztrad(iplon,nlayers+1,ig) = 0._rb
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE spcvmc_sw_combine_gpu
+
+! Final level loop: atomic-accumulates each g-point's weighted contribution
+! (zincflx = adjflux(jb)*zsflxzen(ig)*prmu0) into the shared per-(column,
+! level) broadband/UV/near-IR flux arrays. Independent per (column,
+! g-point) pair except for this shared-accumulator write, exactly like
+! rtrnmc_gpu's urad/drad atomic-update accumulation.
+      SUBROUTINE spcvmc_sw_accumulate_gpu(ncol, nlayers, adjflux, prmu0, zsflxzen, &
+                        zcd, zcu, zfd, zfu, ztdbtc_nodel, ztdbt_nodel, &
+                        pbbfd, pbbfu, pbbcd, pbbcu, puvfd, puvcd, pnifd, pnicd, &
+                        pbbfddir, pbbcddir, puvfddir, puvcddir, pnifddir, pnicddir)
+
+      use rrsw_wvn, only : ngb
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers
+      REAL(kind=rb), INTENT(IN) :: adjflux(ncol,jpband)
+      REAL(kind=rb), INTENT(IN) :: prmu0(ncol)
+      REAL(kind=rb), INTENT(IN) :: zsflxzen(ncol,ngptsw)
+      REAL(kind=rb), INTENT(IN) :: zcd(ncol,nlayers+1,ngptsw), zcu(ncol,nlayers+1,ngptsw)
+      REAL(kind=rb), INTENT(IN) :: zfd(ncol,nlayers+1,ngptsw), zfu(ncol,nlayers+1,ngptsw)
+      REAL(kind=rb), INTENT(IN) :: ztdbtc_nodel(ncol,nlayers+1,ngptsw), ztdbt_nodel(ncol,nlayers+1,ngptsw)
+      REAL(kind=rb), INTENT(INOUT) :: pbbfd(ncol,nlayers+1), pbbfu(ncol,nlayers+1)
+      REAL(kind=rb), INTENT(INOUT) :: pbbcd(ncol,nlayers+1), pbbcu(ncol,nlayers+1)
+      REAL(kind=rb), INTENT(INOUT) :: puvfd(ncol,nlayers+1), puvcd(ncol,nlayers+1)
+      REAL(kind=rb), INTENT(INOUT) :: pnifd(ncol,nlayers+1), pnicd(ncol,nlayers+1)
+      REAL(kind=rb), INTENT(INOUT) :: pbbfddir(ncol,nlayers+1), pbbcddir(ncol,nlayers+1)
+      REAL(kind=rb), INTENT(INOUT) :: puvfddir(ncol,nlayers+1), puvcddir(ncol,nlayers+1)
+      REAL(kind=rb), INTENT(INOUT) :: pnifddir(ncol,nlayers+1), pnicddir(ncol,nlayers+1)
+
+      INTEGER(kind=im) :: iplon, ig, jk, ikl, ibm, jb
+      REAL(kind=rb) :: zincflx
+
+!$acc parallel loop collapse(2) private(ibm, jb, zincflx, ikl) &
+!$acc   present(adjflux, prmu0, zsflxzen, zcd, zcu, zfd, zfu, ztdbtc_nodel, ztdbt_nodel) &
+!$acc   present(pbbfd, pbbfu, pbbcd, pbbcu, puvfd, puvcd, pnifd, pnicd) &
+!$acc   present(pbbfddir, pbbcddir, puvfddir, puvcddir, pnifddir, pnicddir, ngb)
+      DO ig = 1, ngptsw
+      DO iplon = 1, ncol
+         jb = ngb(ig)
+         ibm = jb - 15
+         zincflx = adjflux(iplon,jb) * zsflxzen(iplon,ig) * prmu0(iplon)
+!$acc loop seq
+         DO jk = 1, nlayers+1
+            ikl = nlayers+2-jk
+!$acc atomic update
+            pbbfu(iplon,ikl) = pbbfu(iplon,ikl) + zincflx*zfu(iplon,jk,ig)
+!$acc atomic update
+            pbbfd(iplon,ikl) = pbbfd(iplon,ikl) + zincflx*zfd(iplon,jk,ig)
+!$acc atomic update
+            pbbcu(iplon,ikl) = pbbcu(iplon,ikl) + zincflx*zcu(iplon,jk,ig)
+!$acc atomic update
+            pbbcd(iplon,ikl) = pbbcd(iplon,ikl) + zincflx*zcd(iplon,jk,ig)
+!$acc atomic update
+            pbbfddir(iplon,ikl) = pbbfddir(iplon,ikl) + zincflx*ztdbt_nodel(iplon,jk,ig)
+!$acc atomic update
+            pbbcddir(iplon,ikl) = pbbcddir(iplon,ikl) + zincflx*ztdbtc_nodel(iplon,jk,ig)
+
+            IF (ibm .ge. 10 .and. ibm .le. 13) THEN
+!$acc atomic update
+               puvcd(iplon,ikl) = puvcd(iplon,ikl) + zincflx*zcd(iplon,jk,ig)
+!$acc atomic update
+               puvfd(iplon,ikl) = puvfd(iplon,ikl) + zincflx*zfd(iplon,jk,ig)
+!$acc atomic update
+               puvcddir(iplon,ikl) = puvcddir(iplon,ikl) + zincflx*ztdbtc_nodel(iplon,jk,ig)
+!$acc atomic update
+               puvfddir(iplon,ikl) = puvfddir(iplon,ikl) + zincflx*ztdbt_nodel(iplon,jk,ig)
+            ELSE IF (ibm .eq. 14 .or. ibm .le. 9) THEN
+!$acc atomic update
+               pnicd(iplon,ikl) = pnicd(iplon,ikl) + zincflx*zcd(iplon,jk,ig)
+!$acc atomic update
+               pnifd(iplon,ikl) = pnifd(iplon,ikl) + zincflx*zfd(iplon,jk,ig)
+!$acc atomic update
+               pnicddir(iplon,ikl) = pnicddir(iplon,ikl) + zincflx*ztdbtc_nodel(iplon,jk,ig)
+!$acc atomic update
+               pnifddir(iplon,ikl) = pnifddir(iplon,ikl) + zincflx*ztdbt_nodel(iplon,jk,ig)
+            ENDIF
+         ENDDO
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE spcvmc_sw_accumulate_gpu
+
+! Single entry point bundling the whole spectral loop, mirroring
+! taumol_sw_driver_gpu/rtrnmc_driver_gpu's bundling convention. Takes
+! zsflxzen/ztaug/ztaur as already computed by taumol_sw_driver_gpu (the
+! gaseous-optics stage is a separate, already-verified port stage -- see
+! module header comment). Allocates and device-creates all per-(column,
+! layer,g-point) scratch, runs the kernel sequence, then tears it down.
+      SUBROUTINE spcvmc_sw_driver_gpu(ncol, nlayers, palbd, palbp, &
+                        pcldfmc, ptaucmc, pasycmc, pomgcmc, ptaormc, &
+                        ptaua, pasya, pomga, prmu0, adjflux, &
+                        zsflxzen, ztaug, ztaur, &
+                        pbbfd, pbbfu, pbbcd, pbbcu, puvfd, puvcd, pnifd, pnicd, &
+                        pbbfddir, pbbcddir, puvfddir, puvcddir, pnifddir, pnicddir)
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers
+      REAL(kind=rb), INTENT(IN) :: palbd(ncol,nbndsw), palbp(ncol,nbndsw)
+      REAL(kind=rb), INTENT(IN) :: pcldfmc(ncol,nlayers,ngptsw), ptaucmc(ncol,nlayers,ngptsw)
+      REAL(kind=rb), INTENT(IN) :: pasycmc(ncol,nlayers,ngptsw), pomgcmc(ncol,nlayers,ngptsw)
+      REAL(kind=rb), INTENT(IN) :: ptaormc(ncol,nlayers,ngptsw)
+      REAL(kind=rb), INTENT(IN) :: ptaua(ncol,nlayers,nbndsw), pasya(ncol,nlayers,nbndsw), pomga(ncol,nlayers,nbndsw)
+      REAL(kind=rb), INTENT(IN) :: prmu0(ncol)
+      REAL(kind=rb), INTENT(IN) :: adjflux(ncol,jpband)
+      REAL(kind=rb), INTENT(IN) :: zsflxzen(ncol,ngptsw)
+      REAL(kind=rb), INTENT(IN) :: ztaug(ncol,nlayers,ngptsw), ztaur(ncol,nlayers,ngptsw)
+      REAL(kind=rb), INTENT(OUT) :: pbbfd(ncol,nlayers+1), pbbfu(ncol,nlayers+1)
+      REAL(kind=rb), INTENT(OUT) :: pbbcd(ncol,nlayers+1), pbbcu(ncol,nlayers+1)
+      REAL(kind=rb), INTENT(OUT) :: puvfd(ncol,nlayers+1), puvcd(ncol,nlayers+1)
+      REAL(kind=rb), INTENT(OUT) :: pnifd(ncol,nlayers+1), pnicd(ncol,nlayers+1)
+      REAL(kind=rb), INTENT(OUT) :: pbbfddir(ncol,nlayers+1), pbbcddir(ncol,nlayers+1)
+      REAL(kind=rb), INTENT(OUT) :: puvfddir(ncol,nlayers+1), puvcddir(ncol,nlayers+1)
+      REAL(kind=rb), INTENT(OUT) :: pnifddir(ncol,nlayers+1), pnicddir(ncol,nlayers+1)
+
+      LOGICAL, ALLOCATABLE :: lrtchkclr(:,:,:), lrtchkcld(:,:,:)
+      REAL(kind=rb), ALLOCATABLE :: zgcc(:,:,:), zomcc(:,:,:), ztauc(:,:,:)
+      REAL(kind=rb), ALLOCATABLE :: zgco(:,:,:), zomco(:,:,:), ztauo(:,:,:)
+      REAL(kind=rb), ALLOCATABLE :: zdbtc_nodel(:,:,:), zdbt_nodel(:,:,:)
+      REAL(kind=rb), ALLOCATABLE :: ztdbtc_nodel(:,:,:), ztdbt_nodel(:,:,:)
+      REAL(kind=rb), ALLOCATABLE :: zrefc(:,:,:), zrefdc(:,:,:), ztrac(:,:,:), ztradc(:,:,:)
+      REAL(kind=rb), ALLOCATABLE :: zrefo(:,:,:), zrefdo(:,:,:), ztrao(:,:,:), ztrado(:,:,:)
+      REAL(kind=rb), ALLOCATABLE :: zref(:,:,:), zrefd(:,:,:), ztra(:,:,:), ztrad(:,:,:)
+      REAL(kind=rb), ALLOCATABLE :: zdbtc(:,:,:), zdbt(:,:,:)
+      REAL(kind=rb), ALLOCATABLE :: ztdbtc(:,:,:), ztdbt(:,:,:)
+      REAL(kind=rb), ALLOCATABLE :: zcd(:,:,:), zcu(:,:,:), zfd(:,:,:), zfu(:,:,:)
+      INTEGER(kind=im) :: iplon, jk, ig
+
+      ALLOCATE(lrtchkclr(ncol,nlayers,ngptsw), lrtchkcld(ncol,nlayers,ngptsw))
+      ALLOCATE(zgcc(ncol,nlayers,ngptsw), zomcc(ncol,nlayers,ngptsw), ztauc(ncol,nlayers,ngptsw))
+      ALLOCATE(zgco(ncol,nlayers,ngptsw), zomco(ncol,nlayers,ngptsw), ztauo(ncol,nlayers,ngptsw))
+      ALLOCATE(zdbtc_nodel(ncol,nlayers+1,ngptsw), zdbt_nodel(ncol,nlayers+1,ngptsw))
+      ALLOCATE(ztdbtc_nodel(ncol,nlayers+1,ngptsw), ztdbt_nodel(ncol,nlayers+1,ngptsw))
+      ALLOCATE(zrefc(ncol,nlayers+1,ngptsw), zrefdc(ncol,nlayers+1,ngptsw))
+      ALLOCATE(ztrac(ncol,nlayers+1,ngptsw), ztradc(ncol,nlayers+1,ngptsw))
+      ALLOCATE(zrefo(ncol,nlayers+1,ngptsw), zrefdo(ncol,nlayers+1,ngptsw))
+      ALLOCATE(ztrao(ncol,nlayers+1,ngptsw), ztrado(ncol,nlayers+1,ngptsw))
+      ALLOCATE(zref(ncol,nlayers+1,ngptsw), zrefd(ncol,nlayers+1,ngptsw))
+      ALLOCATE(ztra(ncol,nlayers+1,ngptsw), ztrad(ncol,nlayers+1,ngptsw))
+      ALLOCATE(zdbtc(ncol,nlayers+1,ngptsw), zdbt(ncol,nlayers+1,ngptsw))
+      ALLOCATE(ztdbtc(ncol,nlayers+1,ngptsw), ztdbt(ncol,nlayers+1,ngptsw))
+      ALLOCATE(zcd(ncol,nlayers+1,ngptsw), zcu(ncol,nlayers+1,ngptsw))
+      ALLOCATE(zfd(ncol,nlayers+1,ngptsw), zfu(ncol,nlayers+1,ngptsw))
+
+!$acc enter data create(lrtchkclr, lrtchkcld, zgcc, zomcc, ztauc, zgco, zomco, ztauo) &
+!$acc   create(zdbtc_nodel, zdbt_nodel, ztdbtc_nodel, ztdbt_nodel) &
+!$acc   create(zrefc, zrefdc, ztrac, ztradc, zrefo, zrefdo, ztrao, ztrado) &
+!$acc   create(zref, zrefd, ztra, ztrad, zdbtc, zdbt, ztdbtc, ztdbt) &
+!$acc   create(zcd, zcu, zfd, zfu)
+
+      CALL spcvmc_sw_zero_gpu(ncol, nlayers, &
+                pbbfd, pbbfu, pbbcd, pbbcu, puvfd, puvcd, pnifd, pnicd, &
+                pbbfddir, pbbcddir, puvfddir, puvcddir, pnifddir, pnicddir)
+
+      CALL spcvmc_sw_prep_gpu(ncol, nlayers, palbd, palbp, &
+                pcldfmc, ptaucmc, pasycmc, pomgcmc, ptaormc, &
+                ptaua, pasya, pomga, prmu0, zsflxzen, ztaug, ztaur, &
+                lrtchkcld, zgcc, zomcc, ztauc, zgco, zomco, ztauo, &
+                zdbtc_nodel, zdbt_nodel, &
+                zrefc, zrefdc, ztrac, ztradc, zrefo, zrefdo, ztrao, ztrado)
+
+      CALL spcvmc_sw_cumprod_gpu(ncol, nlayers, zdbtc_nodel, zdbt_nodel, ztdbtc_nodel, ztdbt_nodel)
+
+!$acc parallel loop collapse(3) present(lrtchkclr)
+      DO ig = 1, ngptsw
+      DO jk = 1, nlayers
+      DO iplon = 1, ncol
+         lrtchkclr(iplon,jk,ig) = .true.
+      ENDDO
+      ENDDO
+      ENDDO
+
+! Clear-sky reflectivities (reftra always computed for every clear layer)
+      CALL reftra_sw_gpu(ncol, nlayers, ngptsw, lrtchkclr, zgcc, prmu0, ztauc, zomcc, &
+                          zrefc, zrefdc, ztrac, ztradc)
+
+! Total-sky reflectivities (reftra only for the cloudy layers; the clear
+! layers were already handled above -- lrtchkcld gates this)
+      CALL reftra_sw_gpu(ncol, nlayers, ngptsw, lrtchkcld, zgco, prmu0, ztauo, zomco, &
+                          zrefo, zrefdo, ztrao, ztrado)
+
+      CALL spcvmc_sw_combine_gpu(ncol, nlayers, pcldfmc, ztauc, ztauo, prmu0, palbd, palbp, &
+                zrefc, zrefdc, ztrac, ztradc, zrefo, zrefdo, ztrao, ztrado, &
+                zref, zrefd, ztra, ztrad, zdbtc, zdbt)
+
+      CALL spcvmc_sw_cumprod_gpu(ncol, nlayers, zdbtc, zdbt, ztdbtc, ztdbt)
+
+      CALL vrtqdr_sw_gpu(ncol, nlayers, ngptsw, zrefc, zrefdc, ztrac, ztradc, zdbtc, ztdbtc, zcd, zcu)
+      CALL vrtqdr_sw_gpu(ncol, nlayers, ngptsw, zref, zrefd, ztra, ztrad, zdbt, ztdbt, zfd, zfu)
+
+      CALL spcvmc_sw_accumulate_gpu(ncol, nlayers, adjflux, prmu0, zsflxzen, &
+                zcd, zcu, zfd, zfu, ztdbtc_nodel, ztdbt_nodel, &
+                pbbfd, pbbfu, pbbcd, pbbcu, puvfd, puvcd, pnifd, pnicd, &
+                pbbfddir, pbbcddir, puvfddir, puvcddir, pnifddir, pnicddir)
+
+!$acc exit data delete(lrtchkclr, lrtchkcld, zgcc, zomcc, ztauc, zgco, zomco, ztauo) &
+!$acc   delete(zdbtc_nodel, zdbt_nodel, ztdbtc_nodel, ztdbt_nodel) &
+!$acc   delete(zrefc, zrefdc, ztrac, ztradc, zrefo, zrefdo, ztrao, ztrado) &
+!$acc   delete(zref, zrefd, ztra, ztrad, zdbtc, zdbt, ztdbtc, ztdbt) &
+!$acc   delete(zcd, zcu, zfd, zfu)
+
+      DEALLOCATE(lrtchkclr, lrtchkcld, zgcc, zomcc, ztauc, zgco, zomco, ztauo)
+      DEALLOCATE(zdbtc_nodel, zdbt_nodel, ztdbtc_nodel, ztdbt_nodel)
+      DEALLOCATE(zrefc, zrefdc, ztrac, ztradc, zrefo, zrefdo, ztrao, ztrado)
+      DEALLOCATE(zref, zrefd, ztra, ztrad, zdbtc, zdbt, ztdbtc, ztdbt)
+      DEALLOCATE(zcd, zcu, zfd, zfu)
+
+      END SUBROUTINE spcvmc_sw_driver_gpu
+
+      END MODULE rrtmg_sw_spcvmc_gpu
+#endif
 
 !     path:      $Source: /cvsroot/NWP/WRFV3/phys/module_ra_rrtmg_sw.F,v $
 !     author:    $Author: trn $
