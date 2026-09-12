@@ -268,37 +268,88 @@ addition, original CPU per-column path untouched) that:
      crashed on this" means "this input never occurs" — it may just mean
      the CPU's specific undefined-behavior outcome happened to be caught
      by a downstream clamp.
-  5. **Fix applied**: `gpu_flush_lw_chunk` now clamps any non-finite or
-     out-of-physical-range `play`/`plev`/`tlay`/`tlev`/`tsfc` to a nominal
-     value (1013.25 mb / 288 K) immediately before device dispatch, with
-     a permanent `wrf_message` warning (`WRF_GPU_RAD WARNING: non-physical
-     p/T at i=... j=...`) so the underlying issue stays visible rather
-     than silently disappearing. This does **not** fix the upstream NaN
-     bug — it only keeps this port from crashing on it, the same way the
-     CPU path was accidentally protected.
-  6. **Verified**: a full 10-minute real 1-rank run now reaches `SUCCESS
-     COMPLETE WRF` with no crash.
-  - **A much bigger finding surfaced by this same test, NOT fixed, and
-    outside this port's scope**: the warning fired for **15,625 of the
-    15,876 columns** in the domain over the 10-minute run — not an
-    isolated corner point. Combined with the `dpsdt`/`dmudt`
-    domain-average diagnostics growing from `NaN` at t=0 to huge
-    (thousands) and increasingly unstable values, and the model's adaptive
-    timestep visibly shrinking (25.0s → 19.0s) over the run, this looks
-    like **the simulation itself is going numerically unstable** across
-    nearly the whole domain, not a narrow edge case in one grid cell. This
-    predates (or is at least independent of) today's RRTMG-LW work — the
-    prior `dyn_em` OpenACC port's own verification (see "Prior work"
-    below) used these same `dpsdt`/`dmudt` diagnostics and found them
-    fine, so this is either a regression somewhere since then or a
-    genuine sensitivity of this exact case/config that was never exercised
-    long enough to show up before. **This has not been investigated and
-    is a real, separate, likely-serious correctness issue** — the
-    defensive clamp above only stops it from crashing RRTMG-GPU; it does
-    not mean the run's physics (on either the CPU or GPU radiation path)
-    is trustworthy while this is happening. Worth a dedicated
-    investigation before treating any output from this exact case as
-    meaningful, independent of the RRTMG GPU port's own correctness.
+  5. **First fix attempt (incomplete, caused a second real bug)**:
+     `gpu_flush_lw_chunk` clamped any non-finite/out-of-physical-range
+     `play`/`plev`/`tlay`/`tlev`/`tsfc` to a single nominal value
+     (1013.25 mb / 288 K) for every layer, immediately before device
+     dispatch, then still computed and wrote that column's heating rate
+     normally. This stopped the crash, but a 10-minute real run showed
+     `dpsdt`/`dmudt` growing from `NaN` at t=0 to huge (thousands) and
+     increasingly unstable values, with the model's adaptive timestep
+     visibly shrinking (25.0s → 19.0s), and the warning firing for an
+     ever-growing share of the domain (**15,625 of 15,876 columns** by the
+     end). This looked like it might be a separate, serious, pre-existing
+     instability — until a direct CPU-baseline comparison (same case,
+     `/mnt/nvme/wrf_hk_cpu_d01`, `run_minutes=10`) showed **no such
+     instability at all**: `dpsdt`/`dmudt` stayed finite and settled down
+     over the run. Rebuilding with `WRF_GPU_RAD` *undefined* (keeping
+     `WRF_GPU_DYN`, so radiation reverts to plain CPU `rrtmg_lw`) matched
+     the CPU baseline almost exactly too. **This proved the instability was
+     introduced by this session's RRTMG-LW GPU code, not a pre-existing
+     dyn_em issue** — don't take "the CPU path is fine" as proof a GPU
+     port hasn't regressed something; check the actual isolating
+     variable (here: build with the new macro on vs. off) rather than
+     assuming. The real mechanism, once found: clamping every layer of a
+     bad column to one nominal surface-like pressure/temperature and then
+     computing that column's LW heating rate as normal produces a heating
+     rate that is *finite but physically absurd* for any layer that isn't
+     actually near the surface (a real ~50 mb layer silently treated as
+     1013 mb has wildly wrong optical path and therefore wildly wrong
+     heating). That heating rate was still being written into
+     `RTHRATENLW`, feeding a real, physical, self-reinforcing bug: bad
+     heating → destabilized dynamics next step → more columns with
+     NaN pressure → more bad clamped heating → worse instability. Not
+     memory corruption at all, just wrong (but finite, so nothing crashed
+     on it) physics being genuinely fed back into the model.
+  6. **Actual fix**: added a per-column `gpu_bad(:)` flag, set alongside
+     the clamp. `gpu_flush_lw_chunk`'s unpack loop now `CYCLE`s a flagged
+     column entirely — `RTHRATENLW`/`GLW`/`OLR`/`LWCF`/etc. (all
+     `INTENT(INOUT)`) simply keep whatever value they already had, rather
+     than receiving a finite-but-wrong update. The clamp itself is still
+     applied first (so the device kernels never see a NaN and can't
+     propagate it through a per-column reduction like `pwvcm`), but its
+     result is now only used to keep that one flush's kernel launch
+     numerically well-behaved, never written back to the real output
+     arrays.
+  7. **Verified**: a full 10-minute real 1-rank run now reaches `SUCCESS
+     COMPLETE WRF`, with `dpsdt`/`dmudt` tracking the CPU baseline closely
+     throughout (e.g. final step 103.65/94.71 vs. baseline's 103.61/94.77)
+     — no instability, no crash. The warning still fires at the same scale
+     (125,000 lines / 15,625 columns over the run).
+  8. **The NaN-pressure condition itself is confirmed to be introduced by
+     `WRF_GPU_RAD`, not a pre-existing `dyn_em` artifact** — checked
+     directly rather than assumed. The same host-side finite/range check
+     was added temporarily to the CPU path (right before the `call
+     rrtmg_lw` this port's `#ifndef WRF_GPU_RAD` branch still contains) and
+     the identical `WRF_GPU_DYN`-only build (radiation on CPU, dynamics on
+     GPU, same 10-minute run) printed **zero** occurrences — `play`/`tlay`
+     were never non-physical there, at all. Since `play`/`tlay` are
+     computed by host-side setup code shared byte-for-byte between the CPU
+     and GPU radiation branches (only the final two calls differ), this
+     means enabling `WRF_GPU_RAD` is *itself* introducing the non-finite
+     pressure into shared state, not merely exposing a pre-existing one.
+     The most likely mechanism, not yet confirmed: `dyn_em`'s GPU-computed
+     pressure (`p8w`/`p3d`) is produced asynchronously on the device and
+     copied back to host before physics reads it; with `WRF_GPU_RAD` off,
+     RRTMG's radiation call is the *only* other thing that might contend
+     for the GPU, and it runs entirely on the host, so there's no
+     competing device work to expose a synchronization gap. With
+     `WRF_GPU_RAD` on, RRTMG's own kernels are now also active on the same
+     device, and if the host-side read of `p8w`/`p3d` isn't correctly
+     ordered after `dyn_em`'s copy-back completes (e.g. an implicit
+     ordering assumption that held when nothing else used the GPU, but
+     doesn't when a second, independently-developed GPU subsystem is also
+     issuing work), a stale/partial value could reach `RRTMG_LWRAD`. This
+     has **not been located or fixed** — it needs someone to look at the
+     actual data-dependency path from `dyn_em`'s device kernels through to
+     `p8w`/`p3d`'s host copy and confirm whether/where an `!$acc update
+     host`/`wait` is missing relative to the radiation call, in
+     `module_first_rk_step_part1.F`/`solve_em.F` or wherever that
+     boundary actually sits. Given the wrong-heating-rate feedback loop
+     this caused before the `gpu_bad` fix (see point 5 above), this is a
+     real correctness issue worth fixing properly, not just working around
+     — the current `gpu_bad` skip-on-bad-column behavior is a safety net
+     for *this port*, not a fix for the upstream synchronization bug.
 - **Chunk sizing is solved, device-independently**:
   `rrtmg_lw_gpu_chunksize(nlayers, max_ncol)` (module `rrtmg_lw_gpu_chunk`,
   commit `01df733b0`) queries the *actual running device's* free memory at
