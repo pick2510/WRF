@@ -17550,11 +17550,36 @@ CONTAINS
     ALLOCATE(gpu_rei(gpu_chunksize,nlayers), gpu_rel(gpu_chunksize,nlayers), gpu_res(gpu_chunksize,nlayers))
     ALLOCATE(gpu_tauaer(gpu_chunksize,nlayers,nbndlw))
     ALLOCATE(gpu_tauc(nbndlw,gpu_chunksize,nlayers))
-    gpu_tauc = 0.0
     ALLOCATE(gpu_totuflux(gpu_chunksize,0:nlayers), gpu_totdflux(gpu_chunksize,0:nlayers))
     ALLOCATE(gpu_fnet(gpu_chunksize,0:nlayers), gpu_htr(gpu_chunksize,0:nlayers))
     ALLOCATE(gpu_totuclfl(gpu_chunksize,0:nlayers), gpu_totdclfl(gpu_chunksize,0:nlayers))
     ALLOCATE(gpu_fnetc(gpu_chunksize,0:nlayers), gpu_htrc(gpu_chunksize,0:nlayers))
+
+! Zero every input staging array once so that a chunk's unused tail slots
+! (whenever gpu_nfill < gpu_chunksize, i.e. the tile's last partial chunk)
+! never carry uninitialized garbage into the device kernels -- see the
+! persistent-device-buffer redesign note below.
+    gpu_play = 0.0; gpu_plev = 0.0; gpu_tlay = 0.0; gpu_tlev = 0.0; gpu_tsfc = 0.0
+    gpu_h2ovmr = 0.0; gpu_o3vmr = 0.0; gpu_co2vmr = 0.0; gpu_ch4vmr = 0.0
+    gpu_n2ovmr = 0.0; gpu_o2vmr = 0.0
+    gpu_cfc11vmr = 0.0; gpu_cfc12vmr = 0.0; gpu_cfc22vmr = 0.0; gpu_ccl4vmr = 0.0
+    gpu_emis = 0.0
+    gpu_cldfrac = 0.0; gpu_ciwp = 0.0; gpu_clwp = 0.0; gpu_cswp = 0.0
+    gpu_rei = 0.0; gpu_rel = 0.0; gpu_res = 0.0; gpu_tauaer = 0.0
+    gpu_tauc = 0.0
+
+! Push every batch array to the device ONCE per RRTMG_LWRAD call (not once
+! per flush -- see the redesign note in gpu_flush_lw_chunk below) and keep
+! it resident for every flush in this call; a flush only "!$acc update
+! device"s the just-filled input arrays and "!$acc update host"s the
+! results, never re-creating or deleting the mapping.
+!$acc enter data copyin(gpu_play, gpu_plev, gpu_tlay, gpu_tlev, gpu_tsfc) &
+!$acc   copyin(gpu_h2ovmr, gpu_o3vmr, gpu_co2vmr, gpu_ch4vmr, gpu_n2ovmr, gpu_o2vmr) &
+!$acc   copyin(gpu_cfc11vmr, gpu_cfc12vmr, gpu_cfc22vmr, gpu_ccl4vmr, gpu_emis) &
+!$acc   copyin(gpu_cldfrac, gpu_ciwp, gpu_clwp, gpu_cswp, gpu_tauc) &
+!$acc   copyin(gpu_rei, gpu_rel, gpu_res, gpu_tauaer) &
+!$acc   create(gpu_totuflux, gpu_totdflux, gpu_fnet, gpu_htr) &
+!$acc   create(gpu_totuclfl, gpu_totdclfl, gpu_fnetc, gpu_htrc)
 #endif
 
 ! latitude loop
@@ -18419,6 +18444,14 @@ CONTAINS
 !-------------------------------------------------------------------
 
 #ifdef WRF_GPU_RAD
+!$acc exit data delete(gpu_play, gpu_plev, gpu_tlay, gpu_tlev, gpu_tsfc) &
+!$acc   delete(gpu_h2ovmr, gpu_o3vmr, gpu_co2vmr, gpu_ch4vmr, gpu_n2ovmr, gpu_o2vmr) &
+!$acc   delete(gpu_cfc11vmr, gpu_cfc12vmr, gpu_cfc22vmr, gpu_ccl4vmr, gpu_emis) &
+!$acc   delete(gpu_cldfrac, gpu_ciwp, gpu_clwp, gpu_cswp, gpu_tauc) &
+!$acc   delete(gpu_rei, gpu_rel, gpu_res, gpu_tauaer) &
+!$acc   delete(gpu_totuflux, gpu_totdflux, gpu_fnet, gpu_htr) &
+!$acc   delete(gpu_totuclfl, gpu_totdclfl, gpu_fnetc, gpu_htrc)
+
     DEALLOCATE(gpu_i_idx, gpu_j_idx)
     DEALLOCATE(gpu_play, gpu_plev, gpu_tlay, gpu_tlev, gpu_tsfc)
     DEALLOCATE(gpu_h2ovmr, gpu_o3vmr, gpu_co2vmr, gpu_ch4vmr, gpu_n2ovmr, gpu_o2vmr)
@@ -18444,104 +18477,109 @@ CONTAINS
    IMPLICIT NONE
    INTEGER :: gk, gi, gj
 
-! A slice like gpu_play(1:gpu_nfill,:) is non-contiguous whenever gpu_nfill
-! < gpu_chunksize (the last, partial chunk of a tile): Fortran argument
-! association to the chain driver's explicit-shape dummies then makes a
-! compiler-generated HOST-side copy-in/copy-out temporary for that call,
-! which is a different address than whatever "!$acc enter data copyin" was
-! told about -- so present() inside the device kernels fails to find it
-! ("data in PRESENT clause was not found on device"). Fix: always operate on
-! freshly allocated, exactly (gpu_nfill,...)-shaped, contiguous arrays.
-   REAL, ALLOCATABLE :: fl_play(:,:), fl_plev(:,:), fl_tlay(:,:), fl_tlev(:,:), fl_tsfc(:)
-   REAL, ALLOCATABLE :: fl_h2ovmr(:,:), fl_o3vmr(:,:), fl_co2vmr(:,:), fl_ch4vmr(:,:)
-   REAL, ALLOCATABLE :: fl_n2ovmr(:,:), fl_o2vmr(:,:), fl_cfc11vmr(:,:), fl_cfc12vmr(:,:)
-   REAL, ALLOCATABLE :: fl_cfc22vmr(:,:), fl_ccl4vmr(:,:), fl_emis(:,:)
-   REAL, ALLOCATABLE :: fl_cldfrac(:,:), fl_ciwp(:,:), fl_clwp(:,:), fl_cswp(:,:)
-   REAL, ALLOCATABLE :: fl_rei(:,:), fl_rel(:,:), fl_res(:,:), fl_tauaer(:,:,:), fl_tauc(:,:,:)
-   REAL, ALLOCATABLE :: fl_totuflux(:,:), fl_totdflux(:,:), fl_fnet(:,:), fl_htr(:,:)
-   REAL, ALLOCATABLE :: fl_totuclfl(:,:), fl_totdclfl(:,:), fl_fnetc(:,:), fl_htrc(:,:)
+! REDESIGNED (see CLAUDE.md): this used to ALLOCATE a fresh set of
+! exactly-(gpu_nfill,...)-shaped "fl_*" arrays, "!$acc enter data" them,
+! call the driver, "!$acc exit data" them, then DEALLOCATE -- every single
+! flush (called ~twice per radiation call). That repeated create/delete
+! cycle on freshly (re)allocated host memory turned out to be fragile: a
+! deterministic CUDA_ERROR_ILLEGAL_ADDRESS / CUDA_ERROR_INVALID_ADDRESS_SPACE
+! crash appeared a few flushes into a real run, reproduced identically with
+! CUDA_LAUNCH_BLOCKING=1 (ruling out an async race) but did NOT reproduce
+! under compute-sanitizer's memcheck (which uses its own allocator and
+! doesn't reuse freed device/host addresses the same way) -- exactly the
+! signature of a stale device mapping surviving past where the runtime's
+! dynamic reference-counting expected it to be gone. Rather than keep
+! auditing create/delete lists by hand, the batch arrays (gpu_play,
+! gpu_plev, ... gpu_totuflux, ...) are now pushed to the device exactly
+! ONCE per RRTMG_LWRAD call (right after they're allocated, before j_loop)
+! and never deleted/recreated until the whole call ends. A flush now only
+! "!$acc update device"s the just-filled inputs and "!$acc update host"s
+! the results -- no enter/exit data, no ALLOCATE/DEALLOCATE, nothing that
+! could leave a dangling mapping behind. The chain driver always runs on
+! the full gpu_chunksize (never a gpu_nfill slice, so never a non-contiguous
+! section either); any unused tail columns on a tile's last partial chunk
+! just recompute on stale-but-valid leftover data from an earlier chunk
+! (harmless -- those columns are simply not unpacked below).
+! Defensive sanitization: the diagnostic version of this block (run against
+! the real Hong Kong case) found play/plev genuinely NaN for the domain
+! corner column (i=1,j=1) at some radiation calls, while tlay/tlev at the
+! same column/layers were finite -- a pre-existing bug elsewhere (dpsdt/
+! dmudt domain-average diagnostics are NaN from t=0 in this same run,
+! independent of WRF_GPU_RAD), NOT something introduced by this port. The
+! CPU rrtmg_lw path never crashed on it only by luck: x86's REAL-to-INTEGER
+! conversion of NaN yields INT_MIN, which setcoef's existing
+! "IF (jp.lt.1) jp=1" clamp happens to catch; the GPU's conversion of the
+! same NaN-derived expression does not reliably land somewhere those clamps
+! catch, and an out-of-range jp/jt/indself/indfor/indminor feeding a table
+! lookup in taugb1_gpu is exactly what an invalid/illegal device address
+! during kernel execution looks like. Clamping non-finite/non-physical
+! pressure or temperature to a nominal value here does not fix that
+! upstream bug -- it only keeps this port from crashing on it, the same
+! way the CPU path was accidentally protected. The warning below is left
+! in permanently so the underlying issue stays visible instead of being
+! silently masked.
+   BLOCK
+   INTEGER :: san_ic, san_k
+   LOGICAL :: san_bad
+   DO san_ic = 1, gpu_nfill
+      san_bad = .FALSE.
+      DO san_k = 1, nlayers
+         IF (.NOT. (gpu_play(san_ic,san_k) .GE. 1.0e-3 .AND. gpu_play(san_ic,san_k) .LE. 1100.0)) THEN
+            gpu_play(san_ic,san_k) = 1013.25
+            san_bad = .TRUE.
+         ENDIF
+         IF (.NOT. (gpu_plev(san_ic,san_k) .GE. 1.0e-3 .AND. gpu_plev(san_ic,san_k) .LE. 1100.0)) THEN
+            gpu_plev(san_ic,san_k) = 1013.25
+            san_bad = .TRUE.
+         ENDIF
+         IF (.NOT. (gpu_tlay(san_ic,san_k) .GE. 100.0 .AND. gpu_tlay(san_ic,san_k) .LE. 400.0)) THEN
+            gpu_tlay(san_ic,san_k) = 288.0
+            san_bad = .TRUE.
+         ENDIF
+         IF (.NOT. (gpu_tlev(san_ic,san_k) .GE. 100.0 .AND. gpu_tlev(san_ic,san_k) .LE. 400.0)) THEN
+            gpu_tlev(san_ic,san_k) = 288.0
+            san_bad = .TRUE.
+         ENDIF
+      ENDDO
+      IF (.NOT. (gpu_plev(san_ic,nlayers+1) .GE. 1.0e-3 .AND. gpu_plev(san_ic,nlayers+1) .LE. 1100.0)) THEN
+         gpu_plev(san_ic,nlayers+1) = 1013.25
+         san_bad = .TRUE.
+      ENDIF
+      IF (.NOT. (gpu_tlev(san_ic,nlayers+1) .GE. 100.0 .AND. gpu_tlev(san_ic,nlayers+1) .LE. 400.0)) THEN
+         gpu_tlev(san_ic,nlayers+1) = 288.0
+         san_bad = .TRUE.
+      ENDIF
+      IF (.NOT. (gpu_tsfc(san_ic) .GE. 100.0 .AND. gpu_tsfc(san_ic) .LE. 400.0)) THEN
+         gpu_tsfc(san_ic) = 288.0
+         san_bad = .TRUE.
+      ENDIF
+      IF (san_bad) THEN
+         WRITE(message,'(A,I5,A,I5,A)') &
+            'WRF_GPU_RAD WARNING: non-physical p/T at i=', &
+            gpu_i_idx(san_ic), ' j=', gpu_j_idx(san_ic), &
+            ' -- clamped (pre-existing NaN upstream, see dpsdt/dmudt)'
+         call wrf_message(message)
+      ENDIF
+   ENDDO
+   END BLOCK
 
-   ALLOCATE(fl_play(gpu_nfill,nlayers), fl_plev(gpu_nfill,nlayers+1))
-   ALLOCATE(fl_tlay(gpu_nfill,nlayers), fl_tlev(gpu_nfill,nlayers+1), fl_tsfc(gpu_nfill))
-   ALLOCATE(fl_h2ovmr(gpu_nfill,nlayers), fl_o3vmr(gpu_nfill,nlayers), fl_co2vmr(gpu_nfill,nlayers))
-   ALLOCATE(fl_ch4vmr(gpu_nfill,nlayers), fl_n2ovmr(gpu_nfill,nlayers), fl_o2vmr(gpu_nfill,nlayers))
-   ALLOCATE(fl_cfc11vmr(gpu_nfill,nlayers), fl_cfc12vmr(gpu_nfill,nlayers))
-   ALLOCATE(fl_cfc22vmr(gpu_nfill,nlayers), fl_ccl4vmr(gpu_nfill,nlayers))
-   ALLOCATE(fl_emis(gpu_nfill,nbndlw))
-   ALLOCATE(fl_cldfrac(gpu_nfill,nlayers), fl_ciwp(gpu_nfill,nlayers))
-   ALLOCATE(fl_clwp(gpu_nfill,nlayers), fl_cswp(gpu_nfill,nlayers))
-   ALLOCATE(fl_rei(gpu_nfill,nlayers), fl_rel(gpu_nfill,nlayers), fl_res(gpu_nfill,nlayers))
-   ALLOCATE(fl_tauaer(gpu_nfill,nlayers,nbndlw), fl_tauc(nbndlw,gpu_nfill,nlayers))
-   ALLOCATE(fl_totuflux(gpu_nfill,0:nlayers), fl_totdflux(gpu_nfill,0:nlayers))
-   ALLOCATE(fl_fnet(gpu_nfill,0:nlayers), fl_htr(gpu_nfill,0:nlayers))
-   ALLOCATE(fl_totuclfl(gpu_nfill,0:nlayers), fl_totdclfl(gpu_nfill,0:nlayers))
-   ALLOCATE(fl_fnetc(gpu_nfill,0:nlayers), fl_htrc(gpu_nfill,0:nlayers))
+!$acc update device(gpu_play, gpu_plev, gpu_tlay, gpu_tlev, gpu_tsfc) &
+!$acc   device(gpu_h2ovmr, gpu_o3vmr, gpu_co2vmr, gpu_ch4vmr, gpu_n2ovmr, gpu_o2vmr) &
+!$acc   device(gpu_cfc11vmr, gpu_cfc12vmr, gpu_cfc22vmr, gpu_ccl4vmr, gpu_emis) &
+!$acc   device(gpu_cldfrac, gpu_ciwp, gpu_clwp, gpu_cswp) &
+!$acc   device(gpu_rei, gpu_rel, gpu_res, gpu_tauaer)
 
-   fl_play     = gpu_play(1:gpu_nfill,:)
-   fl_plev     = gpu_plev(1:gpu_nfill,:)
-   fl_tlay     = gpu_tlay(1:gpu_nfill,:)
-   fl_tlev     = gpu_tlev(1:gpu_nfill,:)
-   fl_tsfc     = gpu_tsfc(1:gpu_nfill)
-   fl_h2ovmr   = gpu_h2ovmr(1:gpu_nfill,:)
-   fl_o3vmr    = gpu_o3vmr(1:gpu_nfill,:)
-   fl_co2vmr   = gpu_co2vmr(1:gpu_nfill,:)
-   fl_ch4vmr   = gpu_ch4vmr(1:gpu_nfill,:)
-   fl_n2ovmr   = gpu_n2ovmr(1:gpu_nfill,:)
-   fl_o2vmr    = gpu_o2vmr(1:gpu_nfill,:)
-   fl_cfc11vmr = gpu_cfc11vmr(1:gpu_nfill,:)
-   fl_cfc12vmr = gpu_cfc12vmr(1:gpu_nfill,:)
-   fl_cfc22vmr = gpu_cfc22vmr(1:gpu_nfill,:)
-   fl_ccl4vmr  = gpu_ccl4vmr(1:gpu_nfill,:)
-   fl_emis     = gpu_emis(1:gpu_nfill,:)
-   fl_cldfrac  = gpu_cldfrac(1:gpu_nfill,:)
-   fl_ciwp     = gpu_ciwp(1:gpu_nfill,:)
-   fl_clwp     = gpu_clwp(1:gpu_nfill,:)
-   fl_cswp     = gpu_cswp(1:gpu_nfill,:)
-   fl_rei      = gpu_rei(1:gpu_nfill,:)
-   fl_rel      = gpu_rel(1:gpu_nfill,:)
-   fl_res      = gpu_res(1:gpu_nfill,:)
-   fl_tauaer   = gpu_tauaer(1:gpu_nfill,:,:)
-   fl_tauc     = gpu_tauc(:,1:gpu_nfill,:)
-
-!$acc enter data copyin(fl_play, fl_plev, fl_tlay, fl_tlev, fl_tsfc) &
-!$acc   copyin(fl_h2ovmr, fl_o3vmr, fl_co2vmr, fl_ch4vmr, fl_n2ovmr, fl_o2vmr) &
-!$acc   copyin(fl_cfc11vmr, fl_cfc12vmr, fl_cfc22vmr, fl_ccl4vmr, fl_emis) &
-!$acc   copyin(fl_cldfrac, fl_ciwp, fl_clwp, fl_cswp, fl_tauc) &
-!$acc   copyin(fl_rei, fl_rel, fl_res, fl_tauaer) &
-!$acc   create(fl_totuflux, fl_totdflux, fl_fnet, fl_htr) &
-!$acc   create(fl_totuclfl, fl_totdclfl, fl_fnetc, fl_htrc)
-
-   CALL rrtmg_lw_gpu_chain_driver(gpu_nfill, nlayers, icld, gpu_iaer, irng, permuteseed, &
-             fl_play, fl_plev, fl_tlay, fl_tlev, fl_tsfc, &
-             fl_h2ovmr, fl_o3vmr, fl_co2vmr, fl_ch4vmr, fl_n2ovmr, fl_o2vmr, &
-             fl_ccl4vmr, fl_cfc11vmr, fl_cfc12vmr, fl_cfc22vmr, fl_emis, &
+   CALL rrtmg_lw_gpu_chain_driver(gpu_chunksize, nlayers, icld, gpu_iaer, irng, permuteseed, &
+             gpu_play, gpu_plev, gpu_tlay, gpu_tlev, gpu_tsfc, &
+             gpu_h2ovmr, gpu_o3vmr, gpu_co2vmr, gpu_ch4vmr, gpu_n2ovmr, gpu_o2vmr, &
+             gpu_ccl4vmr, gpu_cfc11vmr, gpu_cfc12vmr, gpu_cfc22vmr, gpu_emis, &
              gpu_inflglw, gpu_iceflglw, gpu_liqflglw, &
-             fl_cldfrac, fl_ciwp, fl_clwp, fl_cswp, fl_tauc, &
-             fl_rei, fl_rel, fl_res, fl_tauaer, &
-             fl_totuflux, fl_totdflux, fl_fnet, fl_htr, &
-             fl_totuclfl, fl_totdclfl, fl_fnetc, fl_htrc)
+             gpu_cldfrac, gpu_ciwp, gpu_clwp, gpu_cswp, gpu_tauc, &
+             gpu_rei, gpu_rel, gpu_res, gpu_tauaer, &
+             gpu_totuflux, gpu_totdflux, gpu_fnet, gpu_htr, &
+             gpu_totuclfl, gpu_totdclfl, gpu_fnetc, gpu_htrc)
 
-!$acc exit data copyout(fl_totuflux, fl_totdflux, fl_totuclfl, fl_totdclfl, fl_htr) &
-!$acc   delete(fl_play, fl_plev, fl_tlay, fl_tlev, fl_tsfc) &
-!$acc   delete(fl_h2ovmr, fl_o3vmr, fl_co2vmr, fl_ch4vmr, fl_n2ovmr, fl_o2vmr) &
-!$acc   delete(fl_cfc11vmr, fl_cfc12vmr, fl_cfc22vmr, fl_ccl4vmr, fl_emis) &
-!$acc   delete(fl_cldfrac, fl_ciwp, fl_clwp, fl_cswp, fl_tauc) &
-!$acc   delete(fl_rei, fl_rel, fl_res, fl_tauaer) &
-!$acc   delete(fl_fnet, fl_fnetc, fl_htrc)
-
-   gpu_totuflux(1:gpu_nfill,:) = fl_totuflux
-   gpu_totdflux(1:gpu_nfill,:) = fl_totdflux
-   gpu_totuclfl(1:gpu_nfill,:) = fl_totuclfl
-   gpu_totdclfl(1:gpu_nfill,:) = fl_totdclfl
-   gpu_htr(1:gpu_nfill,:)      = fl_htr
-
-   DEALLOCATE(fl_play, fl_plev, fl_tlay, fl_tlev, fl_tsfc)
-   DEALLOCATE(fl_h2ovmr, fl_o3vmr, fl_co2vmr, fl_ch4vmr, fl_n2ovmr, fl_o2vmr)
-   DEALLOCATE(fl_cfc11vmr, fl_cfc12vmr, fl_cfc22vmr, fl_ccl4vmr, fl_emis)
-   DEALLOCATE(fl_cldfrac, fl_ciwp, fl_clwp, fl_cswp, fl_rei, fl_rel, fl_res)
-   DEALLOCATE(fl_tauaer, fl_tauc)
-   DEALLOCATE(fl_totuflux, fl_totdflux, fl_fnet, fl_htr)
-   DEALLOCATE(fl_totuclfl, fl_totdclfl, fl_fnetc, fl_htrc)
+!$acc update host(gpu_totuflux, gpu_totdflux, gpu_totuclfl, gpu_totdclfl, gpu_htr)
 
    DO gk = 1, gpu_nfill
       gi = gpu_i_idx(gk)
