@@ -17472,6 +17472,7 @@ CONTAINS
     INTEGER :: gpu_chunksize, gpu_nfill, gpu_ic, gpu_ncol_tile, gpu_iaer
     LOGICAL :: gpu_have_lwupt, gpu_have_lwupflx
     INTEGER, ALLOCATABLE :: gpu_i_idx(:), gpu_j_idx(:)
+    LOGICAL, ALLOCATABLE :: gpu_bad(:)
     REAL, ALLOCATABLE :: gpu_play(:,:), gpu_plev(:,:), gpu_tlay(:,:), gpu_tlev(:,:), gpu_tsfc(:)
     REAL, ALLOCATABLE :: gpu_h2ovmr(:,:), gpu_o3vmr(:,:), gpu_co2vmr(:,:), gpu_ch4vmr(:,:)
     REAL, ALLOCATABLE :: gpu_n2ovmr(:,:), gpu_o2vmr(:,:), gpu_cfc11vmr(:,:), gpu_cfc12vmr(:,:)
@@ -17537,7 +17538,8 @@ CONTAINS
     gpu_iaer = 10
     gpu_have_lwupt = PRESENT(lwupt)
     gpu_have_lwupflx = PRESENT(lwupflx)
-    ALLOCATE(gpu_i_idx(gpu_chunksize), gpu_j_idx(gpu_chunksize))
+    ALLOCATE(gpu_i_idx(gpu_chunksize), gpu_j_idx(gpu_chunksize), gpu_bad(gpu_chunksize))
+    gpu_bad = .FALSE.
     ALLOCATE(gpu_play(gpu_chunksize,nlayers), gpu_plev(gpu_chunksize,nlayers+1))
     ALLOCATE(gpu_tlay(gpu_chunksize,nlayers), gpu_tlev(gpu_chunksize,nlayers+1), gpu_tsfc(gpu_chunksize))
     ALLOCATE(gpu_h2ovmr(gpu_chunksize,nlayers), gpu_o3vmr(gpu_chunksize,nlayers), gpu_co2vmr(gpu_chunksize,nlayers))
@@ -18403,6 +18405,7 @@ CONTAINS
          gpu_ic = gpu_nfill + 1
          gpu_i_idx(gpu_ic) = i
          gpu_j_idx(gpu_ic) = j
+         gpu_bad(gpu_ic) = .FALSE.
          gpu_play(gpu_ic,:)     = play(1,:)
          gpu_plev(gpu_ic,:)     = plev(1,:)
          gpu_tlay(gpu_ic,:)     = tlay(1,:)
@@ -18452,7 +18455,7 @@ CONTAINS
 !$acc   delete(gpu_totuflux, gpu_totdflux, gpu_fnet, gpu_htr) &
 !$acc   delete(gpu_totuclfl, gpu_totdclfl, gpu_fnetc, gpu_htrc)
 
-    DEALLOCATE(gpu_i_idx, gpu_j_idx)
+    DEALLOCATE(gpu_i_idx, gpu_j_idx, gpu_bad)
     DEALLOCATE(gpu_play, gpu_plev, gpu_tlay, gpu_tlev, gpu_tsfc)
     DEALLOCATE(gpu_h2ovmr, gpu_o3vmr, gpu_co2vmr, gpu_ch4vmr, gpu_n2ovmr, gpu_o2vmr)
     DEALLOCATE(gpu_cfc11vmr, gpu_cfc12vmr, gpu_cfc22vmr, gpu_ccl4vmr, gpu_emis)
@@ -18554,10 +18557,11 @@ CONTAINS
          san_bad = .TRUE.
       ENDIF
       IF (san_bad) THEN
+         gpu_bad(san_ic) = .TRUE.
          WRITE(message,'(A,I5,A,I5,A)') &
             'WRF_GPU_RAD WARNING: non-physical p/T at i=', &
             gpu_i_idx(san_ic), ' j=', gpu_j_idx(san_ic), &
-            ' -- clamped (pre-existing NaN upstream, see dpsdt/dmudt)'
+            ' -- skipping LW update this step (pre-existing NaN upstream)'
          call wrf_message(message)
       ENDIF
    ENDDO
@@ -18584,6 +18588,20 @@ CONTAINS
    DO gk = 1, gpu_nfill
       gi = gpu_i_idx(gk)
       gj = gpu_j_idx(gk)
+
+! Columns flagged bad above had their pressure/temperature force-clamped to
+! a single nominal value (1013.25 mb / 288 K) for every layer just to keep
+! the device kernels from choking on NaN -- that clamp is physically wrong
+! for any layer that isn't actually near the surface (imagine a real ~50 mb
+! layer silently treated as 1013 mb: wildly wrong optical path, wildly
+! wrong heating rate). Writing that heating rate into RTHRATENLW measurably
+! destabilized the dynamics in testing (an ever-growing fraction of the
+! domain kept tripping the same warning over a 10-minute run -- a runaway
+! feedback loop caused by this fix, not the original upstream NaN). So a
+! bad column's LW outputs are skipped entirely this step, holding whatever
+! value RTHRATENLW/GLW/OLR/LWCF/etc already had (all INTENT(INOUT)) rather
+! than injecting a finite-but-physically-wrong update.
+      IF (gpu_bad(gk)) CYCLE
 
       glw(gi,gj) = gpu_totdflux(gk,0)
       olr(gi,gj) = gpu_totuflux(gk,nlayers)
