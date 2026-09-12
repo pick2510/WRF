@@ -2838,6 +2838,86 @@ contains
       END SUBROUTINE mcica_subcol_lw_driver_gpu
 
       END MODULE mcica_subcol_gen_lw_gpu
+
+! Device-independent column-batch sizing for LW driver integration.
+!
+! The batched pipeline (inatm -> mcica_subcol_lw -> cldprmc -> setcoef ->
+! taumol -> rtrnmc) needs ncol-major device arrays sized to whatever chunk
+! of the tile is processed per call. That chunk size must NOT be a
+! hardcoded constant tied to one GPU's VRAM capacity (this project
+! developed against an 8GB RTX 5060, but the same build must size
+! correctly on any other device) -- so it is computed at runtime from
+! OpenACC's `acc_get_property(..., acc_property_free_memory)`, which
+! queries the actual device the process is running on.
+      MODULE rrtmg_lw_gpu_chunk
+
+      use parkind, only : im => kind_im, rb => kind_rb
+
+      IMPLICIT NONE
+
+      CONTAINS
+
+! Per-column device memory footprint (bytes) of the batched LW pipeline,
+! single-precision (4-byte, per this build's -r4). This is a first-cut
+! estimate from the arrays known to be threaded end-to-end through the
+! pipeline (inatm's per-g-point cloud/gas outputs, taumol's per-g-point
+! optical depths, rtrnmc's per-g-point scratch) -- it should be revisited
+! once the actual batched driver's array list is finalized, since it is
+! currently derived from the individual _gpu stages' known signatures
+! rather than from a single, already-written end-to-end driver.
+      INTEGER(kind=8) FUNCTION rrtmg_lw_gpu_bytes_per_column(nlayers) RESULT(nbytes)
+
+      use parrrtm, only : nbndlw, ngptlw, mxmol, maxxsec
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: nlayers
+      INTEGER(kind=8) :: nlay8
+
+      nlay8 = INT(nlayers, 8)
+
+! Per layer: wkl(mxmol) + wx(maxxsec) [inatm], cldfmc/taucmc/ciwpmc/
+! clwpmc/cswpmc(ngptlw) [inatm->cldprmc, 5 arrays], fracs/taut/taur-style
+! g-point arrays carried through taumol/rtrnmc (~4 more ngptlw-wide
+! arrays), planklay/planklev/secdiff-style band arrays (~3 nbndlw-wide),
+! plus roughly 20 scalar-per-layer arrays (pavel, tavel, coldry, jp, jt,
+! jt1, fac00/01/10/11, selffac, selffrac, indself, forfac, forfrac,
+! indfor, ...) that are negligible next to the ngptlw=140-wide arrays.
+      nbytes = 4_8 * nlay8 * (INT(mxmol,8) + INT(maxxsec,8) + 9_8*INT(ngptlw,8) &
+                               + 3_8*INT(nbndlw,8) + 20_8)
+
+      END FUNCTION rrtmg_lw_gpu_bytes_per_column
+
+! Returns a safe ncol batch size for one LW GPU pipeline call, capped at
+! max_ncol (the actual number of columns remaining to process) and sized
+! against a fraction of this device's currently-free memory -- queried at
+! runtime, never assumed. The safety_fraction leaves headroom for the
+! ~4MB of k-distribution lookup tables (fixed, independent of chunk size)
+! and anything else already resident on the device (e.g. the dyn_em
+! OpenACC port's own working arrays, if running in the same process) that
+! this query cannot separately account for.
+      INTEGER(kind=im) FUNCTION rrtmg_lw_gpu_chunksize(nlayers, max_ncol) RESULT(ncol_chunk)
+
+      use openacc
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: nlayers, max_ncol
+
+      INTEGER :: devnum
+      INTEGER(kind=8) :: free_bytes, bytes_per_col
+      REAL(kind=rb), PARAMETER :: safety_fraction = 0.5_rb
+
+      devnum = acc_get_device_num(acc_device_nvidia)
+      free_bytes = acc_get_property(devnum, acc_device_nvidia, acc_property_free_memory)
+      bytes_per_col = rrtmg_lw_gpu_bytes_per_column(nlayers)
+
+      ncol_chunk = INT(REAL(free_bytes, rb) * safety_fraction / REAL(bytes_per_col, rb), im)
+
+      IF (ncol_chunk .gt. max_ncol) ncol_chunk = max_ncol
+      IF (ncol_chunk .lt. 1) ncol_chunk = 1
+
+      END FUNCTION rrtmg_lw_gpu_chunksize
+
+      END MODULE rrtmg_lw_gpu_chunk
 #endif
 
 !     path:      $Source: /storm/rc1/cvsroot/rc/rrtmg_lw/src/rrtmg_lw_cldprmc.f90,v $
