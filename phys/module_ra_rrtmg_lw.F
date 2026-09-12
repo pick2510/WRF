@@ -16499,8 +16499,13 @@ contains
       REAL(kind=rb), INTENT(IN) :: cldfmcl(ngptlw,ncol,nlay), taucmcl(ngptlw,ncol,nlay)
       REAL(kind=rb), INTENT(IN) :: ciwpmcl(ngptlw,ncol,nlay), cswpmcl(ngptlw,ncol,nlay), clwpmcl(ngptlw,ncol,nlay)
       REAL(kind=rb), INTENT(IN) :: reicmcl(ncol,nlay), relqmcl(ncol,nlay), resnmcl(ncol,nlay)
-      REAL(kind=rb), INTENT(OUT) :: cldfmc(ncol,nlay,ngptlw), taucmc(ncol,nlay,ngptlw)
-      REAL(kind=rb), INTENT(OUT) :: ciwpmc(ncol,nlay,ngptlw), cswpmc(ncol,nlay,ngptlw), clwpmc(ncol,nlay,ngptlw)
+! Species-BEFORE-layer here, matching cldprmc_gpu/rtrnmc_gpu's established
+! (ncol,ngptlw,nlayers) convention from the earlier LW port stages -- NOT
+! this project's usual species-last layout. inatm_cloud_gpu has no other
+! consumer, so it conforms to the already-verified downstream stages
+! rather than the other way around.
+      REAL(kind=rb), INTENT(OUT) :: cldfmc(ncol,ngptlw,nlay), taucmc(ncol,ngptlw,nlay)
+      REAL(kind=rb), INTENT(OUT) :: ciwpmc(ncol,ngptlw,nlay), cswpmc(ncol,ngptlw,nlay), clwpmc(ncol,ngptlw,nlay)
       REAL(kind=rb), INTENT(OUT) :: reicmc(ncol,nlay), relqmc(ncol,nlay), resnmc(ncol,nlay)
 
       INTEGER(kind=im) :: iplon, l, ig
@@ -16509,11 +16514,11 @@ contains
       DO ig = 1, ngptlw
       DO l = 1, nlay
       DO iplon = 1, ncol
-         cldfmc(iplon,l,ig) = cldfmcl(ig,iplon,l)
-         taucmc(iplon,l,ig) = taucmcl(ig,iplon,l)
-         ciwpmc(iplon,l,ig) = ciwpmcl(ig,iplon,l)
-         cswpmc(iplon,l,ig) = cswpmcl(ig,iplon,l)
-         clwpmc(iplon,l,ig) = clwpmcl(ig,iplon,l)
+         cldfmc(iplon,ig,l) = cldfmcl(ig,iplon,l)
+         taucmc(iplon,ig,l) = taucmcl(ig,iplon,l)
+         ciwpmc(iplon,ig,l) = ciwpmcl(ig,iplon,l)
+         cswpmc(iplon,ig,l) = cswpmcl(ig,iplon,l)
+         clwpmc(iplon,ig,l) = clwpmcl(ig,iplon,l)
       ENDDO
       ENDDO
       ENDDO
@@ -16560,8 +16565,8 @@ contains
       REAL(kind=rb), INTENT(OUT) :: coldry(ncol,nlay), wbrodl(ncol,nlay)
       REAL(kind=rb), INTENT(OUT) :: wkl(ncol,nlay,mxmol), wx(ncol,nlay,maxxsec)
       REAL(kind=rb), INTENT(OUT) :: pwvcm(ncol), semiss(ncol,nbndlw)
-      REAL(kind=rb), INTENT(OUT) :: cldfmc(ncol,nlay,ngptlw), taucmc(ncol,nlay,ngptlw)
-      REAL(kind=rb), INTENT(OUT) :: ciwpmc(ncol,nlay,ngptlw), cswpmc(ncol,nlay,ngptlw), clwpmc(ncol,nlay,ngptlw)
+      REAL(kind=rb), INTENT(OUT) :: cldfmc(ncol,ngptlw,nlay), taucmc(ncol,ngptlw,nlay)
+      REAL(kind=rb), INTENT(OUT) :: ciwpmc(ncol,ngptlw,nlay), cswpmc(ncol,ngptlw,nlay), clwpmc(ncol,ngptlw,nlay)
       REAL(kind=rb), INTENT(OUT) :: reicmc(ncol,nlay), relqmc(ncol,nlay), resnmc(ncol,nlay)
       REAL(kind=rb), INTENT(OUT) :: taua(ncol,nlay,nbndlw)
 
