@@ -1166,14 +1166,16 @@ SUBROUTINE rk_scalar_tend ( scs, sce, config_flags,          &
    khdq = khdif/prandtl
    kvdq = kvdif/prandtl
 
-#ifdef WRF_GPU_DYN
-!  rk_scalar_tend is a separate subroutine from rk_tendency (not nested
-!  inside it) with its own call scope, so it needs its own copy of the
-!  shared-inputs residency block -- ru/rv/ww/etc. entered in rk_tendency
-!  are already gone (exit data at rk_tendency's end) by the time this runs.
-!$acc enter data copyin(ru,rv,ww,c1h,c2h,mut,msfux,msfuy,msfvx,msfvy,msftx, &
-!$acc& msfty,fnm,fnp,rdnw,rdn,config_flags)
-#endif
+!  ru/rv/ww/c1h/c2h/mut/map-scale-factors/fnm/fnp/rdnw/rdn/config_flags are
+!  NOT entered here (unlike rk_tendency, which has its own private call
+!  scope): rk_scalar_tend is called once per species from five separate
+!  loops in solve_em.F (moist/tke/chem/tracer/other-scalar), all passing
+!  these exact same read-only arrays, so the caller now holds one shared
+!  enter-data spanning all five loops instead of this subroutine re-entering
+!  it on every one of those ~144 per-species calls -- see solve_em.F around
+!  "moist_scalar_advance"/"other_scalar_advance". Verified (grep) none of
+!  the host code in solve_em.F between those two points writes any of these
+!  arrays, so residency for the whole span is safe.
 
    scalar_loop : DO im = scs, sce
 
@@ -1384,11 +1386,6 @@ SUBROUTINE rk_scalar_tend ( scs, sce, config_flags,          &
   ENDIF rk_step_1
 
  END DO scalar_loop
-
-#ifdef WRF_GPU_DYN
-!$acc exit data delete(ru,rv,ww,c1h,c2h,mut,msfux,msfuy,msfvx,msfvy,msftx, &
-!$acc& msfty,fnm,fnp,rdnw,rdn,config_flags)
-#endif
 
 END SUBROUTINE rk_scalar_tend
 

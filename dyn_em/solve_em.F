@@ -2477,6 +2477,18 @@ BENCH_END(small_step_finish_tim)
 !</pre>
 !</DESCRIPTION>
 
+#ifdef WRF_GPU_DYN
+!  ru_m/rv_m/ww_m/muts/c1h/c2h/map-scale-factors/fnm/fnp/rdnw/rdn/config_flags
+!  are the read-only inputs every rk_scalar_tend call below needs (moist/tke/
+!  chem/tracer/other-scalar, up to ~8 species per RK step) -- rk_scalar_tend
+!  used to re-enter this same block itself on every one of those per-species
+!  calls (144x in a 2-minute profiled run). None of the host code from here
+!  through "ENDIF other_scalar_advance" writes any of these arrays (verified
+!  by grep), so bring them onto the device once for the whole span instead.
+!$acc enter data copyin(grid%ru_m,grid%rv_m,grid%ww_m,grid%muts,grid%c1h, &
+!$acc& grid%c2h,grid%msfux,grid%msfuy,grid%msfvx,grid%msfvy,grid%msftx,   &
+!$acc& grid%msfty,grid%fnm,grid%fnp,grid%rdnw,grid%rdn,config_flags)
+#endif
 
        moist_scalar_advance: IF (num_3d_m >= PARAM_FIRST_SCALAR )  THEN
 
@@ -3186,6 +3198,12 @@ BENCH_END(tracer_adv_tim)
        ENDDO scalar_variable_loop
 
      ENDIF other_scalar_advance
+
+#ifdef WRF_GPU_DYN
+!$acc exit data delete(grid%ru_m,grid%rv_m,grid%ww_m,grid%muts,grid%c1h, &
+!$acc& grid%c2h,grid%msfux,grid%msfuy,grid%msfvx,grid%msfvy,grid%msftx,  &
+!$acc& grid%msfty,grid%fnm,grid%fnp,grid%rdnw,grid%rdn,config_flags)
+#endif
 
 !************************************************************************************************************************
 ! LES_fix: convert theta_m back to theta, point 2 ! 28 January 2015
