@@ -3649,6 +3649,501 @@ contains
 
       end module rrtmg_lw_rtrnmc
 
+#ifdef WRF_GPU_RAD
+!-------------------------------------------------------------------------------
+!  GPU (OpenACC) port of rtrnmc, RRTMG-LW's radiative transfer routine -- the
+!  hottest routine in the scheme and the one genuine sequential recurrence in
+!  this port (an up/down flux sweep over layers, same category of constraint
+!  as advance_w_fast's Thomas-sweep in the dyn_em port). See plan.md "GPU
+!  Port: RRTMG Radiation" and the taugb1_gpu header comment above for the
+!  general restructuring rationale. The original CPU rtrnmc above is
+!  untouched.
+!
+!  Key structural discovery that makes this tractable: WRF's caller always
+!  invokes rtrnmc with istart=1, iend=16, iout=0 (module_ra_rrtmg_lw.F, the
+!  three assignments right before the "call rtrnmc" in rrtmg_lw) -- iout=0
+!  means the "if (iout.gt.0.and.iband.ge.2) igc = ngs(iband-1)+1" branch
+!  that resets the g-point counter per band NEVER triggers, so the original's
+!  nested "do iband = istart,iend" / "1000 continue ... goto 1000" structure
+!  is exactly equivalent to one flat loop over igc = 1,ngptlw with
+!  iband = ngb(igc) looked up per g-point -- confirmed by inspecting every
+!  call site (there is only one). rtrnmc_gpu asserts istart==1, iend==16,
+!  iout==0 on the host (the only shape ever exercised) rather than device-
+!  porting the general case.
+!
+!  With that flattening, the recurrence structure becomes: each (column,
+!  g-point) pair does its own independent down-then-up sweep over layers
+!  (radld/radlu are NOT shared across g-points -- each igc iteration in the
+!  original starts them at 0/rad0 fresh) -- so "(column, g-point)" is the
+!  parallel axis (ncol*ngptlw fully independent sequential sweeps, the same
+!  "gang-per-independent-recurrence" shape as advance_w_fast's per-column
+!  Thomas sweep) and "layer" is the sequential axis within each gang, using
+!  per-gang private scratch (atrans/bbugas/bbutot/atot/urad/drad/clrurad/
+!  clrdrad) sized to parrrtm's mxlay so private-clause array bounds are
+!  compile-time constants, not runtime-shaped.
+!
+!  The one real cross-g-point dependency is the OUTPUT reduction: in the
+!  original, urad/drad accumulate *across all g-points in a band* into a
+!  shared array before being scaled by delwave(iband) and added into
+!  totuflux/totdflux once per band. Since delwave depends only on iband and
+!  ngb(igc) gives each g-point's band directly, this is equivalent to a
+!  flat sum over ALL g-points of wtdiff*delwave(ngb(igc))*radlu(lev) (a
+!  plain commutative reduction, order-independent up to the same floating-
+!  point reassociation noise already accepted for taumol_gpu/setcoef_gpu) --
+!  implemented here as "!$acc atomic update" adds from each (column,g-point)
+!  gang into the shared per-(column,layer) totuflux/totdflux/totuclfl/
+!  totdclfl accumulators, contended only across a single column's 140
+!  g-points, not across columns.
+!
+!  The final fnet/heating-rate post-processing (rtrnmc_post_gpu) is split
+!  into two kernels rather than one: htr(l) reads fnet(l) *and* fnet(l+1),
+!  so it cannot be fused into the same parallel loop that writes fnet
+!  (another gang could read fnet(l+1) before it's been written) -- two
+!  kernel launches give the ordering the single CPU loop got for free.
+!-------------------------------------------------------------------------------
+      MODULE rrtmg_lw_rtrnmc_gpu
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrtm, only : mxlay, nbndlw, ngptlw
+
+      real(kind=rb) :: wtdiff_gpu, rec_6_gpu
+      real(kind=rb) :: a0_gpu(nbndlw), a1_gpu(nbndlw), a2_gpu(nbndlw)
+      data wtdiff_gpu /0.5_rb/
+      data rec_6_gpu /0.166667_rb/
+      data a0_gpu / 1.66_rb,  1.55_rb,  1.58_rb,  1.66_rb, &
+                1.54_rb, 1.454_rb,  1.89_rb,  1.33_rb, &
+               1.668_rb,  1.66_rb,  1.66_rb,  1.66_rb, &
+                1.66_rb,  1.66_rb,  1.66_rb,  1.66_rb /
+      data a1_gpu / 0.00_rb,  0.25_rb,  0.22_rb,  0.00_rb, &
+                0.13_rb, 0.446_rb, -0.10_rb,  0.40_rb, &
+              -0.006_rb,  0.00_rb,  0.00_rb,  0.00_rb, &
+                0.00_rb,  0.00_rb,  0.00_rb,  0.00_rb /
+      data a2_gpu / 0.00_rb, -12.0_rb, -11.7_rb,  0.00_rb, &
+               -0.72_rb,-0.243_rb,  0.19_rb,-0.062_rb, &
+               0.414_rb,  0.00_rb,  0.00_rb,  0.00_rb, &
+                0.00_rb,  0.00_rb,  0.00_rb,  0.00_rb /
+
+      CONTAINS
+
+      SUBROUTINE rtrnmc_secdiff_gpu(ncol, pwvcm, secdiff)
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol
+      REAL(kind=rb), INTENT(IN) :: pwvcm(ncol)
+      REAL(kind=rb), INTENT(OUT) :: secdiff(ncol,nbndlw)
+
+      INTEGER(kind=im) :: iplon, ibnd
+
+!$acc parallel loop collapse(2) present(pwvcm, secdiff) &
+!$acc   present(a0_gpu, a1_gpu, a2_gpu)
+      DO iplon = 1, ncol
+      DO ibnd = 1, nbndlw
+         IF (ibnd .eq. 1 .or. ibnd .eq. 4 .or. ibnd .ge. 10) THEN
+            secdiff(iplon,ibnd) = 1.66_rb
+         ELSE
+            secdiff(iplon,ibnd) = a0_gpu(ibnd) + a1_gpu(ibnd)*exp(a2_gpu(ibnd)*pwvcm(iplon))
+            IF (secdiff(iplon,ibnd) .gt. 1.80_rb) secdiff(iplon,ibnd) = 1.80_rb
+            IF (secdiff(iplon,ibnd) .lt. 1.50_rb) secdiff(iplon,ibnd) = 1.50_rb
+         ENDIF
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE rtrnmc_secdiff_gpu
+
+      SUBROUTINE rtrnmc_cldprep_gpu(ncol, nlayers, cldfmc, taucmc, secdiff, &
+                                     icldlyr, odcld, abscld, efclfrac)
+
+      use rrlw_wvn, only: ngb
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers
+      REAL(kind=rb), INTENT(IN) :: cldfmc(ncol,ngptlw,nlayers), taucmc(ncol,ngptlw,nlayers)
+      REAL(kind=rb), INTENT(IN) :: secdiff(ncol,nbndlw)
+      INTEGER(kind=im), INTENT(OUT) :: icldlyr(ncol,nlayers)
+      REAL(kind=rb), INTENT(OUT) :: odcld(ncol,nlayers,ngptlw), abscld(ncol,nlayers,ngptlw), &
+                                     efclfrac(ncol,nlayers,ngptlw)
+
+      INTEGER(kind=im) :: iplon, lay, ig, ib
+      REAL(kind=rb) :: transcld
+
+!$acc parallel loop collapse(2) private(ib, transcld) &
+!$acc   present(cldfmc, taucmc, secdiff, icldlyr, odcld, abscld, efclfrac, ngb)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+         icldlyr(iplon,lay) = 0
+!$acc loop seq
+         DO ig = 1, ngptlw
+            IF (cldfmc(iplon,ig,lay) .eq. 1._rb) THEN
+               ib = ngb(ig)
+               odcld(iplon,lay,ig) = secdiff(iplon,ib) * taucmc(iplon,ig,lay)
+               transcld = exp(-odcld(iplon,lay,ig))
+               abscld(iplon,lay,ig) = 1._rb - transcld
+               efclfrac(iplon,lay,ig) = abscld(iplon,lay,ig) * cldfmc(iplon,ig,lay)
+               icldlyr(iplon,lay) = 1
+            ELSE
+               odcld(iplon,lay,ig) = 0.0_rb
+               abscld(iplon,lay,ig) = 0.0_rb
+               efclfrac(iplon,lay,ig) = 0.0_rb
+            ENDIF
+         ENDDO
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE rtrnmc_cldprep_gpu
+
+      SUBROUTINE rtrnmc_zero_gpu(ncol, nlayers, totuflux, totdflux, totuclfl, totdclfl)
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers
+      REAL(kind=rb), INTENT(OUT) :: totuflux(ncol,0:nlayers), totdflux(ncol,0:nlayers)
+      REAL(kind=rb), INTENT(OUT) :: totuclfl(ncol,0:nlayers), totdclfl(ncol,0:nlayers)
+
+      INTEGER(kind=im) :: iplon, lev
+
+!$acc parallel loop collapse(2) present(totuflux, totdflux, totuclfl, totdclfl)
+      DO iplon = 1, ncol
+      DO lev = 0, nlayers
+         totuflux(iplon,lev) = 0.0_rb
+         totdflux(iplon,lev) = 0.0_rb
+         totuclfl(iplon,lev) = 0.0_rb
+         totdclfl(iplon,lev) = 0.0_rb
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE rtrnmc_zero_gpu
+
+! Main sweep: parallel over (column, g-point), sequential down-then-up sweep
+! over layers within each (column,g-point) pair, atomic-accumulating each
+! g-point's weighted contribution into the shared per-(column,layer) flux
+! totals -- see the module header comment for the full derivation of why
+! this flattening is exact for WRF's only call shape (istart=1,iend=16,
+! iout=0).
+      SUBROUTINE rtrnmc_gpu(ncol, nlayers, semiss, &
+                             cldfmc, taucmc, planklay, planklev, plankbnd, &
+                             fracs, taut, secdiff, icldlyr, odcld, abscld, efclfrac, &
+                             totuflux, totdflux, totuclfl, totdclfl)
+
+      use rrlw_wvn, only: delwave, ngb
+      use rrlw_tbl, only: tblint, bpade, tau_tbl, exp_tbl, tfn_tbl
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers
+      REAL(kind=rb), INTENT(IN) :: semiss(ncol,nbndlw)
+      REAL(kind=rb), INTENT(IN) :: cldfmc(ncol,ngptlw,nlayers), taucmc(ncol,ngptlw,nlayers)
+      REAL(kind=rb), INTENT(IN) :: planklay(ncol,nlayers,nbndlw), planklev(ncol,0:nlayers,nbndlw)
+      REAL(kind=rb), INTENT(IN) :: plankbnd(ncol,nbndlw)
+      REAL(kind=rb), INTENT(IN) :: fracs(ncol,nlayers,ngptlw), taut(ncol,nlayers,ngptlw)
+      REAL(kind=rb), INTENT(IN) :: secdiff(ncol,nbndlw)
+      INTEGER(kind=im), INTENT(IN) :: icldlyr(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: odcld(ncol,nlayers,ngptlw), abscld(ncol,nlayers,ngptlw), &
+                                    efclfrac(ncol,nlayers,ngptlw)
+      REAL(kind=rb), INTENT(INOUT) :: totuflux(ncol,0:nlayers), totdflux(ncol,0:nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: totuclfl(ncol,0:nlayers), totdclfl(ncol,0:nlayers)
+
+      INTEGER(kind=im) :: iplon, igc, iband, lev, ib
+      INTEGER(kind=im) :: iclddn
+      INTEGER(kind=im) :: ittot, itgas, itr
+      REAL(kind=rb) :: atrans(mxlay), bbugas(mxlay), bbutot(mxlay), atot(mxlay)
+      REAL(kind=rb) :: urad(0:mxlay), drad(0:mxlay), clrurad(0:mxlay), clrdrad(0:mxlay)
+      REAL(kind=rb) :: radld, radclrd, plfrac, blay, dplankup, dplankdn
+      REAL(kind=rb) :: odepth, odtot, odepth_rec, odtot_rec, gassrc
+      REAL(kind=rb) :: tblind, tfactot, bbd, bbdtot, tfacgas, transc, tausfac
+      REAL(kind=rb) :: rad0, reflect, radlu, radclru
+      REAL(kind=rb) :: wt
+
+!$acc parallel loop collapse(2) &
+!$acc   private(iband, ib, lev, iclddn, ittot, itgas, itr) &
+!$acc   private(atrans, bbugas, bbutot, atot, urad, drad, clrurad, clrdrad) &
+!$acc   private(radld, radclrd, plfrac, blay, dplankup, dplankdn) &
+!$acc   private(odepth, odtot, odepth_rec, odtot_rec, gassrc) &
+!$acc   private(tblind, tfactot, bbd, bbdtot, tfacgas, transc, tausfac) &
+!$acc   private(rad0, reflect, radlu, radclru, wt) &
+!$acc   present(semiss, cldfmc, taucmc, planklay, planklev, plankbnd) &
+!$acc   present(fracs, taut, secdiff, icldlyr, odcld, abscld, efclfrac) &
+!$acc   present(totuflux, totdflux, totuclfl, totdclfl) &
+!$acc   present(delwave, ngb, tau_tbl, exp_tbl, tfn_tbl, bpade)
+      DO iplon = 1, ncol
+      DO igc = 1, ngptlw
+
+         iband = ngb(igc)
+
+         radld = 0._rb
+         radclrd = 0._rb
+         iclddn = 0
+         urad(0) = 0.0_rb
+         drad(0) = 0.0_rb
+         clrurad(0) = 0.0_rb
+         clrdrad(0) = 0.0_rb
+
+! Downward radiative transfer loop.
+!$acc loop seq
+         DO lev = nlayers, 1, -1
+            plfrac = fracs(iplon,lev,igc)
+            blay = planklay(iplon,lev,iband)
+            dplankup = planklev(iplon,lev,iband) - blay
+            dplankdn = planklev(iplon,lev-1,iband) - blay
+            odepth = secdiff(iplon,iband) * taut(iplon,lev,igc)
+            IF (odepth .lt. 0.0_rb) odepth = 0.0_rb
+
+            IF (icldlyr(iplon,lev) .eq. 1) THEN
+               iclddn = 1
+               odtot = odepth + odcld(iplon,lev,igc)
+               IF (odtot .lt. 0.06_rb) THEN
+                  atrans(lev) = odepth - 0.5_rb*odepth*odepth
+                  odepth_rec = rec_6_gpu*odepth
+                  gassrc = plfrac*(blay+dplankdn*odepth_rec)*atrans(lev)
+
+                  atot(lev) = odtot - 0.5_rb*odtot*odtot
+                  odtot_rec = rec_6_gpu*odtot
+                  bbdtot = plfrac * (blay+dplankdn*odtot_rec)
+                  bbd = plfrac*(blay+dplankdn*odepth_rec)
+                  radld = radld - radld * (atrans(lev) + &
+                      efclfrac(iplon,lev,igc) * (1. - atrans(lev))) + &
+                      gassrc + cldfmc(iplon,igc,lev) * &
+                      (bbdtot * atot(lev) - gassrc)
+                  drad(lev-1) = drad(lev-1) + radld
+
+                  bbugas(lev) = plfrac * (blay+dplankup*odepth_rec)
+                  bbutot(lev) = plfrac * (blay+dplankup*odtot_rec)
+
+               ELSEIF (odepth .le. 0.06_rb) THEN
+                  atrans(lev) = odepth - 0.5_rb*odepth*odepth
+                  odepth_rec = rec_6_gpu*odepth
+                  gassrc = plfrac*(blay+dplankdn*odepth_rec)*atrans(lev)
+
+                  odtot = odepth + odcld(iplon,lev,igc)
+                  tblind = odtot/(bpade+odtot)
+                  ittot = tblint*tblind + 0.5_rb
+                  tfactot = tfn_tbl(ittot)
+                  bbdtot = plfrac * (blay + tfactot*dplankdn)
+                  bbd = plfrac*(blay+dplankdn*odepth_rec)
+                  atot(lev) = 1. - exp_tbl(ittot)
+
+                  radld = radld - radld * (atrans(lev) + &
+                      efclfrac(iplon,lev,igc) * (1._rb - atrans(lev))) + &
+                      gassrc + cldfmc(iplon,igc,lev) * &
+                      (bbdtot * atot(lev) - gassrc)
+                  drad(lev-1) = drad(lev-1) + radld
+
+                  bbugas(lev) = plfrac * (blay + dplankup*odepth_rec)
+                  bbutot(lev) = plfrac * (blay + tfactot * dplankup)
+
+               ELSE
+                  tblind = odepth/(bpade+odepth)
+                  itgas = tblint*tblind+0.5_rb
+                  odepth = tau_tbl(itgas)
+                  atrans(lev) = 1._rb - exp_tbl(itgas)
+                  tfacgas = tfn_tbl(itgas)
+                  gassrc = atrans(lev) * plfrac * (blay + tfacgas*dplankdn)
+
+                  odtot = odepth + odcld(iplon,lev,igc)
+                  tblind = odtot/(bpade+odtot)
+                  ittot = tblint*tblind + 0.5_rb
+                  tfactot = tfn_tbl(ittot)
+                  bbdtot = plfrac * (blay + tfactot*dplankdn)
+                  bbd = plfrac*(blay+tfacgas*dplankdn)
+                  atot(lev) = 1._rb - exp_tbl(ittot)
+
+                  radld = radld - radld * (atrans(lev) + &
+                    efclfrac(iplon,lev,igc) * (1._rb - atrans(lev))) + &
+                    gassrc + cldfmc(iplon,igc,lev) * &
+                    (bbdtot * atot(lev) - gassrc)
+                  drad(lev-1) = drad(lev-1) + radld
+                  bbugas(lev) = plfrac * (blay + tfacgas * dplankup)
+                  bbutot(lev) = plfrac * (blay + tfactot * dplankup)
+               ENDIF
+            ELSE
+               IF (odepth .le. 0.06_rb) THEN
+                  atrans(lev) = odepth-0.5_rb*odepth*odepth
+                  odepth = rec_6_gpu*odepth
+                  bbd = plfrac*(blay+dplankdn*odepth)
+                  bbugas(lev) = plfrac*(blay+dplankup*odepth)
+               ELSE
+                  tblind = odepth/(bpade+odepth)
+                  itr = tblint*tblind+0.5_rb
+                  transc = exp_tbl(itr)
+                  atrans(lev) = 1._rb-transc
+                  tausfac = tfn_tbl(itr)
+                  bbd = plfrac*(blay+tausfac*dplankdn)
+                  bbugas(lev) = plfrac * (blay + tausfac * dplankup)
+               ENDIF
+               radld = radld + (bbd-radld)*atrans(lev)
+               drad(lev-1) = drad(lev-1) + radld
+            ENDIF
+
+            IF (iclddn .eq. 1) THEN
+               radclrd = radclrd + (bbd-radclrd) * atrans(lev)
+               clrdrad(lev-1) = clrdrad(lev-1) + radclrd
+            ELSE
+               radclrd = radld
+               clrdrad(lev-1) = drad(lev-1)
+            ENDIF
+         ENDDO
+
+         rad0 = fracs(iplon,1,igc) * plankbnd(iplon,iband)
+         reflect = 1._rb - semiss(iplon,iband)
+         radlu = rad0 + reflect * radld
+         radclru = rad0 + reflect * radclrd
+
+         urad(0) = urad(0) + radlu
+         clrurad(0) = clrurad(0) + radclru
+
+! Upward radiative transfer loop.
+!$acc loop seq
+         DO lev = 1, nlayers
+            IF (icldlyr(iplon,lev) .eq. 1) THEN
+               gassrc = bbugas(lev) * atrans(lev)
+               radlu = radlu - radlu * (atrans(lev) + &
+                   efclfrac(iplon,lev,igc) * (1._rb - atrans(lev))) + &
+                   gassrc + cldfmc(iplon,igc,lev) * &
+                   (bbutot(lev) * atot(lev) - gassrc)
+               urad(lev) = urad(lev) + radlu
+            ELSE
+               radlu = radlu + (bbugas(lev)-radlu)*atrans(lev)
+               urad(lev) = urad(lev) + radlu
+            ENDIF
+            IF (iclddn .eq. 1) THEN
+               radclru = radclru + (bbugas(lev)-radclru)*atrans(lev)
+               clrurad(lev) = clrurad(lev) + radclru
+            ELSE
+               radclru = radlu
+               clrurad(lev) = urad(lev)
+            ENDIF
+         ENDDO
+
+! Weighted contribution of this g-point into the shared per-column,
+! per-layer flux accumulators (see module header comment: equivalent to
+! the original's per-band scale-and-accumulate, since delwave depends
+! only on this g-point's band).
+         wt = wtdiff_gpu * delwave(iband)
+!$acc loop seq
+         DO lev = 0, nlayers
+!$acc atomic update
+            totuflux(iplon,lev) = totuflux(iplon,lev) + urad(lev) * wt
+!$acc atomic update
+            totdflux(iplon,lev) = totdflux(iplon,lev) + drad(lev) * wt
+!$acc atomic update
+            totuclfl(iplon,lev) = totuclfl(iplon,lev) + clrurad(lev) * wt
+!$acc atomic update
+            totdclfl(iplon,lev) = totdclfl(iplon,lev) + clrdrad(lev) * wt
+         ENDDO
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE rtrnmc_gpu
+
+! Final scaling + net flux (pass 1) and heating rate (pass 2, needs pass 1's
+! fnet at both lev and lev+1 already written -- see module header comment).
+      SUBROUTINE rtrnmc_post_gpu(ncol, nlayers, pz, &
+                                  totuflux, totdflux, fnet, htr, &
+                                  totuclfl, totdclfl, fnetc, htrc)
+
+      use rrlw_con, only: fluxfac, heatfac
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers
+      REAL(kind=rb), INTENT(IN) :: pz(ncol,0:nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: totuflux(ncol,0:nlayers), totdflux(ncol,0:nlayers)
+      REAL(kind=rb), INTENT(OUT) :: fnet(ncol,0:nlayers)
+      REAL(kind=rb), INTENT(OUT) :: htr(ncol,0:nlayers)
+      REAL(kind=rb), INTENT(INOUT) :: totuclfl(ncol,0:nlayers), totdclfl(ncol,0:nlayers)
+      REAL(kind=rb), INTENT(OUT) :: fnetc(ncol,0:nlayers)
+      REAL(kind=rb), INTENT(OUT) :: htrc(ncol,0:nlayers)
+
+      INTEGER(kind=im) :: iplon, lev, l
+
+!$acc parallel loop collapse(2) present(totuflux, totdflux, fnet, totuclfl, totdclfl, fnetc)
+      DO iplon = 1, ncol
+      DO lev = 0, nlayers
+         totuflux(iplon,lev) = totuflux(iplon,lev) * fluxfac
+         totdflux(iplon,lev) = totdflux(iplon,lev) * fluxfac
+         fnet(iplon,lev) = totuflux(iplon,lev) - totdflux(iplon,lev)
+         totuclfl(iplon,lev) = totuclfl(iplon,lev) * fluxfac
+         totdclfl(iplon,lev) = totdclfl(iplon,lev) * fluxfac
+         fnetc(iplon,lev) = totuclfl(iplon,lev) - totdclfl(iplon,lev)
+      ENDDO
+      ENDDO
+
+!$acc parallel loop collapse(2) private(l) present(fnet, fnetc, pz, htr, htrc)
+      DO iplon = 1, ncol
+      DO lev = 1, nlayers
+         l = lev - 1
+         htr(iplon,l) = heatfac*(fnet(iplon,l)-fnet(iplon,lev))/(pz(iplon,l)-pz(iplon,lev))
+         htrc(iplon,l) = heatfac*(fnetc(iplon,l)-fnetc(iplon,lev))/(pz(iplon,l)-pz(iplon,lev))
+      ENDDO
+      ENDDO
+
+!$acc parallel loop present(htr, htrc)
+      DO iplon = 1, ncol
+         htr(iplon,nlayers) = 0.0_rb
+         htrc(iplon,nlayers) = 0.0_rb
+      ENDDO
+
+      END SUBROUTINE rtrnmc_post_gpu
+
+! Single entry point bundling secdiff + cldprep + zero + main sweep + post,
+! mirroring taumol_gpu/setcoef_driver_gpu's bundling convention. Asserts the
+! istart=1/iend=16/iout=0 assumption documented in the module header comment
+! (WRF's only call shape) on the host before launching any kernel.
+      SUBROUTINE rtrnmc_driver_gpu(ncol, nlayers, istart, iend, iout, pz, semiss, &
+                                    cldfmc, taucmc, planklay, planklev, plankbnd, &
+                                    pwvcm, fracs, taut, &
+                                    totuflux, totdflux, fnet, htr, &
+                                    totuclfl, totdclfl, fnetc, htrc)
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, istart, iend, iout
+      REAL(kind=rb), INTENT(IN) :: pz(ncol,0:nlayers)
+      REAL(kind=rb), INTENT(IN) :: semiss(ncol,nbndlw)
+      REAL(kind=rb), INTENT(IN) :: cldfmc(ncol,ngptlw,nlayers), taucmc(ncol,ngptlw,nlayers)
+      REAL(kind=rb), INTENT(IN) :: planklay(ncol,nlayers,nbndlw), planklev(ncol,0:nlayers,nbndlw)
+      REAL(kind=rb), INTENT(IN) :: plankbnd(ncol,nbndlw)
+      REAL(kind=rb), INTENT(IN) :: pwvcm(ncol)
+      REAL(kind=rb), INTENT(IN) :: fracs(ncol,nlayers,ngptlw), taut(ncol,nlayers,ngptlw)
+      REAL(kind=rb), INTENT(OUT) :: totuflux(ncol,0:nlayers), totdflux(ncol,0:nlayers)
+      REAL(kind=rb), INTENT(OUT) :: fnet(ncol,0:nlayers)
+      REAL(kind=rb), INTENT(OUT) :: htr(ncol,0:nlayers)
+      REAL(kind=rb), INTENT(OUT) :: totuclfl(ncol,0:nlayers), totdclfl(ncol,0:nlayers)
+      REAL(kind=rb), INTENT(OUT) :: fnetc(ncol,0:nlayers)
+      REAL(kind=rb), INTENT(OUT) :: htrc(ncol,0:nlayers)
+
+      REAL(kind=rb), ALLOCATABLE :: secdiff(:,:)
+      INTEGER(kind=im), ALLOCATABLE :: icldlyr(:,:)
+      REAL(kind=rb), ALLOCATABLE :: odcld(:,:,:), abscld(:,:,:), efclfrac(:,:,:)
+
+      IF (istart .ne. 1 .or. iend .ne. 16 .or. iout .ne. 0) THEN
+         CALL wrf_error_fatal('rtrnmc_driver_gpu: only istart=1,iend=16,iout=0 (WRF''s only call shape) is ported')
+      ENDIF
+
+      ALLOCATE(secdiff(ncol,nbndlw))
+      ALLOCATE(icldlyr(ncol,nlayers))
+      ALLOCATE(odcld(ncol,nlayers,ngptlw), abscld(ncol,nlayers,ngptlw), efclfrac(ncol,nlayers,ngptlw))
+
+!$acc enter data create(secdiff, icldlyr, odcld, abscld, efclfrac)
+
+      CALL rtrnmc_secdiff_gpu(ncol, pwvcm, secdiff)
+      CALL rtrnmc_cldprep_gpu(ncol, nlayers, cldfmc, taucmc, secdiff, &
+                               icldlyr, odcld, abscld, efclfrac)
+      CALL rtrnmc_zero_gpu(ncol, nlayers, totuflux, totdflux, totuclfl, totdclfl)
+      CALL rtrnmc_gpu(ncol, nlayers, semiss, &
+                       cldfmc, taucmc, planklay, planklev, plankbnd, &
+                       fracs, taut, secdiff, icldlyr, odcld, abscld, efclfrac, &
+                       totuflux, totdflux, totuclfl, totdclfl)
+
+!$acc exit data delete(secdiff, icldlyr, odcld, abscld, efclfrac)
+
+      CALL rtrnmc_post_gpu(ncol, nlayers, pz, &
+                            totuflux, totdflux, fnet, htr, &
+                            totuclfl, totdclfl, fnetc, htrc)
+
+      DEALLOCATE(secdiff, icldlyr, odcld, abscld, efclfrac)
+
+      END SUBROUTINE rtrnmc_driver_gpu
+
+      END MODULE rrtmg_lw_rtrnmc_gpu
+#endif
+
 !     path:      $Source: /cvsroot/NWP/WRFV3/phys/module_ra_rrtmg_lw.F,v $
 !     author:    $Author: trn $
 !     revision:  $Revision: 1.3 $
