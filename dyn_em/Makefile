@@ -62,7 +62,7 @@ include ../configure.wrf
 # GPU_DYN_FLAGS is empty in every CPU configuration, so those builds continue
 # to use the ordinary implicit compilation rule unchanged.
 ifneq ($(GPU_DYN_FLAGS),)
-module_small_step_em.o module_big_step_utilities_em.o solve_em.o: FCFLAGS += $(GPU_DYN_FLAGS)
+module_small_step_em.o module_big_step_utilities_em.o solve_em.o module_advect_em.o module_em.o: FCFLAGS += $(GPU_DYN_FLAGS)
 endif
 
 cio.o :

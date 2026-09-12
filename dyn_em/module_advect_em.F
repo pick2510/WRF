@@ -129,7 +129,53 @@ MODULE module_advect_em
   USE module_model_constants
   USE module_wrf_error
 
+#ifdef WRF_GPU_DYN
+!  Fast-path (h_mom_adv_order==5, v_mom_adv_order==3) OpenACC kernels use fully
+!  materialized 3-D flux buffers instead of the rolling 2-slot j-buffer, so that
+!  every kernel can be a standalone, auto-closing, multi-gang
+!  "!$acc parallel loop collapse(N)" with no enclosing "!$acc data" region and
+!  no manually-delimited "!$acc parallel"/"!$acc end parallel" pair -- see
+!  plan.md for why: a second manually-delimited region sharing an enclosing
+!  data region inside a conditional branch reproducibly crashed with
+!  CUDA_ERROR_ILLEGAL_ADDRESS under NVHPC 26.5.  Buffers are shared across
+!  advect_u_o5v3/advect_v_o5v3/advect_w_o5v3/advect_scalar_o5v3 (added
+!  incrementally) since they are never live at the same time; allocated once
+!  per unique tile-bound signature and kept resident for the run.
+   REAL, ALLOCATABLE, DIMENSION(:,:,:), SAVE :: fast_fqy3, fast_fqx3, fast_vflux3
+   INTEGER, SAVE :: fast_its = -999999, fast_ite, fast_jts, fast_jte, &
+                    fast_kts, fast_kte
+#endif
+
 CONTAINS
+
+#ifdef WRF_GPU_DYN
+SUBROUTINE advect_fast_ensure_buffers ( its, ite, jts, jte, kts, kte )
+!  (Re)allocate the shared fast-path scratch buffers if the tile bounds have
+!  changed (first call, or a different nest/domain) and (re)establish their
+!  device residency. Cheap no-op on every call after the first for a given
+!  tile, since WRF tile bounds are fixed for the life of a run.
+   IMPLICIT NONE
+   INTEGER, INTENT(IN) :: its, ite, jts, jte, kts, kte
+
+   IF ( its == fast_its .AND. ite == fast_ite .AND. jts == fast_jts .AND. &
+        jte == fast_jte .AND. kts == fast_kts .AND. kte == fast_kte ) RETURN
+
+   IF ( ALLOCATED( fast_fqy3 ) ) THEN
+      !$acc exit data delete(fast_fqy3,fast_fqx3,fast_vflux3)
+      DEALLOCATE( fast_fqy3, fast_fqx3, fast_vflux3 )
+   ENDIF
+
+   ALLOCATE( fast_fqy3  ( its:ite,   kts:kte, jts-1:jte+1 ) )
+   ALLOCATE( fast_fqx3  ( its-1:ite+1, kts:kte, jts:jte   ) )
+   ALLOCATE( fast_vflux3( its:ite,   kts:kte, jts:jte     ) )
+   !$acc enter data create(fast_fqy3,fast_fqx3,fast_vflux3)
+
+   fast_its = its ; fast_ite = ite
+   fast_jts = jts ; fast_jte = jte
+   fast_kts = kts ; fast_kte = kte
+
+END SUBROUTINE advect_fast_ensure_buffers
+#endif
 
 !-------------------------------------------------------------------------------
 
@@ -233,6 +279,26 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
    horz_order = config_flags%h_mom_adv_order
    vert_order = config_flags%v_mom_adv_order
 
+#ifdef WRF_GPU_DYN
+!  wrf_error_fatal/WRITE cannot run on the device, so validate the order
+!  arguments on the host before entering the parallel region; the ELSE
+!  branches inside horizontal_order_test/vert_order_test below are then
+!  unreachable and were emptied out (see there).
+   IF ( .NOT. ( horz_order==0 .OR. horz_order==2 .OR. horz_order==3 .OR. &
+                horz_order==4 .OR. horz_order==5 .OR. horz_order==6 ) ) THEN
+      WRITE ( wrf_err_message , * ) 'module_advect: advect_u: h_order not known ',horz_order
+      CALL wrf_error_fatal ( TRIM( wrf_err_message ) )
+   ENDIF
+   IF ( .NOT. ( vert_order==2 .OR. vert_order==3 .OR. &
+                vert_order==4 .OR. vert_order==5 .OR. vert_order==6 ) ) THEN
+      WRITE ( wrf_err_message , * ) 'module_advect: advect_u: v_order not known ',vert_order
+      CALL wrf_error_fatal ( TRIM( wrf_err_message ) )
+   ENDIF
+   !$acc data present(u,u_old,ru,rv,rom,mut,tendency,msfux,msfuy,msfvx,msfvy, &
+   !$acc& msftx,msfty,fzm,fzp,rdzw,c1,c2,config_flags) create(fqx,fqy,vflux)
+   !$acc parallel private(i,j,k) num_gangs(1)
+#endif
+
    ktf=MIN(kte,kde-1)
 
 !  begin with horizontal flux divergence
@@ -299,11 +365,20 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
      jp1 = 2
      jp0 = 1
 
+#ifdef WRF_GPU_DYN
+     !$acc loop seq
+#endif
      j_loop_y_flux_6 : DO j = j_start, j_end+1
 
       IF( (j >= j_start_f ) .and. (j <= j_end_f) ) THEN  ! use full stencil
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start, i_end
           vel = 0.5*(rv(i,k,j)+rv(i-1,k,j))
           fqy( i, k, jp1 ) = vel*flux6(               &
@@ -316,7 +391,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
       ELSE IF ( j == jds+1 ) THEN   ! 2nd order flux next to south boundary
 
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               fqy(i, k, jp1) = 0.25*(rv(i,k,j)+rv(i-1,k,j))  &
                                      *(u(i,k,j)+u(i,k,j-1))
@@ -325,7 +406,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
      ELSE IF  ( j == jds+2 ) THEN  ! third of 4th order flux 2 in from south boundary
 
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               vel = 0.5*(rv(i,k,j)+rv(i-1,k,j))
               fqy( i, k, jp1 ) = vel*flux4(      &
@@ -335,7 +422,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
      ELSE IF ( j == jde-1 ) THEN  ! 2nd order flux next to north boundary
 
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               fqy(i, k, jp1) = 0.25*(rv(i,k,j)+rv(i-1,k,j))    &
                      *(u(i,k,j)+u(i,k,j-1))
@@ -344,7 +437,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
      ELSE IF ( j == jde-2 ) THEN  ! 3rd order flux 2 in from north boundary
 
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               vel = 0.5*(rv(i,k,j)+rv(i-1,k,j))
               fqy( i, k, jp1 ) = vel*flux4(     &
@@ -359,7 +458,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
         ! (j > j_start) will miss the u(,,jds) tendency
         IF ( config_flags%polar .AND. (j == jds+1) ) THEN
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             mrdy=msfux(i,j-1)*rdy   ! ADT eqn 44, 2nd term on RHS
             tendency(i,k,j-1) = tendency(i,k,j-1) - mrdy*fqy(i,k,jp1)
@@ -367,7 +472,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
           END DO
         ! This would be seen by (j > j_start) but we need to zero out the NP tendency
         ELSE IF( config_flags%polar .AND. (j == jde) ) THEN
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             mrdy=msfux(i,j-1)*rdy   ! ADT eqn 44, 2nd term on RHS
             tendency(i,k,j-1) = tendency(i,k,j-1) + mrdy*fqy(i,k,jp0)
@@ -377,7 +488,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
         IF(j > j_start) THEN
 
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             mrdy=msfux(i,j-1)*rdy   ! ADT eqn 44, 2nd term on RHS
             tendency(i,k,j-1) = tendency(i,k,j-1) - mrdy*(fqy(i,k,jp1)-fqy(i,k,jp0))
@@ -421,11 +538,20 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
 !  compute fluxes
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
 !  5th or 6th order flux
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start_f, i_end_f
           vel = 0.5*(ru(i,k,j)+ru(i-1,k,j))
           fqx( i,k ) = vel*flux6( u(i-3,k,j), u(i-2,k,j),  &
@@ -442,6 +568,9 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
           IF( i_start == ids+1 ) THEN ! second order flux next to the boundary
             i = ids+1
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO k=kts,ktf
               ub = u(i-1,k,j)
               IF (specified .AND. u(i,k,j) .LT. 0.)ub = u(i,k,j)
@@ -451,6 +580,9 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
           END IF
 
           i = ids+2
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO k=kts,ktf
             vel = 0.5*(ru(i,k,j)+ru(i-1,k,j))
             fqx( i, k  ) = vel*flux4( u(i-2,k,j), u(i-1,k,j),  &
@@ -464,6 +596,9 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
           IF( i_end == ide-1 ) THEN ! second order flux next to the boundary
             i = ide
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO k=kts,ktf
               ub = u(i,k,j)
               IF (specified .AND. u(i-1,k,j) .GT. 0.)ub = u(i-1,k,j)
@@ -472,6 +607,9 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
             ENDDO
           ENDIF
 
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO k=kts,ktf
           i = ide-1
           vel = 0.5*(ru(i,k,j)+ru(i-1,k,j))
@@ -484,7 +622,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
 !  x flux-divergence into tendency
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             mrdx=msfux(i,j)*rdx ! ADT eqn 44, 1st term on RHS
             tendency(i,k,j) = tendency(i,k,j) - mrdx*(fqx(i+1,k)-fqx(i,k))
@@ -560,11 +704,20 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
      jp1 = 2
      jp0 = 1
 
+#ifdef WRF_GPU_DYN
+     !$acc loop seq
+#endif
      j_loop_y_flux_5 : DO j = j_start, j_end+1
 
       IF( (j >= j_start_f ) .and. (j <= j_end_f) ) THEN  ! use full stencil
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start, i_end
           vel = 0.5*(rv(i,k,j)+rv(i-1,k,j))
           fqy( i, k, jp1 ) = vel*flux5(               &
@@ -577,7 +730,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
       ELSE IF ( j == jds+1 ) THEN   ! 2nd order flux next to south boundary
 
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               fqy(i, k, jp1) = 0.25*(rv(i,k,j)+rv(i-1,k,j))  &
                                      *(u(i,k,j)+u(i,k,j-1))
@@ -586,7 +745,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
      ELSE IF  ( j == jds+2 ) THEN  ! third of 4th order flux 2 in from south boundary
 
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               vel = 0.5*(rv(i,k,j)+rv(i-1,k,j))
               fqy( i, k, jp1 ) = vel*flux3(      &
@@ -596,7 +761,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
      ELSE IF ( j == jde-1 ) THEN  ! 2nd order flux next to north boundary
 
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               fqy(i, k, jp1) = 0.25*(rv(i,k,j)+rv(i-1,k,j))    &
                      *(u(i,k,j)+u(i,k,j-1))
@@ -605,7 +776,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
      ELSE IF ( j == jde-2 ) THEN  ! 3rd order flux 2 in from north boundary
 
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               vel = 0.5*(rv(i,k,j)+rv(i-1,k,j))
               fqy( i, k, jp1 ) = vel*flux3(     &
@@ -620,7 +797,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
         ! (j > j_start) will miss the u(,,jds) tendency
         IF ( config_flags%polar .AND. (j == jds+1) ) THEN
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             mrdy=msfux(i,j-1)*rdy   ! ADT eqn 44, 2nd term on RHS
             tendency(i,k,j-1) = tendency(i,k,j-1) - mrdy*fqy(i,k,jp1)
@@ -628,7 +811,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
           END DO
         ! This would be seen by (j > j_start) but we need to zero out the NP tendency
         ELSE IF( config_flags%polar .AND. (j == jde) ) THEN
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             mrdy=msfux(i,j-1)*rdy   ! ADT eqn 44, 2nd term on RHS
             tendency(i,k,j-1) = tendency(i,k,j-1) + mrdy*fqy(i,k,jp0)
@@ -638,7 +827,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
         IF(j > j_start) THEN
 
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             mrdy=msfux(i,j-1)*rdy   ! ADT eqn 44, 2nd term on RHS
             tendency(i,k,j-1) = tendency(i,k,j-1) - mrdy*(fqy(i,k,jp1)-fqy(i,k,jp0))
@@ -682,11 +877,20 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
 !  compute fluxes
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
 !  5th or 6th order flux
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start_f, i_end_f
           vel = 0.5*(ru(i,k,j)+ru(i-1,k,j))
           fqx( i,k ) = vel*flux5( u(i-3,k,j), u(i-2,k,j),  &
@@ -703,6 +907,9 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
           IF( i_start == ids+1 ) THEN ! second order flux next to the boundary
             i = ids+1
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO k=kts,ktf
               ub = u(i-1,k,j)
               IF (specified .AND. u(i,k,j) .LT. 0.)ub = u(i,k,j)
@@ -712,6 +919,9 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
           END IF
 
           i = ids+2
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO k=kts,ktf
             vel = 0.5*(ru(i,k,j)+ru(i-1,k,j))
             fqx( i, k  ) = vel*flux3( u(i-2,k,j), u(i-1,k,j),  &
@@ -725,6 +935,9 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
           IF( i_end == ide-1 ) THEN ! second order flux next to the boundary
             i = ide
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO k=kts,ktf
               ub = u(i,k,j)
               IF (specified .AND. u(i-1,k,j) .GT. 0.)ub = u(i-1,k,j)
@@ -733,6 +946,9 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
             ENDDO
           ENDIF
 
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO k=kts,ktf
           i = ide-1
           vel = 0.5*(ru(i,k,j)+ru(i-1,k,j))
@@ -745,7 +961,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
 !  x flux-divergence into tendency
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             mrdx=msfux(i,j)*rdx ! ADT eqn 44, 1st term on RHS
             tendency(i,k,j) = tendency(i,k,j) - mrdx*(fqx(i+1,k)-fqx(i,k))
@@ -806,9 +1028,18 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
 !  compute fluxes
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start_f, i_end_f
           vel = 0.5*(ru(i,k,j)+ru(i-1,k,j))
           fqx( i, k ) = vel*flux4( u(i-2,k,j), u(i-1,k,j),      &
@@ -821,6 +1052,9 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
         IF( degrade_xs ) THEN
           i = i_start
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO k=kts,ktf
               ub = u(i-1,k,j)
               IF (specified .AND. u(i,k,j) .LT. 0.)ub = u(i,k,j)
@@ -831,6 +1065,9 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
         IF( degrade_xe ) THEN
           i = i_end+1
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO k=kts,ktf
               ub = u(i,k,j)
               IF (specified .AND. u(i-1,k,j) .GT. 0.)ub = u(i-1,k,j)
@@ -841,7 +1078,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
 !  x flux-divergence into tendency
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             mrdx=msfux(i,j)*rdx ! ADT eqn 44, 1st term on RHS
             tendency(i,k,j) = tendency(i,k,j) - mrdx*(fqx(i+1,k)-fqx(i,k))
@@ -886,17 +1129,32 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
      jp1 = 2
      jp0 = 1
 
+#ifdef WRF_GPU_DYN
+   !$acc loop seq
+#endif
    DO j = j_start, j_end+1
 
      IF ( (j < j_start_f) .and. degrade_ys) THEN
+#ifdef WRF_GPU_DYN
+       !$acc loop seq
+#endif
        DO k = kts, ktf
+#ifdef WRF_GPU_DYN
+       !$acc loop vector
+#endif
        DO i = i_start, i_end
          fqy(i, k, jp1) = 0.25*(rv(i,k,j_start)+rv(i-1,k,j_start))  &
                *(u(i,k,j_start)+u(i,k,j_start-1))
        ENDDO
        ENDDO
      ELSE IF ((j > j_end_f) .and. degrade_ye) THEN
+#ifdef WRF_GPU_DYN
+       !$acc loop seq
+#endif
        DO k = kts, ktf
+#ifdef WRF_GPU_DYN
+       !$acc loop vector
+#endif
        DO i = i_start, i_end
          ! Assumes j>j_end_f is ONLY j_end+1 ...
 !         fqy(i, k, jp1) = 0.25*(rv(i,k,j_end+1)+rv(i-1,k,j_end+1))    &
@@ -907,7 +1165,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
        ENDDO
      ELSE
 !  3rd or 4th order flux
+#ifdef WRF_GPU_DYN
+       !$acc loop seq
+#endif
        DO k = kts, ktf
+#ifdef WRF_GPU_DYN
+       !$acc loop vector
+#endif
        DO i = i_start, i_end
          vel = 0.5*(rv(i,k,j)+rv(i-1,k,j))
          fqy( i, k, jp1 ) = vel*flux4( u(i,k,j-2), u(i,k,j-1),  &
@@ -922,7 +1186,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
      ! (j > j_start) will miss the u(,,jds) tendency
      IF ( config_flags%polar .AND. (j == jds+1) ) THEN
+#ifdef WRF_GPU_DYN
+       !$acc loop seq
+#endif
        DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+       !$acc loop vector
+#endif
        DO i = i_start, i_end
          mrdy=msfux(i,j-1)*rdy   ! ADT eqn 44, 2nd term on RHS
          tendency(i,k,j-1) = tendency(i,k,j-1) - mrdy*fqy(i,k,jp1)
@@ -930,7 +1200,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
        END DO
        ! This would be seen by (j > j_start) but we need to zero out the NP tendency
      ELSE IF( config_flags%polar .AND. (j == jde) ) THEN
+#ifdef WRF_GPU_DYN
+       !$acc loop seq
+#endif
        DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+       !$acc loop vector
+#endif
        DO i = i_start, i_end
          mrdy=msfux(i,j-1)*rdy   ! ADT eqn 44, 2nd term on RHS
          tendency(i,k,j-1) = tendency(i,k,j-1) + mrdy*fqy(i,k,jp0)
@@ -940,7 +1216,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
      IF (j > j_start) THEN
 
+#ifdef WRF_GPU_DYN
+       !$acc loop seq
+#endif
        DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+       !$acc loop vector
+#endif
        DO i = i_start, i_end
           mrdy=msfux(i,j-1)*rdy ! ADT eqn 44, 2nd term on RHS
           tendency(i,k,j-1) = tendency(i,k,j-1) - mrdy*(fqy(i,k,jp1)-fqy(i,k,jp0))
@@ -1012,9 +1294,18 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
 !  compute fluxes
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start_f, i_end_f
           vel = 0.5*(ru(i,k,j)+ru(i-1,k,j))
           fqx( i, k ) = vel*flux3( u(i-2,k,j), u(i-1,k,j),      &
@@ -1027,6 +1318,9 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
         IF( degrade_xs ) THEN
           i = i_start
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO k=kts,ktf
               ub = u(i-1,k,j)
               IF (specified .AND. u(i,k,j) .LT. 0.)ub = u(i,k,j)
@@ -1037,6 +1331,9 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
         IF( degrade_xe ) THEN
           i = i_end+1
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO k=kts,ktf
               ub = u(i,k,j)
               IF (specified .AND. u(i-1,k,j) .GT. 0.)ub = u(i-1,k,j)
@@ -1047,7 +1344,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
 !  x flux-divergence into tendency
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
           mrdx=msfux(i,j)*rdx ! ADT eqn 44, 1st term on RHS
             tendency(i,k,j) = tendency(i,k,j) - mrdx*(fqx(i+1,k)-fqx(i,k))
@@ -1091,17 +1394,32 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
      jp1 = 2
      jp0 = 1
 
+#ifdef WRF_GPU_DYN
+   !$acc loop seq
+#endif
    DO j = j_start, j_end+1
 
      IF ( (j < j_start_f) .and. degrade_ys) THEN
+#ifdef WRF_GPU_DYN
+       !$acc loop seq
+#endif
        DO k = kts, ktf
+#ifdef WRF_GPU_DYN
+       !$acc loop vector
+#endif
        DO i = i_start, i_end
          fqy(i, k, jp1) = 0.25*(rv(i,k,j_start)+rv(i-1,k,j_start))  &
                *(u(i,k,j_start)+u(i,k,j_start-1))
        ENDDO
        ENDDO
      ELSE IF ((j > j_end_f) .and. degrade_ye) THEN
+#ifdef WRF_GPU_DYN
+       !$acc loop seq
+#endif
        DO k = kts, ktf
+#ifdef WRF_GPU_DYN
+       !$acc loop vector
+#endif
        DO i = i_start, i_end
          ! Assumes j>j_end_f is ONLY j_end+1 ...
 !         fqy(i, k, jp1) = 0.25*(rv(i,k,j_end+1)+rv(i-1,k,j_end+1))    &
@@ -1112,7 +1430,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
        ENDDO
      ELSE
 !  3rd or 4th order flux
+#ifdef WRF_GPU_DYN
+       !$acc loop seq
+#endif
        DO k = kts, ktf
+#ifdef WRF_GPU_DYN
+       !$acc loop vector
+#endif
        DO i = i_start, i_end
          vel = 0.5*(rv(i,k,j)+rv(i-1,k,j))
          fqy( i, k, jp1 ) = vel*flux3( u(i,k,j-2), u(i,k,j-1),  &
@@ -1127,7 +1451,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
      ! (j > j_start) will miss the u(,,jds) tendency
      IF ( config_flags%polar .AND. (j == jds+1) ) THEN
+#ifdef WRF_GPU_DYN
+       !$acc loop seq
+#endif
        DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+       !$acc loop vector
+#endif
        DO i = i_start, i_end
          mrdy=msfux(i,j-1)*rdy   ! ADT eqn 44, 2nd term on RHS
          tendency(i,k,j-1) = tendency(i,k,j-1) - mrdy*fqy(i,k,jp1)
@@ -1135,7 +1465,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
        END DO
        ! This would be seen by (j > j_start) but we need to zero out the NP tendency
      ELSE IF( config_flags%polar .AND. (j == jde) ) THEN
+#ifdef WRF_GPU_DYN
+       !$acc loop seq
+#endif
        DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+       !$acc loop vector
+#endif
        DO i = i_start, i_end
          mrdy=msfux(i,j-1)*rdy   ! ADT eqn 44, 2nd term on RHS
          tendency(i,k,j-1) = tendency(i,k,j-1) + mrdy*fqy(i,k,jp0)
@@ -1145,7 +1481,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
      IF (j > j_start) THEN
 
+#ifdef WRF_GPU_DYN
+       !$acc loop seq
+#endif
        DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+       !$acc loop vector
+#endif
        DO i = i_start, i_end
           mrdy=msfux(i,j-1)*rdy      ! ADT eqn 44, 2nd term on RHS
           tendency(i,k,j-1) = tendency(i,k,j-1) - mrdy*(fqy(i,k,jp1)-fqy(i,k,jp0))
@@ -1176,8 +1518,17 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
       IF ( config_flags%periodic_x ) i_start = its
       IF ( config_flags%periodic_x ) i_end = ite
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+      !$acc loop vector
+#endif
       DO i = i_start, i_end
          mrdx=msfux(i,j)*rdx         ! ADT eqn 44, 1st term on RHS
          tendency(i,k,j)=tendency(i,k,j)-mrdx*0.25 &
@@ -1188,7 +1539,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
       ENDDO
 
       IF ( specified .AND. its .LE. ids+1 .AND. .NOT. config_flags%periodic_x ) THEN
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO j = j_start, j_end
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO k=kts,ktf
            i = ids+1
            mrdx=msfux(i,j)*rdx       ! ADT eqn 44, 1st term on RHS
@@ -1201,7 +1558,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
         ENDDO
       ENDIF
       IF ( specified .AND. ite .GE. ide-1 .AND. .NOT. config_flags%periodic_x ) THEN
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO j = j_start, j_end
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO k=kts,ktf
            i = ide-1
            mrdx=msfux(i,j)*rdx       ! ADT eqn 44, 1st term on RHS
@@ -1217,8 +1580,17 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
       IF ( config_flags%open_ys .or. specified ) j_start = MAX(jds+1,jts)
       IF ( config_flags%open_ye .or. specified ) j_end   = MIN(jde-2,jte)
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+      !$acc loop vector
+#endif
       DO i = i_start, i_end
          mrdy=msfux(i,j)*rdy         ! ADT eqn 44, 1st term on RHS
          ! Comments for polar boundary condition
@@ -1243,9 +1615,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
       ! Just in case we want to turn horizontal advection off, we can do it
 
    ELSE
-
+!  unreachable under WRF_GPU_DYN: horz_order was validated on the host
+!  before entering this parallel region (wrf_error_fatal/WRITE cannot
+!  run on the device).
+#ifndef WRF_GPU_DYN
       WRITE ( wrf_err_message , * ) 'module_advect: advect_u_6a:  h_order not known ',horz_order
       CALL wrf_error_fatal ( TRIM( wrf_err_message ) )
+#endif
 
    ENDIF horizontal_order_test
 
@@ -1256,7 +1632,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
         j_start = jts
         j_end   = MIN(jte,jde-1)
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO j = j_start, j_end
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO k = kts, ktf
           ub = MIN(ru(its,k,j)-cb*mut(its,j), 0.)
           tendency(its,k,j) = tendency(its,k,j)                    &
@@ -1271,7 +1653,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
         j_start = jts
         j_end   = MIN(jte,jde-1)
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO j = j_start, j_end
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO k = kts, ktf
           ub = MAX(ru(ite,k,j)+cb*mut(ite-1,j), 0.)
           tendency(ite,k,j) = tendency(ite,k,j)                    &
@@ -1301,12 +1689,18 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
    IF( (config_flags%open_ys) .and. (jts == jds)) THEN
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO i = i_start, i_end
 
          mrdy=msfux(i,jts)*rdy       ! ADT eqn 44, 2nd term on RHS
          ip = MIN( imax, i   )
          im = MAX( imin, i-1 )
 
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO k=kts,ktf
 
           vw = 0.5*(rv(ip,k,jts)+rv(im,k,jts))
@@ -1323,12 +1717,18 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
    IF( (config_flags%open_ye) .and. (jte == jde)) THEN
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO i = i_start, i_end
 
          mrdy=msfux(i,jte-1)*rdy     ! ADT eqn 44, 2nd term on RHS
          ip = MIN( imax, i   )
          im = MAX( imin, i-1 )
 
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO k=kts,ktf
 
           vw = 0.5*(rv(ip,k,jte)+rv(im,k,jte))
@@ -1362,6 +1762,9 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
       IF ( config_flags%periodic_x ) i_start = its
       IF ( config_flags%periodic_x ) i_end = ite
 
+#ifdef WRF_GPU_DYN
+   !$acc loop vector
+#endif
    DO i = i_start, i_end
      vflux(i,kts)=0.
      vflux(i,kte)=0.
@@ -1369,9 +1772,18 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
    vert_order_test : IF (vert_order == 6) THEN    
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts+3,ktf-2
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
            vel=0.5*(rom(i-1,k,j)+rom(i,k,j))
            vflux(i,k) = vel*flux6(                     &
@@ -1380,6 +1792,9 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
          ENDDO
          ENDDO
 
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
 
            k=kts+1
@@ -1400,7 +1815,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
                                    *(fzm(k)*u(i,k,j)+fzp(k)*u(i,k-1,j))
 
          ENDDO
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
             tendency(i,k,j)=tendency(i,k,j)-rdzw(k)*(vflux(i,k+1)-vflux(i,k))
          ENDDO
@@ -1409,9 +1830,18 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
     ELSE IF (vert_order == 5) THEN    
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts+3,ktf-2
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
            vel=0.5*(rom(i-1,k,j)+rom(i,k,j))
            vflux(i,k) = vel*flux5(                     &
@@ -1420,6 +1850,9 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
          ENDDO
          ENDDO
 
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
 
            k=kts+1
@@ -1440,7 +1873,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
                                    *(fzm(k)*u(i,k,j)+fzp(k)*u(i,k-1,j))
 
          ENDDO
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
             tendency(i,k,j)=tendency(i,k,j)-rdzw(k)*(vflux(i,k+1)-vflux(i,k))
          ENDDO
@@ -1449,9 +1888,18 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
     ELSE IF (vert_order == 4) THEN    
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts+2,ktf-1
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
            vel=0.5*(rom(i-1,k,j)+rom(i,k,j))
            vflux(i,k) = vel*flux4(               &
@@ -1460,6 +1908,9 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
          ENDDO
          ENDDO
 
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
 
            k=kts+1
@@ -1470,7 +1921,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
                                    *(fzm(k)*u(i,k,j)+fzp(k)*u(i,k-1,j))
 
          ENDDO
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
             tendency(i,k,j)=tendency(i,k,j)-rdzw(k)*(vflux(i,k+1)-vflux(i,k))
          ENDDO
@@ -1479,9 +1936,18 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
     ELSE IF (vert_order == 3) THEN    
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts+2,ktf-1
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
            vel=0.5*(rom(i-1,k,j)+rom(i,k,j))
            vflux(i,k) = vel*flux3(               &
@@ -1490,6 +1956,9 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
          ENDDO
          ENDDO
 
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
 
            k=kts+1
@@ -1500,7 +1969,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
                                    *(fzm(k)*u(i,k,j)+fzp(k)*u(i,k-1,j))
 
          ENDDO
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
             tendency(i,k,j)=tendency(i,k,j)-rdzw(k)*(vflux(i,k+1)-vflux(i,k))
          ENDDO
@@ -1509,8 +1984,17 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
 
     ELSE IF (vert_order == 2) THEN    
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts+1,ktf
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
                vflux(i,k)=0.5*(rom(i,k,j)+rom(i-1,k,j)) &
                                 *(fzm(k)*u(i,k,j)+fzp(k)*u(i,k-1,j))
@@ -1518,7 +2002,13 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
          ENDDO
 
 
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
                tendency(i,k,j)=tendency(i,k,j)-rdzw(k)*(vflux(i,k+1)-vflux(i,k))
          ENDDO
@@ -1527,13 +2017,467 @@ SUBROUTINE advect_u   ( u, u_old, tendency,            &
       ENDDO
 
    ELSE
-
+!  unreachable under WRF_GPU_DYN: vert_order was validated on the host
+!  before entering this parallel region.
+#ifndef WRF_GPU_DYN
       WRITE ( wrf_err_message , * ) 'module_advect: advect_u_6a: v_order not known ',vert_order
       CALL wrf_error_fatal ( TRIM( wrf_err_message ) )
+#endif
 
    ENDIF vert_order_test
 
+#ifdef WRF_GPU_DYN
+   !$acc end parallel
+   !$acc end data
+#endif
 END SUBROUTINE advect_u
+
+#ifdef WRF_GPU_DYN
+!-------------------------------------------------------------------------------
+!  Fast multi-gang path for the one (horz_order,vert_order) combination the
+!  target real-data case actually runs: h_mom_adv_order=5 (WRF default),
+!  v_mom_adv_order=3 (WRF default). Semantically identical to the horz_order==5
+!  / vert_order==3 branches of advect_u above -- every flux expression below is
+!  a verbatim copy -- restructured so every loop nest is a standalone
+!  "!$acc parallel loop collapse(N)" kernel with no enclosing "!$acc data" and
+!  no manually-delimited region (see plan.md). The rolling 2-slot fqy/fqx/vflux
+!  buffers are replaced by full 3-D buffers (fast_fqy3/fast_fqx3/fast_vflux3,
+!  shared module-level storage, see advect_fast_ensure_buffers above) indexed
+!  by the real j, which removes the j-loop-carried dependency that forced
+!  num_gangs(1) in advect_u and lets every kernel parallelize over (i,j,k).
+!  Not called unless the dispatch check in module_em.F confirms both orders
+!  match; advect_u remains the fallback for every other order combination.
+SUBROUTINE advect_u_o5v3 ( u, u_old, tendency,         &
+                        ru, rv, rom,                   &
+                        c1, c2,                        &
+                        mut, time_step, config_flags,  &
+                        msfux, msfuy, msfvx, msfvy,    &
+                        msftx, msfty,                  &
+                        fzm, fzp,                      &
+                        rdx, rdy, rdzw,                &
+                        ids, ide, jds, jde, kds, kde,  &
+                        ims, ime, jms, jme, kms, kme,  &
+                        its, ite, jts, jte, kts, kte  )
+
+   IMPLICIT NONE
+
+   TYPE(grid_config_rec_type), INTENT(IN   ) :: config_flags
+
+   INTEGER ,                 INTENT(IN   ) :: ids, ide, jds, jde, kds, kde, &
+                                              ims, ime, jms, jme, kms, kme, &
+                                              its, ite, jts, jte, kts, kte
+
+   REAL , DIMENSION( ims:ime , kms:kme , jms:jme ) , INTENT(IN   ) :: u,     &
+                                                                      u_old, &
+                                                                      ru,    &
+                                                                      rv,    &
+                                                                      rom
+
+   REAL , DIMENSION( ims:ime , jms:jme ) , INTENT(IN   ) :: mut
+   REAL , DIMENSION( ims:ime , kms:kme , jms:jme ) , INTENT(INOUT) :: tendency
+
+   REAL , DIMENSION( ims:ime , jms:jme ) ,         INTENT(IN   ) :: msfux,  &
+                                                                    msfuy,  &
+                                                                    msfvx,  &
+                                                                    msfvy,  &
+                                                                    msftx,  &
+                                                                    msfty
+
+   REAL , DIMENSION( kms:kme ) ,                 INTENT(IN   ) :: fzm,  &
+                                                                  fzp,  &
+                                                                  rdzw, &
+                                                                  c1,   &
+                                                                  c2
+
+   REAL ,                                        INTENT(IN   ) :: rdx,  &
+                                                                  rdy
+   INTEGER ,                                     INTENT(IN   ) :: time_step
+
+   ! Local data
+
+   INTEGER :: i, j, k, ktf
+   INTEGER :: i_start, i_end, j_start, j_end
+   INTEGER :: i_start_f, i_end_f, j_start_f, j_end_f
+   INTEGER :: imin, imax, im, ip
+
+   REAL    :: mrdx, mrdy, ub, vb, vw, dvm, dvp, vel
+
+   LOGICAL :: degrade_xs, degrade_ys, degrade_xe, degrade_ye
+   LOGICAL :: specified, polar_l
+
+! definition of flux operators, 3rd, 4th, 5th or 6th order (verbatim from advect_u)
+
+   REAL    :: flux3, flux4, flux5
+   REAL    :: q_im3, q_im2, q_im1, q_i, q_ip1, q_ip2, ua
+
+   flux4(q_im2, q_im1, q_i, q_ip1, ua) =                         &
+          ( 7.*(q_i + q_im1) - (q_ip1 + q_im2) )/12.0
+
+   flux3(q_im2, q_im1, q_i, q_ip1, ua) =                         &
+            flux4(q_im2, q_im1, q_i, q_ip1, ua) +                &
+            sign(1,time_step)*sign(1.,ua)*((q_ip1 - q_im2)-3.*(q_i-q_im1))/12.0
+
+   flux5(q_im3, q_im2, q_im1, q_i, q_ip1, q_ip2, ua) =           &
+           ( 37.*(q_i+q_im1) - 8.*(q_ip1+q_im2)                 &
+            +(q_ip2+q_im3) )/60.0                                &
+            -sign(1,time_step)*sign(1.,ua)*(                     &
+              (q_ip2-q_im3)-5.*(q_ip1-q_im2)+10.*(q_i-q_im1) )/60.0
+
+   specified = .false.
+   if (config_flags%specified .or. config_flags%nested) specified = .true.
+   polar_l = config_flags%polar
+
+   CALL advect_fast_ensure_buffers( its, ite, jts, jte, kts, kte )
+
+   ktf = MIN(kte,kde-1)
+
+!  degrade-order boundary flags -- verbatim from advect_u horz_order==5
+
+   degrade_xs = .true.
+   degrade_xe = .true.
+   degrade_ys = .true.
+   degrade_ye = .true.
+
+   IF( config_flags%periodic_x   .or. &
+       config_flags%symmetric_xs .or. &
+       (its > ids+3)                ) degrade_xs = .false.
+   IF( config_flags%periodic_x   .or. &
+       config_flags%symmetric_xe .or. &
+       (ite < ide-2)                ) degrade_xe = .false.
+   IF( config_flags%periodic_y   .or. &
+       config_flags%symmetric_ys .or. &
+       (jts > jds+3)                ) degrade_ys = .false.
+   IF( config_flags%periodic_y   .or. &
+       config_flags%symmetric_ye .or. &
+       (jte < jde-4)                ) degrade_ye = .false.
+
+!--------------- y - advection ------------------------------------------------
+
+   i_start = its
+   i_end   = ite
+   IF ( config_flags%open_xs .or. specified ) i_start = MAX(ids+1,its)
+   IF ( config_flags%open_xe .or. specified ) i_end   = MIN(ide-1,ite)
+   IF ( config_flags%periodic_x ) i_start = its
+   IF ( config_flags%periodic_x ) i_end = ite
+
+   j_start = jts
+   j_end   = MIN(jte,jde-1)
+
+   j_start_f = j_start
+   j_end_f   = j_end+1
+
+   IF(degrade_ys) then
+     j_start = MAX(jts,jds+1)
+     j_start_f = jds+3
+   ENDIF
+
+   IF(degrade_ye) then
+     j_end = MIN(jte,jde-2)
+     j_end_f = jde-3
+   ENDIF
+
+   IF(config_flags%polar) j_end = MIN(jte,jde-1)
+
+!  y flux -- collapsed over (j,k,i), one thread per point, no j-carried state
+
+!$acc parallel loop collapse(3) private(vel) &
+!$acc& present(u,rv,fast_fqy3)
+   DO j = j_start, j_end+1
+   DO k = kts, ktf
+   DO i = i_start, i_end
+      IF( (j >= j_start_f ) .and. (j <= j_end_f) ) THEN
+         vel = 0.5*(rv(i,k,j)+rv(i-1,k,j))
+         fast_fqy3( i, k, j ) = vel*flux5(               &
+                 u(i,k,j-3), u(i,k,j-2), u(i,k,j-1),       &
+                 u(i,k,j  ), u(i,k,j+1), u(i,k,j+2),  vel )
+      ELSE IF ( j == jds+1 ) THEN
+         fast_fqy3(i, k, j) = 0.25*(rv(i,k,j)+rv(i-1,k,j))  &
+                                *(u(i,k,j)+u(i,k,j-1))
+      ELSE IF ( j == jds+2 ) THEN
+         vel = 0.5*(rv(i,k,j)+rv(i-1,k,j))
+         fast_fqy3( i, k, j ) = vel*flux3(      &
+              u(i,k,j-2),u(i,k,j-1), u(i,k,j),u(i,k,j+1),vel )
+      ELSE IF ( j == jde-1 ) THEN
+         fast_fqy3(i, k, j) = 0.25*(rv(i,k,j)+rv(i-1,k,j))    &
+                *(u(i,k,j)+u(i,k,j-1))
+      ELSE IF ( j == jde-2 ) THEN
+         vel = 0.5*(rv(i,k,j)+rv(i-1,k,j))
+         fast_fqy3( i, k, j ) = vel*flux3(     &
+              u(i,k,j-2),u(i,k,j-1),    &
+              u(i,k,j),u(i,k,j+1),vel )
+      ENDIF
+      ! else: unset for this j -- matches advect_u's stale-slot semantics;
+      ! only reachable at j==jde under config_flags%polar, which is never
+      ! read (see the polar j==jde branch below, which reads slot j-1).
+   ENDDO
+   ENDDO
+   ENDDO
+
+!  y flux-divergence into tendency -- collapsed over (j,k,i); each thread
+!  updates a disjoint tendency(:,:,j-1), so no write conflicts despite the
+!  per-thread branch structure mirroring advect_u's sequential IF-ladder.
+
+!$acc parallel loop collapse(3) private(mrdy) &
+!$acc& present(tendency,fast_fqy3,msfux)
+   DO j = j_start, j_end+1
+   DO k = kts, ktf
+   DO i = i_start, i_end
+      IF ( polar_l .AND. (j == jds+1) ) THEN
+         mrdy=msfux(i,j-1)*rdy
+         tendency(i,k,j-1) = tendency(i,k,j-1) - mrdy*fast_fqy3(i,k,j)
+      ELSE IF( polar_l .AND. (j == jde) ) THEN
+         mrdy=msfux(i,j-1)*rdy
+         tendency(i,k,j-1) = tendency(i,k,j-1) + mrdy*fast_fqy3(i,k,j-1)
+      ELSE IF ( j > j_start ) THEN
+         mrdy=msfux(i,j-1)*rdy
+         tendency(i,k,j-1) = tendency(i,k,j-1) - mrdy*(fast_fqy3(i,k,j)-fast_fqy3(i,k,j-1))
+      ENDIF
+   ENDDO
+   ENDDO
+   ENDDO
+
+!--------------- x - flux divergence -------------------------------------------
+
+   i_start = its
+   i_end   = ite
+
+   j_start = jts
+   j_end   = MIN(jte,jde-1)
+
+   i_start_f = i_start
+   i_end_f   = i_end+1
+
+   IF(degrade_xs) then
+     i_start = MAX(ids+1,its)
+     i_start_f = ids+3
+   ENDIF
+
+   IF(degrade_xe) then
+     i_end = MIN(ide-1,ite)
+     i_end_f = ide-2
+   ENDIF
+
+!$acc parallel loop collapse(3) private(vel) &
+!$acc& present(u,ru,fast_fqx3)
+   DO j = j_start, j_end
+   DO k = kts, ktf
+   DO i = i_start_f, i_end_f
+      vel = 0.5*(ru(i,k,j)+ru(i-1,k,j))
+      fast_fqx3( i, k, j ) = vel*flux5( u(i-3,k,j), u(i-2,k,j),  &
+                                     u(i-1,k,j), u(i  ,k,j),  &
+                                     u(i+1,k,j), u(i+2,k,j),  &
+                                     vel                     )
+   ENDDO
+   ENDDO
+   ENDDO
+
+!  lower-order fixups close to boundaries -- fixed i columns, small (j,k) kernels
+
+   IF( degrade_xs ) THEN
+
+      IF( i_start == ids+1 ) THEN
+         i = ids+1
+!$acc parallel loop collapse(2) private(ub) present(u,ru,fast_fqx3)
+         DO j = j_start, j_end
+         DO k = kts, ktf
+            ub = u(i-1,k,j)
+            IF (specified .AND. u(i,k,j) .LT. 0.) ub = u(i,k,j)
+            fast_fqx3(i, k, j) = 0.25*(ru(i,k,j)+ru(i-1,k,j)) &
+                   *(u(i,k,j)+ub)
+         ENDDO
+         ENDDO
+      END IF
+
+      i = ids+2
+!$acc parallel loop collapse(2) private(vel) present(u,ru,fast_fqx3)
+      DO j = j_start, j_end
+      DO k = kts, ktf
+         vel = 0.5*(ru(i,k,j)+ru(i-1,k,j))
+         fast_fqx3( i, k, j ) = vel*flux3( u(i-2,k,j), u(i-1,k,j),  &
+                                        u(i  ,k,j), u(i+1,k,j),  &
+                                        vel                     )
+      ENDDO
+      ENDDO
+
+   ENDIF
+
+   IF( degrade_xe ) THEN
+
+      IF( i_end == ide-1 ) THEN
+         i = ide
+!$acc parallel loop collapse(2) private(ub) present(u,ru,fast_fqx3)
+         DO j = j_start, j_end
+         DO k = kts, ktf
+            ub = u(i,k,j)
+            IF (specified .AND. u(i-1,k,j) .GT. 0.) ub = u(i-1,k,j)
+            fast_fqx3(i, k, j) = 0.25*(ru(i,k,j)+ru(i-1,k,j)) &
+                   *(u(i-1,k,j)+ub)
+         ENDDO
+         ENDDO
+      ENDIF
+
+      i = ide-1
+!$acc parallel loop collapse(2) private(vel) present(u,ru,fast_fqx3)
+      DO j = j_start, j_end
+      DO k = kts, ktf
+         vel = 0.5*(ru(i,k,j)+ru(i-1,k,j))
+         fast_fqx3( i, k, j ) = vel*flux3( u(i-2,k,j), u(i-1,k,j),  &
+                                        u(i  ,k,j), u(i+1,k,j),  &
+                                        vel                     )
+      ENDDO
+      ENDDO
+
+   ENDIF
+
+!  x flux-divergence into tendency
+
+!$acc parallel loop collapse(3) private(mrdx) &
+!$acc& present(tendency,fast_fqx3,msfux)
+   DO j = j_start, j_end
+   DO k = kts, ktf
+   DO i = i_start, i_end
+      mrdx=msfux(i,j)*rdx
+      tendency(i,k,j) = tendency(i,k,j) - mrdx*(fast_fqx3(i+1,k,j)-fast_fqx3(i,k,j))
+   ENDDO
+   ENDDO
+   ENDDO
+
+!  radiative lateral BC in x for u -- inactive for specified BCs (Hong Kong
+!  case), kept for fidelity; single-column kernels, cheap even when active.
+
+   IF ( (config_flags%open_xs) .and. its == ids ) THEN
+      j_start = jts
+      j_end   = MIN(jte,jde-1)
+!$acc parallel loop collapse(2) private(ub) present(u_old,ru,mut,tendency)
+      DO j = j_start, j_end
+      DO k = kts, ktf
+         ub = MIN(ru(its,k,j)-cb*mut(its,j), 0.)
+         tendency(its,k,j) = tendency(its,k,j)                    &
+                     - rdx*ub*(u_old(its+1,k,j) - u_old(its,k,j))
+      ENDDO
+      ENDDO
+   ENDIF
+
+   IF ( (config_flags%open_xe) .and. ite == ide ) THEN
+      j_start = jts
+      j_end   = MIN(jte,jde-1)
+!$acc parallel loop collapse(2) private(ub) present(u_old,ru,mut,tendency)
+      DO j = j_start, j_end
+      DO k = kts, ktf
+         ub = MAX(ru(ite,k,j)+cb*mut(ite-1,j), 0.)
+         tendency(ite,k,j) = tendency(ite,k,j)                    &
+                     - rdx*ub*(u_old(ite,k,j) - u_old(ite-1,k,j))
+      ENDDO
+      ENDDO
+   ENDIF
+
+   i_start = its
+   i_end   = MIN(ite,ide)
+   imin    = ids
+   imax    = ide-1
+
+   IF (config_flags%open_xs) THEN
+     i_start = MAX(ids+1, its)
+     imin = ids
+   ENDIF
+   IF (config_flags%open_xe) THEN
+     i_end = MIN(ite,ide-1)
+     imax = ide-1
+   ENDIF
+
+   IF( (config_flags%open_ys) .and. (jts == jds)) THEN
+!$acc parallel loop collapse(2) private(mrdy,ip,im,vw,vb,dvm,dvp) &
+!$acc& present(u,u_old,rv,tendency,msfux)
+      DO i = i_start, i_end
+      DO k = kts, ktf
+         mrdy=msfux(i,jts)*rdy
+         ip = MIN( imax, i   )
+         im = MAX( imin, i-1 )
+         vw = 0.5*(rv(ip,k,jts)+rv(im,k,jts))
+         vb = MIN( vw, 0. )
+         dvm =  rv(ip,k,jts+1)-rv(ip,k,jts)
+         dvp =  rv(im,k,jts+1)-rv(im,k,jts)
+         tendency(i,k,jts)=tendency(i,k,jts)-mrdy*(                &
+                           vb*(u_old(i,k,jts+1)-u_old(i,k,jts))    &
+                          +0.5*u(i,k,jts)*(dvm+dvp))
+      ENDDO
+      ENDDO
+   ENDIF
+
+   IF( (config_flags%open_ye) .and. (jte == jde)) THEN
+!$acc parallel loop collapse(2) private(mrdy,ip,im,vw,vb,dvm,dvp) &
+!$acc& present(u,u_old,rv,tendency,msfux)
+      DO i = i_start, i_end
+      DO k = kts, ktf
+         mrdy=msfux(i,jte-1)*rdy
+         ip = MIN( imax, i   )
+         im = MAX( imin, i-1 )
+         vw = 0.5*(rv(ip,k,jte)+rv(im,k,jte))
+         vb = MAX( vw, 0. )
+         dvm =  rv(ip,k,jte)-rv(ip,k,jte-1)
+         dvp =  rv(im,k,jte)-rv(im,k,jte-1)
+         tendency(i,k,jte-1)=tendency(i,k,jte-1)-mrdy*(              &
+                             vb*(u_old(i,k,jte-1)-u_old(i,k,jte-2))  &
+                            +0.5*u(i,k,jte-1)*(dvm+dvp))
+      ENDDO
+      ENDDO
+   ENDIF
+
+!-------------------- vertical advection (vert_order==3) -----------------------
+
+   i_start = its
+   i_end   = ite
+   j_start = jts
+   j_end   = min(jte,jde-1)
+
+   IF ( config_flags%open_ys .or. specified ) i_start = MAX(ids+1,its)
+   IF ( config_flags%open_ye .or. specified ) i_end   = MIN(ide-1,ite)
+   IF ( config_flags%periodic_x ) i_start = its
+   IF ( config_flags%periodic_x ) i_end = ite
+
+!  zero-flux end caps at model top/bottom -- same for every column j
+
+!$acc parallel loop collapse(2) present(fast_vflux3)
+   DO j = j_start, j_end
+   DO i = i_start, i_end
+      fast_vflux3(i,kts,j) = 0.
+      fast_vflux3(i,kte,j) = 0.
+   ENDDO
+   ENDDO
+
+!$acc parallel loop collapse(3) private(vel) present(u,rom,fast_vflux3)
+   DO j = j_start, j_end
+   DO k = kts+2, ktf-1
+   DO i = i_start, i_end
+      vel=0.5*(rom(i-1,k,j)+rom(i,k,j))
+      fast_vflux3(i,k,j) = vel*flux3(               &
+              u(i,k-2,j), u(i,k-1,j),       &
+              u(i,k  ,j), u(i,k+1,j),  -vel )
+   ENDDO
+   ENDDO
+   ENDDO
+
+!$acc parallel loop collapse(2) present(u,rom,fzm,fzp,fast_vflux3)
+   DO j = j_start, j_end
+   DO i = i_start, i_end
+      fast_vflux3(i,kts+1,j)=0.5*(rom(i,kts+1,j)+rom(i-1,kts+1,j))  &
+                              *(fzm(kts+1)*u(i,kts+1,j)+fzp(kts+1)*u(i,kts+1-1,j))
+      fast_vflux3(i,ktf,j)=0.5*(rom(i,ktf,j)+rom(i-1,ktf,j)) &
+                              *(fzm(ktf)*u(i,ktf,j)+fzp(ktf)*u(i,ktf-1,j))
+   ENDDO
+   ENDDO
+
+!$acc parallel loop collapse(3) present(tendency,fast_vflux3,rdzw)
+   DO j = j_start, j_end
+   DO k = kts, ktf
+   DO i = i_start, i_end
+      tendency(i,k,j)=tendency(i,k,j)-rdzw(k)*(fast_vflux3(i,k+1,j)-fast_vflux3(i,k,j))
+   ENDDO
+   ENDDO
+   ENDDO
+
+END SUBROUTINE advect_u_o5v3
+#endif
 
 !-------------------------------------------------------------------------------
 
@@ -1643,6 +2587,26 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
    horz_order = config_flags%h_mom_adv_order
    vert_order = config_flags%v_mom_adv_order
 
+#ifdef WRF_GPU_DYN
+!  wrf_error_fatal/WRITE cannot run on the device, so validate the order
+!  arguments on the host before entering the parallel region; the ELSE
+!  branches inside horizontal_order_test/vert_order_test below are then
+!  unreachable and were emptied out (see there).
+   IF ( .NOT. ( horz_order==0 .OR. horz_order==2 .OR. horz_order==3 .OR. &
+                horz_order==4 .OR. horz_order==5 .OR. horz_order==6 ) ) THEN
+      WRITE ( wrf_err_message , * ) 'module_advect: advect_v: h_order not known ',horz_order
+      CALL wrf_error_fatal ( TRIM( wrf_err_message ) )
+   ENDIF
+   IF ( .NOT. ( vert_order==2 .OR. vert_order==3 .OR. &
+                vert_order==4 .OR. vert_order==5 .OR. vert_order==6 ) ) THEN
+      WRITE ( wrf_err_message , * ) 'module_advect: advect_v: v_order not known ',vert_order
+      CALL wrf_error_fatal ( TRIM( wrf_err_message ) )
+   ENDIF
+   !$acc data present(v,v_old,ru,rv,rom,mut,tendency,msfux,msfuy,msfvx,msfvy, &
+   !$acc& msftx,msfty,fzm,fzp,rdzw,c1,c2,config_flags) create(fqx,fqy,vflux)
+   !$acc parallel private(i,j,k) num_gangs(1)
+#endif
+
 
 !  here is the choice of flux operators
 
@@ -1702,11 +2666,20 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
      jp1 = 2
      jp0 = 1
 
+#ifdef WRF_GPU_DYN
+     !$acc loop seq
+#endif
      j_loop_y_flux_6 : DO j = j_start, j_end+1
 
       IF( (j >= j_start_f ) .and. (j <= j_end_f) ) THEN
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start, i_end
           vel = 0.5*(rv(i,k,j)+rv(i,k,j-1))
           fqy( i, k, jp1 ) = vel*flux6(               &
@@ -1720,7 +2693,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
 
       ELSE IF ( j == jds+1 ) THEN   ! 2nd order flux next to south boundary
 
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
                 vb = v(i,k,j-1)
                 IF (specified .AND. v(i,k,j) .LT. 0.)vb = v(i,k,j)
@@ -1731,7 +2710,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
 
      ELSE IF  ( j == jds+2 ) THEN  ! third of 4th order flux 2 in from south boundary
 
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               vel = 0.5*(rv(i,k,j)+rv(i,k,j-1))
               fqy( i, k, jp1 ) = vel*flux4(      &
@@ -1742,7 +2727,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
 
      ELSE IF ( j == jde ) THEN  ! 2nd order flux next to north boundary
 
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
                 vb = v(i,k,j)
                 IF (specified .AND. v(i,k,j-1) .GT. 0.)vb = v(i,k,j-1)
@@ -1753,7 +2744,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
 
      ELSE IF ( j == jde-1 ) THEN  ! 3rd or 4th order flux 2 in from north boundary
 
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               vel = 0.5*(rv(i,k,j)+rv(i,k,j-1))
               fqy( i, k, jp1 ) = vel*flux4(     &
@@ -1770,7 +2767,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
         ! to jde [N pole], i.e., on v grid) must be zero at poles
         ! [tendency(jds) and tendency(jde)=0]
         IF ( config_flags%polar .AND. (j == jds+1) ) THEN
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             tendency(i,k,j-1) = 0.
           END DO
@@ -1780,7 +2783,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
         ! we want the tendency to be zero anyway, not looping to jde+1
         ! will produce the same effect.
         ELSE IF( config_flags%polar .AND. (j == jde+1) ) THEN
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             tendency(i,k,j-1) = 0.
           END DO
@@ -1789,7 +2798,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
 
         IF(j > j_start) THEN
 
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             mrdy=msfvy(i,j-1)*rdy    ! ADT eqn 45, 2nd term on RHS
             tendency(i,k,j-1) = tendency(i,k,j-1) - mrdy*(fqy(i,k,jp1)-fqy(i,k,jp0))
@@ -1836,11 +2851,20 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
 
 !  compute fluxes
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
 !  5th or 6th order flux
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start_f, i_end_f
           vel = 0.5*(ru(i,k,j)+ru(i,k,j-1))
           fqx( i, k ) = vel*flux6( v(i-3,k,j), v(i-2,k,j),  &
@@ -1854,9 +2878,15 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
 
         IF( degrade_xs ) THEN
 
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO i=i_start,i_start_f-1
 
             IF(i == ids+1) THEN ! second order
+#ifdef WRF_GPU_DYN
+              !$acc loop vector
+#endif
               DO k=kts,ktf
                 fqx(i,k) = 0.25*(ru(i,k,j)+ru(i,k,j-1)) &
                                 *(v(i,k,j)+v(i-1,k,j))
@@ -1864,6 +2894,9 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
             ENDIF
 
             IF(i == ids+2) THEN  ! third order
+#ifdef WRF_GPU_DYN
+              !$acc loop vector
+#endif
               DO k=kts,ktf
                 vel = 0.5*(ru(i,k,j)+ru(i,k,j-1))
                 fqx( i,k ) = vel*flux4( v(i-2,k,j), v(i-1,k,j),  &
@@ -1878,9 +2911,15 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
 
         IF( degrade_xe ) THEN
 
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO i = i_end_f+1, i_end+1
 
             IF( i == ide-1 ) THEN ! second order flux next to the boundary
+#ifdef WRF_GPU_DYN
+              !$acc loop vector
+#endif
               DO k=kts,ktf
                 fqx(i,k) = 0.25*(ru(i_end+1,k,j)+ru(i_end+1,k,j-1))      &
                                 *(v(i_end+1,k,j)+v(i_end,k,j))
@@ -1888,6 +2927,9 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
             ENDIF
 
             IF( i == ide-2 ) THEN ! third order flux one in from the boundary
+#ifdef WRF_GPU_DYN
+              !$acc loop vector
+#endif
               DO k=kts,ktf
                 vel = 0.5*(ru(i,k,j)+ru(i,k,j-1))
                 fqx( i,k ) = vel*flux4( v(i-2,k,j), v(i-1,k,j),  &
@@ -1902,7 +2944,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
 
 !  x flux-divergence into tendency
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             mrdx=msfvy(i,j)*rdx      ! ADT eqn 45, 1st term on RHS
             tendency(i,k,j) = tendency(i,k,j) - mrdx*(fqx(i+1,k)-fqx(i,k))
@@ -1971,11 +3019,20 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
      jp1 = 2
      jp0 = 1
 
+#ifdef WRF_GPU_DYN
+     !$acc loop seq
+#endif
      j_loop_y_flux_5 : DO j = j_start, j_end+1
 
       IF( (j >= j_start_f ) .and. (j <= j_end_f) ) THEN
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start, i_end
           vel = 0.5*(rv(i,k,j)+rv(i,k,j-1))
           fqy( i, k, jp1 ) = vel*flux5(               &
@@ -1989,7 +3046,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
 
       ELSE IF ( j == jds+1 ) THEN   ! 2nd order flux next to south boundary
 
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
                 vb = v(i,k,j-1)
                 IF (specified .AND. v(i,k,j) .LT. 0.)vb = v(i,k,j)
@@ -2000,7 +3063,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
 
      ELSE IF  ( j == jds+2 ) THEN  ! third of 4th order flux 2 in from south boundary
 
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               vel = 0.5*(rv(i,k,j)+rv(i,k,j-1))
               fqy( i, k, jp1 ) = vel*flux3(      &
@@ -2011,7 +3080,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
 
      ELSE IF ( j == jde ) THEN  ! 2nd order flux next to north boundary
 
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
                 vb = v(i,k,j)
                 IF (specified .AND. v(i,k,j-1) .GT. 0.)vb = v(i,k,j-1)
@@ -2022,7 +3097,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
 
      ELSE IF ( j == jde-1 ) THEN  ! 3rd or 4th order flux 2 in from north boundary
 
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               vel = 0.5*(rv(i,k,j)+rv(i,k,j-1))
               fqy( i, k, jp1 ) = vel*flux3(     &
@@ -2039,7 +3120,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
         ! to jde [N pole], i.e., on v grid) must be zero at poles
         ! [tendency(jds) and tendency(jde)=0]
         IF ( config_flags%polar .AND. (j == jds+1) ) THEN
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             tendency(i,k,j-1) = 0.
           END DO
@@ -2049,7 +3136,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
         ! we want the tendency to be zero anyway, not looping to jde+1
         ! will produce the same effect.
         ELSE IF( config_flags%polar .AND. (j == jde+1) ) THEN
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             tendency(i,k,j-1) = 0.
           END DO
@@ -2058,7 +3151,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
 
         IF(j > j_start) THEN
 
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             mrdy=msfvy(i,j-1)*rdy    ! ADT eqn 45, 2nd term on RHS
             tendency(i,k,j-1) = tendency(i,k,j-1) - mrdy*(fqy(i,k,jp1)-fqy(i,k,jp0))
@@ -2105,11 +3204,20 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
 
 !  compute fluxes
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
 !  5th or 6th order flux
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start_f, i_end_f
           vel = 0.5*(ru(i,k,j)+ru(i,k,j-1))
           fqx( i, k ) = vel*flux5( v(i-3,k,j), v(i-2,k,j),  &
@@ -2123,9 +3231,15 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
 
         IF( degrade_xs ) THEN
 
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO i=i_start,i_start_f-1
 
             IF(i == ids+1) THEN ! second order
+#ifdef WRF_GPU_DYN
+              !$acc loop vector
+#endif
               DO k=kts,ktf
                 fqx(i,k) = 0.25*(ru(i,k,j)+ru(i,k,j-1)) &
                                 *(v(i,k,j)+v(i-1,k,j))
@@ -2133,6 +3247,9 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
             ENDIF
 
             IF(i == ids+2) THEN  ! third order
+#ifdef WRF_GPU_DYN
+              !$acc loop vector
+#endif
               DO k=kts,ktf
                 vel = 0.5*(ru(i,k,j)+ru(i,k,j-1))
                 fqx( i,k ) = vel*flux3( v(i-2,k,j), v(i-1,k,j),  &
@@ -2147,9 +3264,15 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
 
         IF( degrade_xe ) THEN
 
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO i = i_end_f+1, i_end+1
 
             IF( i == ide-1 ) THEN ! second order flux next to the boundary
+#ifdef WRF_GPU_DYN
+              !$acc loop vector
+#endif
               DO k=kts,ktf
                 fqx(i,k) = 0.25*(ru(i_end+1,k,j)+ru(i_end+1,k,j-1))      &
                                 *(v(i_end+1,k,j)+v(i_end,k,j))
@@ -2157,6 +3280,9 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
             ENDIF
 
             IF( i == ide-2 ) THEN ! third order flux one in from the boundary
+#ifdef WRF_GPU_DYN
+              !$acc loop vector
+#endif
               DO k=kts,ktf
                 vel = 0.5*(ru(i,k,j)+ru(i,k,j-1))
                 fqx( i,k ) = vel*flux3( v(i-2,k,j), v(i-1,k,j),  &
@@ -2171,7 +3297,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
 
 !  x flux-divergence into tendency
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             mrdx=msfvy(i,j)*rdx      ! ADT eqn 45, 1st term on RHS
             tendency(i,k,j) = tendency(i,k,j) - mrdx*(fqx(i+1,k)-fqx(i,k))
@@ -2240,10 +3372,19 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
     jp0 = 1
     jp1 = 2
 
+#ifdef WRF_GPU_DYN
+    !$acc loop seq
+#endif
     DO j = j_start, j_end+1
 
       IF ((j == j_start) .and. degrade_ys) THEN
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k = kts,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start, i_end
                 vb = v(i,k,j-1)
                 IF (specified .AND. v(i,k,j) .LT. 0.)vb = v(i,k,j)
@@ -2252,7 +3393,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
         ENDDO
         ENDDO
       ELSE IF ((j == j_end+1) .and. degrade_ye) THEN
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k = kts, ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start, i_end
                 vb = v(i,k,j)
                 IF (specified .AND. v(i,k,j-1) .GT. 0.)vb = v(i,k,j-1)
@@ -2261,7 +3408,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
         ENDDO
         ENDDO
       ELSE
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k = kts, ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start, i_end
           vel = 0.5*(rv(i,k,j)+rv(i,k,j-1))
           fqy( i,k,jp1 ) = vel*flux4( v(i,k,j-2), v(i,k,j-1),  &
@@ -2276,7 +3429,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
       ! to jde [N pole], i.e., on v grid) must be zero at poles
       ! [tendency(jds) and tendency(jde)=0]
       IF ( config_flags%polar .AND. (j == jds+1) ) THEN
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start, i_end
           tendency(i,k,j-1) = 0.
         END DO
@@ -2286,7 +3445,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
       ! we want the tendency to be zero anyway, not looping to jde+1
       ! will produce the same effect.
       ELSE IF( config_flags%polar .AND. (j == jde+1) ) THEN
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start, i_end
           tendency(i,k,j-1) = 0.
         END DO
@@ -2294,7 +3459,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
       ELSE  ! Normal code
 
       IF( j > j_start) THEN
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k = kts, ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start, i_end
             mrdy=msfvy(i,j-1)*rdy     ! ADT eqn 45, 2nd term on RHS
             tendency(i,k,j-1) = tendency(i,k,j-1) - mrdy*(fqy(i,k,jp1)-fqy(i,k,jp0))
@@ -2341,11 +3512,20 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
 
 !  compute fluxes
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
 !  3rd or 4th order flux
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start_f, i_end_f
           vel = 0.5*(ru(i,k,j)+ru(i,k,j-1))
           fqx( i, k ) = vel*flux4( v(i-2,k,j), v(i-1,k,j),  &
@@ -2357,6 +3537,9 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
 !  second order flux close to boundaries (if not periodic or symmetric)
 
         IF( degrade_xs ) THEN
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO k=kts,ktf
             fqx(i_start,k) = 0.25*(ru(i_start,k,j)+ru(i_start,k,j-1)) &
                    *(v(i_start,k,j)+v(i_start-1,k,j))
@@ -2364,6 +3547,9 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
         ENDIF
 
         IF( degrade_xe ) THEN
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO k=kts,ktf
             fqx(i_end+1,k) = 0.25*(ru(i_end+1,k,j)+ru(i_end+1,k,j-1))      &
                    *(v(i_end+1,k,j)+v(i_end,k,j))
@@ -2372,7 +3558,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
 
 !  x flux-divergence into tendency
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start, i_end
             mrdx=msfvy(i,j)*rdx       ! ADT eqn 45, 1st term on RHS
             tendency(i,k,j) = tendency(i,k,j) - mrdx*(fqx(i+1,k)-fqx(i,k))
@@ -2441,10 +3633,19 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
     jp0 = 1
     jp1 = 2
 
+#ifdef WRF_GPU_DYN
+    !$acc loop seq
+#endif
     DO j = j_start, j_end+1
 
       IF ((j == j_start) .and. degrade_ys) THEN
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k = kts,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start, i_end
                 vb = v(i,k,j-1)
                 IF (specified .AND. v(i,k,j) .LT. 0.)vb = v(i,k,j)
@@ -2453,7 +3654,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
         ENDDO
         ENDDO
       ELSE IF ((j == j_end+1) .and. degrade_ye) THEN
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k = kts, ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start, i_end
                 vb = v(i,k,j)
                 IF (specified .AND. v(i,k,j-1) .GT. 0.)vb = v(i,k,j-1)
@@ -2462,7 +3669,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
         ENDDO
         ENDDO
       ELSE
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k = kts, ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start, i_end
           vel = 0.5*(rv(i,k,j)+rv(i,k,j-1))
           fqy( i,k,jp1 ) = vel*flux3( v(i,k,j-2), v(i,k,j-1),  &
@@ -2477,7 +3690,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
       ! to jde [N pole], i.e., on v grid) must be zero at poles
       ! [tendency(jds) and tendency(jde)=0]
       IF ( config_flags%polar .AND. (j == jds+1) ) THEN
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start, i_end
           tendency(i,k,j-1) = 0.
         END DO
@@ -2487,7 +3706,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
       ! we want the tendency to be zero anyway, not looping to jde+1
       ! will produce the same effect.
       ELSE IF( config_flags%polar .AND. (j == jde+1) ) THEN
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start, i_end
           tendency(i,k,j-1) = 0.
         END DO
@@ -2495,7 +3720,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
       ELSE  ! Normal code
 
       IF( j > j_start) THEN
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k = kts, ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start, i_end
             mrdy=msfvy(i,j-1)*rdy     ! ADT eqn 45, 2nd term on RHS
             tendency(i,k,j-1) = tendency(i,k,j-1) - mrdy*(fqy(i,k,jp1)-fqy(i,k,jp0))
@@ -2542,11 +3773,20 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
 
 !  compute fluxes
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
 !  3rd or 4th order flux
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start_f, i_end_f
           vel = 0.5*(ru(i,k,j)+ru(i,k,j-1))
           fqx( i, k ) = vel*flux3( v(i-2,k,j), v(i-1,k,j),  &
@@ -2558,6 +3798,9 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
 !  second order flux close to boundaries (if not periodic or symmetric)
 
         IF( degrade_xs ) THEN
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO k=kts,ktf
             fqx(i_start,k) = 0.25*(ru(i_start,k,j)+ru(i_start,k,j-1)) &
                    *(v(i_start,k,j)+v(i_start-1,k,j))
@@ -2565,6 +3808,9 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
         ENDIF
 
         IF( degrade_xe ) THEN
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO k=kts,ktf
             fqx(i_end+1,k) = 0.25*(ru(i_end+1,k,j)+ru(i_end+1,k,j-1))      &
                    *(v(i_end+1,k,j)+v(i_end,k,j))
@@ -2573,7 +3819,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
 
 !  x flux-divergence into tendency
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start, i_end
             mrdx=msfvy(i,j)*rdx      ! ADT eqn 45, 1st term on RHS
             tendency(i,k,j) = tendency(i,k,j) - mrdx*(fqx(i+1,k)-fqx(i,k))
@@ -2597,8 +3849,17 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
       IF ( config_flags%polar ) j_start = MAX(jds+1,jts)
       IF ( config_flags%polar ) j_end   = MIN(jde-1,jte)
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+      !$acc loop vector
+#endif
       DO i = i_start, i_end
 
          mrdy=msfvy(i,j)*rdy          ! ADT eqn 45, 2nd term on RHS
@@ -2616,14 +3877,26 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
       ! next to poles
       IF (config_flags%polar) THEN
          IF (jts == jds) THEN
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
                tendency(i,k,jds) = 0.
             END DO
             END DO
          END IF
          IF (jte == jde) THEN
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
                tendency(i,k,jde) = 0.
             END DO
@@ -2635,7 +3908,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
 
       IF ( specified .AND. jts .LE. jds+1 ) THEN
         j = jds+1
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start, i_end
            mrdy=msfvy(i,j)*rdy       ! ADT eqn 45, 2nd term on RHS
            vb = v(i,k,j-1)
@@ -2651,7 +3930,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
 
       IF ( specified .AND. jte .GE. jde-1 ) THEN
         j = jde-1
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start, i_end
 
            mrdy=msfvy(i,j)*rdy       ! ADT eqn 45, 2nd term on RHS
@@ -2673,8 +3958,17 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
       IF ( config_flags%polar ) j_start = MAX(jds+1,jts)
       IF ( config_flags%polar ) j_end   = MIN(jde-1,jte)
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+      !$acc loop vector
+#endif
       DO i = i_start, i_end
 
          mrdx=msfvy(i,j)*rdx         ! ADT eqn 45, 1st term on RHS
@@ -2692,10 +3986,12 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
       ! Just in case we want to turn horizontal advection off, we can do it
 
   ELSE
-
-
+!  unreachable under WRF_GPU_DYN: horz_order was validated on the host
+!  before entering this parallel region.
+#ifndef WRF_GPU_DYN
       WRITE ( wrf_err_message , * ) 'module_advect: advect_v_6a: h_order not known ',horz_order
       CALL wrf_error_fatal ( TRIM( wrf_err_message ) )
+#endif
 
    ENDIF horizontal_order_test
 
@@ -2703,14 +3999,26 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
    !  Force tendency=0 at NP and SP
    !  We keep setting this everywhere, but it can't hurt...
    IF ( config_flags%polar .AND. (jts == jds) ) THEN
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO i=its,ite
+#ifdef WRF_GPU_DYN
+      !$acc loop vector
+#endif
       DO k=kts,ktf
          tendency(i,k,jts)=0.
       END DO
       END DO
    END IF
    IF ( config_flags%polar .AND. (jte == jde) ) THEN
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO i=its,ite
+#ifdef WRF_GPU_DYN
+      !$acc loop vector
+#endif
       DO k=kts,ktf
          tendency(i,k,jte)=0.
       END DO
@@ -2724,7 +4032,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
         i_start = its
         i_end   = MIN(ite,ide-1)
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO i = i_start, i_end
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO k = kts, ktf
           vb = MIN(rv(i,k,jts)-cb*mut(i,jts), 0.)
           tendency(i,k,jts) = tendency(i,k,jts)                    &
@@ -2739,7 +4053,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
         i_start = its
         i_end   = MIN(ite,ide-1)
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO i = i_start, i_end
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO k = kts, ktf
           vb = MAX(rv(i,k,jte)+cb*mut(i,jte-1), 0.)
           tendency(i,k,jte) = tendency(i,k,jte)                    &
@@ -2772,12 +4092,18 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
 
    IF( (config_flags%open_xs) .and. (its == ids)) THEN
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
          mrdx=msfvy(its,j)*rdx       ! ADT eqn 45, 1st term on RHS
          jp = MIN( jmax, j   )
          jm = MAX( jmin, j-1 )
 
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO k=kts,ktf
 
           uw = 0.5*(ru(its,k,jp)+ru(its,k,jm))
@@ -2793,12 +4119,18 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
    ENDIF
 
    IF( (config_flags%open_xe) .and. (ite == ide) ) THEN
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
          mrdx=msfvy(ite-1,j)*rdx     ! ADT eqn 45, 1st term on RHS
          jp = MIN( jmax, j   )
          jm = MAX( jmin, j-1 )
 
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO k=kts,ktf
 
           uw = 0.5*(ru(ite,k,jp)+ru(ite,k,jm))
@@ -2833,6 +4165,9 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
       j_start = jts
       j_end   = jte
 
+#ifdef WRF_GPU_DYN
+      !$acc loop vector
+#endif
       DO i = i_start, i_end
          vflux(i,kts)=0.
          vflux(i,kte)=0.
@@ -2845,10 +4180,19 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
 
     vert_order_test : IF (vert_order == 6) THEN    
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
 
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts+3,ktf-2
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
            vel=0.5*(rom(i,k,j)+rom(i,k,j-1))
            vflux(i,k) = vel*flux6(                       &
@@ -2857,6 +4201,9 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
          ENDDO
          ENDDO
 
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
            k=kts+1
            vflux(i,k)=0.5*(rom(i,k,j)+rom(i,k,j-1))  &
@@ -2878,7 +4225,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
          ENDDO
 
 
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
             ! We are calculating vertical fluxes on v points,
             ! so we must mean msf_v_x/y variables
@@ -2890,10 +4243,19 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
 
    ELSE IF (vert_order == 5) THEN    
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
 
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts+3,ktf-2
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
            vel=0.5*(rom(i,k,j)+rom(i,k,j-1))
            vflux(i,k) = vel*flux5(                       &
@@ -2902,6 +4264,9 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
          ENDDO
          ENDDO
 
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
            k=kts+1
            vflux(i,k)=0.5*(rom(i,k,j)+rom(i,k,j-1))  &
@@ -2923,7 +4288,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
          ENDDO
 
 
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
             ! We are calculating vertical fluxes on v points,
             ! so we must mean msf_v_x/y variables
@@ -2935,10 +4306,19 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
 
     ELSE IF (vert_order == 4) THEN    
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
 
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts+2,ktf-1
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
            vel=0.5*(rom(i,k,j)+rom(i,k,j-1))
            vflux(i,k) = vel*flux4(               &
@@ -2947,6 +4327,9 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
          ENDDO
          ENDDO
 
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
            k=kts+1
            vflux(i,k)=0.5*(rom(i,k,j)+rom(i,k,j-1))  &
@@ -2958,7 +4341,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
          ENDDO
 
 
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
             ! We are calculating vertical fluxes on v points,
             ! so we must mean msf_v_x/y variables
@@ -2970,10 +4359,19 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
 
     ELSE IF (vert_order == 3) THEN    
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
 
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts+2,ktf-1
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
            vel=0.5*(rom(i,k,j)+rom(i,k,j-1))
            vflux(i,k) = vel*flux3(               &
@@ -2982,6 +4380,9 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
          ENDDO
          ENDDO
 
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
            k=kts+1
            vflux(i,k)=0.5*(rom(i,k,j)+rom(i,k,j-1))  &
@@ -2993,7 +4394,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
          ENDDO
 
 
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
             ! We are calculating vertical fluxes on v points,
             ! so we must mean msf_v_x/y variables
@@ -3006,8 +4413,17 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
 
     ELSE IF (vert_order == 2) THEN    
 
+#ifdef WRF_GPU_DYN
+   !$acc loop seq
+#endif
    DO j = j_start, j_end
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO k=kts+1,ktf
+#ifdef WRF_GPU_DYN
+      !$acc loop vector
+#endif
       DO i = i_start, i_end
 
             vflux(i,k)=0.5*(rom(i,k,j)+rom(i,k,j-1)) &
@@ -3015,7 +4431,13 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
       ENDDO
       ENDDO
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+      !$acc loop vector
+#endif
       DO i = i_start, i_end
             ! We are calculating vertical fluxes on v points,
             ! so we must mean msf_v_x/y variables
@@ -3025,12 +4447,19 @@ SUBROUTINE advect_v   ( v, v_old, tendency,            &
    ENDDO
 
    ELSE
-
+!  unreachable under WRF_GPU_DYN: vert_order was validated on the host
+!  before entering this parallel region.
+#ifndef WRF_GPU_DYN
       WRITE ( wrf_err_message , * ) 'module_advect: advect_v_6a: v_order not known ',vert_order
       CALL wrf_error_fatal ( TRIM( wrf_err_message ) )
+#endif
 
    ENDIF vert_order_test
 
+#ifdef WRF_GPU_DYN
+   !$acc end parallel
+   !$acc end data
+#endif
 END SUBROUTINE advect_v
 
 !-------------------------------------------------------------------
@@ -3140,6 +4569,26 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
   horz_order = config_flags%h_sca_adv_order
   vert_order = config_flags%v_sca_adv_order
 
+#ifdef WRF_GPU_DYN
+!  wrf_error_fatal/WRITE cannot run on the device, so validate the order
+!  arguments on the host before entering the parallel region; the ELSE
+!  branches inside horizontal_order_test/vert_order_test below are then
+!  unreachable and were emptied out (see there).
+   IF ( .NOT. ( horz_order==0 .OR. horz_order==2 .OR. horz_order==3 .OR. &
+                horz_order==4 .OR. horz_order==5 .OR. horz_order==6 ) ) THEN
+      WRITE ( wrf_err_message , * ) 'module_advect: advect_scalar: h_order not known ',horz_order
+      CALL wrf_error_fatal ( TRIM( wrf_err_message ) )
+   ENDIF
+   IF ( .NOT. ( vert_order==2 .OR. vert_order==3 .OR. &
+                vert_order==4 .OR. vert_order==5 .OR. vert_order==6 ) ) THEN
+      WRITE ( wrf_err_message , * ) 'module_advect: advect_scalar: v_order not known ',vert_order
+      CALL wrf_error_fatal ( TRIM( wrf_err_message ) )
+   ENDIF
+   !$acc data present(field,field_old,ru,rv,rom,mut,tendency,msfux,msfuy,msfvx,msfvy, &
+   !$acc& msftx,msfty,fzm,fzp,rdzw,c1,c2,config_flags) create(fqx,fqy,vflux)
+   !$acc parallel private(i,j,k) num_gangs(1)
+#endif
+
 !  begin with horizontal flux divergence
 !  here is the choice of flux operators
 
@@ -3202,11 +4651,20 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
      jp1 = 2
      jp0 = 1
 
+#ifdef WRF_GPU_DYN
+     !$acc loop seq
+#endif
      j_loop_y_flux_6 : DO j = j_start, j_end+1
 
       IF( (j >= j_start_f ) .and. (j <= j_end_f) ) THEN ! use full stencil
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start, i_end
           vel = rv(i,k,j)
           fqy( i, k, jp1 ) = vel*flux6(                                &
@@ -3218,7 +4676,13 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 
       ELSE IF ( j == jds+1 ) THEN   ! 2nd order flux next to south boundary
 
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               fqy(i,k, jp1) = 0.5*rv(i,k,j)*          &
                      (field(i,k,j)+field(i,k,j-1))
@@ -3228,7 +4692,13 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 
      ELSE IF  ( j == jds+2 ) THEN  ! 4th order flux 2 in from south boundary
 
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               vel = rv(i,k,j)
               fqy( i, k, jp1 ) = vel*flux4(              &
@@ -3238,7 +4708,13 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 
      ELSE IF ( j == jde-1 ) THEN  ! 2nd order flux next to north boundary
 
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               fqy(i, k, jp1) = 0.5*rv(i,k,j)*      &
                      (field(i,k,j)+field(i,k,j-1))
@@ -3247,7 +4723,13 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 
      ELSE IF ( j == jde-2 ) THEN  ! 3rd or 4th order flux 2 in from north boundary
 
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               vel = rv(i,k,j)
               fqy( i, k, jp1) = vel*flux4(             &
@@ -3265,14 +4747,26 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
         ! (latitudes are as for u grid, longitudes are displaced)
         ! Therefore: flow is only from one side for points next to poles
         IF ( config_flags%polar .AND. (j == jds+1) ) THEN
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             mrdy=msftx(i,j-1)*rdy     ! see ADT eqn 48 [rho->rho*q] dividing by my, 2nd term RHS
             tendency(i,k,j-1) = tendency(i,k,j-1) - mrdy*fqy(i,k,jp1)
           END DO
           END DO
         ELSE IF( config_flags%polar .AND. (j == jde) ) THEN
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             mrdy=msftx(i,j-1)*rdy     ! see ADT eqn 48 [rho->rho*q] dividing by my, 2nd term RHS
             tendency(i,k,j-1) = tendency(i,k,j-1) + mrdy*fqy(i,k,jp0)
@@ -3282,7 +4776,13 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 
         IF(j > j_start) THEN
 
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             mrdy=msftx(i,j-1)*rdy    ! see ADT eqn 48 [rho->rho*q] dividing by my, 2nd term RHS
             tendency(i,k,j-1) = tendency(i,k,j-1) - mrdy*(fqy(i,k,jp1)-fqy(i,k,jp0))
@@ -3326,11 +4826,20 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 
 !  compute fluxes
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
 !  5th or 6th order flux
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start_f, i_end_f
           vel = ru(i,k,j)
           fqx( i,k ) = vel*flux6( field(i-3,k,j), field(i-2,k,j),  &
@@ -3344,9 +4853,15 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 
         IF( degrade_xs ) THEN
 
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO i=i_start,i_start_f-1
 
             IF(i == ids+1) THEN ! second order
+#ifdef WRF_GPU_DYN
+              !$acc loop vector
+#endif
               DO k=kts,ktf
                 fqx(i,k) = 0.5*(ru(i,k,j)) &
                        *(field(i,k,j)+field(i-1,k,j))
@@ -3354,6 +4869,9 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
             ENDIF
 
             IF(i == ids+2) THEN  ! third order
+#ifdef WRF_GPU_DYN
+              !$acc loop vector
+#endif
               DO k=kts,ktf
                 vel = ru(i,k,j)
                 fqx( i,k ) = vel*flux4( field(i-2,k,j), field(i-1,k,j),  &
@@ -3368,9 +4886,15 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 
         IF( degrade_xe ) THEN
 
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO i = i_end_f+1, i_end+1
 
             IF( i == ide-1 ) THEN ! second order flux next to the boundary
+#ifdef WRF_GPU_DYN
+              !$acc loop vector
+#endif
               DO k=kts,ktf
                 fqx(i,k) = 0.5*(ru(i,k,j))      &
                        *(field(i,k,j)+field(i-1,k,j))
@@ -3378,6 +4902,9 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
            ENDIF
 
            IF( i == ide-2 ) THEN ! third order flux one in from the boundary
+#ifdef WRF_GPU_DYN
+             !$acc loop vector
+#endif
              DO k=kts,ktf
                vel = ru(i,k,j)
                fqx( i,k ) = vel*flux4( field(i-2,k,j), field(i-1,k,j),  &
@@ -3392,7 +4919,13 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 
 !  x flux-divergence into tendency
 
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             mrdx=msftx(i,j)*rdx      ! see ADT eqn 48 [rho->rho*q] dividing by my, 1st term RHS
             tendency(i,k,j) = tendency(i,k,j) - mrdx*(fqx(i+1,k)-fqx(i,k))
@@ -3459,11 +4992,20 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
      jp1 = 2
      jp0 = 1
 
+#ifdef WRF_GPU_DYN
+     !$acc loop seq
+#endif
      j_loop_y_flux_5 : DO j = j_start, j_end+1
 
       IF( (j >= j_start_f ) .and. (j <= j_end_f) ) THEN ! use full stencil
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start, i_end
           vel = rv(i,k,j)
           fqy( i, k, jp1 ) = vel*flux5(                                &
@@ -3475,7 +5017,13 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 
       ELSE IF ( j == jds+1 ) THEN   ! 2nd order flux next to south boundary
 
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               fqy(i,k, jp1) = 0.5*rv(i,k,j)*          &
                      (field(i,k,j)+field(i,k,j-1))
@@ -3485,7 +5033,13 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 
      ELSE IF  ( j == jds+2 ) THEN  ! third of 4th order flux 2 in from south boundary
 
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               vel = rv(i,k,j)
               fqy( i, k, jp1 ) = vel*flux3(              &
@@ -3495,7 +5049,13 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 
      ELSE IF ( j == jde-1 ) THEN  ! 2nd order flux next to north boundary
 
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               fqy(i, k, jp1) = 0.5*rv(i,k,j)*      &
                      (field(i,k,j)+field(i,k,j-1))
@@ -3504,7 +5064,13 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 
      ELSE IF ( j == jde-2 ) THEN  ! 3rd or 4th order flux 2 in from north boundary
 
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               vel = rv(i,k,j)
               fqy( i, k, jp1) = vel*flux3(             &
@@ -3522,14 +5088,26 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
         ! (latitudes are as for u grid, longitudes are displaced)
         ! Therefore: flow is only from one side for points next to poles
         IF ( config_flags%polar .AND. (j == jds+1) ) THEN
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             mrdy=msftx(i,j-1)*rdy     ! see ADT eqn 48 [rho->rho*q] dividing by my, 2nd term RHS
             tendency(i,k,j-1) = tendency(i,k,j-1) - mrdy*fqy(i,k,jp1)
           END DO
           END DO
         ELSE IF( config_flags%polar .AND. (j == jde) ) THEN
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             mrdy=msftx(i,j-1)*rdy     ! see ADT eqn 48 [rho->rho*q] dividing by my, 2nd term RHS
             tendency(i,k,j-1) = tendency(i,k,j-1) + mrdy*fqy(i,k,jp0)
@@ -3539,7 +5117,13 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 
         IF(j > j_start) THEN
 
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             mrdy=msftx(i,j-1)*rdy    ! see ADT eqn 48 [rho->rho*q] dividing by my, 2nd term RHS
             tendency(i,k,j-1) = tendency(i,k,j-1) - mrdy*(fqy(i,k,jp1)-fqy(i,k,jp0))
@@ -3583,11 +5167,20 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 
 !  compute fluxes
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
 !  5th or 6th order flux
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start_f, i_end_f
           vel = ru(i,k,j)
           fqx( i,k ) = vel*flux5( field(i-3,k,j), field(i-2,k,j),  &
@@ -3601,9 +5194,15 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 
         IF( degrade_xs ) THEN
 
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO i=i_start,i_start_f-1
 
             IF(i == ids+1) THEN ! second order
+#ifdef WRF_GPU_DYN
+              !$acc loop vector
+#endif
               DO k=kts,ktf
                 fqx(i,k) = 0.5*(ru(i,k,j)) &
                        *(field(i,k,j)+field(i-1,k,j))
@@ -3611,6 +5210,9 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
             ENDIF
 
             IF(i == ids+2) THEN  ! third order
+#ifdef WRF_GPU_DYN
+              !$acc loop vector
+#endif
               DO k=kts,ktf
                 vel = ru(i,k,j)
                 fqx( i,k ) = vel*flux3( field(i-2,k,j), field(i-1,k,j),  &
@@ -3625,9 +5227,15 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 
         IF( degrade_xe ) THEN
 
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO i = i_end_f+1, i_end+1
 
             IF( i == ide-1 ) THEN ! second order flux next to the boundary
+#ifdef WRF_GPU_DYN
+              !$acc loop vector
+#endif
               DO k=kts,ktf
                 fqx(i,k) = 0.5*(ru(i,k,j))      &
                        *(field(i,k,j)+field(i-1,k,j))
@@ -3635,6 +5243,9 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
            ENDIF
 
            IF( i == ide-2 ) THEN ! third order flux one in from the boundary
+#ifdef WRF_GPU_DYN
+             !$acc loop vector
+#endif
              DO k=kts,ktf
                vel = ru(i,k,j)
                fqx( i,k ) = vel*flux3( field(i-2,k,j), field(i-1,k,j),  &
@@ -3649,7 +5260,13 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 
 !  x flux-divergence into tendency
 
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             mrdx=msftx(i,j)*rdx      ! see ADT eqn 48 [rho->rho*q] dividing by my, 1st term RHS
             tendency(i,k,j) = tendency(i,k,j) - mrdx*(fqx(i+1,k)-fqx(i,k))
@@ -3707,11 +5324,20 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 
 !  compute fluxes
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
 !  3rd or 4th order flux
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start_f, i_end_f
 
           fqx( i, k) = ru(i,k,j)*flux4( field(i-2,k,j), field(i-1,k,j),  &
@@ -3723,6 +5349,9 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 !  second order flux close to boundaries (if not periodic or symmetric)
 
         IF( degrade_xs ) THEN
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO k=kts,ktf
             fqx(i_start, k) = 0.5*ru(i_start,k,j)             &
                    *(field(i_start,k,j)+field(i_start-1,k,j))
@@ -3730,6 +5359,9 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
         ENDIF
 
         IF( degrade_xe ) THEN
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO k=kts,ktf
             fqx(i_end+1,k ) = 0.5*ru(i_end+1,k,j)          &
                    *(field(i_end+1,k,j)+field(i_end,k,j))
@@ -3738,7 +5370,13 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 
 !  x flux-divergence into tendency
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start, i_end
           mrdx=msftx(i,j)*rdx        ! see ADT eqn 48 [rho->rho*q] dividing by my, 1st term RHS
           tendency(i,k,j) = tendency(i,k,j) - mrdx*(fqx(i+1,k)-fqx(i,k))
@@ -3776,17 +5414,32 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
     jp1 = 2
     jp0 = 1
 
+#ifdef WRF_GPU_DYN
+  !$acc loop seq
+#endif
   DO j = j_start, j_end+1
 
     IF ((j < j_start_f) .and. degrade_ys) THEN
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO k = kts, ktf
+#ifdef WRF_GPU_DYN
+      !$acc loop vector
+#endif
       DO i = i_start, i_end
          fqy(i,k,jp1) = 0.5*rv(i,k,j_start)             &
                 *(field(i,k,j_start)+field(i,k,j_start-1))
       ENDDO
       ENDDO
     ELSE IF ((j > j_end_f) .and. degrade_ye) THEN
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO k = kts, ktf
+#ifdef WRF_GPU_DYN
+      !$acc loop vector
+#endif
       DO i = i_start, i_end
          ! Assumes j>j_end_f is ONLY j_end+1 ...
 !         fqy(i,k,jp1) = 0.5*rv(i,k,j_end+1)          &
@@ -3797,7 +5450,13 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
       ENDDO
     ELSE
 !  3rd or 4th order flux
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO k = kts, ktf
+#ifdef WRF_GPU_DYN
+      !$acc loop vector
+#endif
       DO i = i_start, i_end
          fqy( i, k, jp1 ) = rv(i,k,j)*flux4( field(i,k,j-2), field(i,k,j-1),  &
                                             field(i,k,j  ), field(i,k,j+1),  &
@@ -3813,14 +5472,26 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
     ! (latitudes are as for u grid, longitudes are displaced)
     ! Therefore: flow is only from one side for points next to poles
     IF ( config_flags%polar .AND. (j == jds+1) ) THEN
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+      !$acc loop vector
+#endif
       DO i = i_start, i_end
         mrdy=msftx(i,j-1)*rdy     ! see ADT eqn 48 [rho->rho*q] dividing by my, 2nd term RHS
         tendency(i,k,j-1) = tendency(i,k,j-1) - mrdy*fqy(i,k,jp1)
       END DO
       END DO
     ELSE IF( config_flags%polar .AND. (j == jde) ) THEN
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+      !$acc loop vector
+#endif
       DO i = i_start, i_end
         mrdy=msftx(i,j-1)*rdy     ! see ADT eqn 48 [rho->rho*q] dividing by my, 2nd term RHS
         tendency(i,k,j-1) = tendency(i,k,j-1) + mrdy*fqy(i,k,jp0)
@@ -3830,7 +5501,13 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 
     IF ( j > j_start ) THEN
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+      !$acc loop vector
+#endif
       DO i = i_start, i_end
         mrdy=msftx(i,j-1)*rdy        ! see ADT eqn 48 [rho->rho*q] dividing by my, 2nd term RHS
         tendency(i,k,j-1) = tendency(i,k,j-1) - mrdy*(fqy(i,k,jp1)-fqy(i,k,jp0))
@@ -3896,11 +5573,20 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 
 !  compute fluxes
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
 !  3rd or 4th order flux
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start_f, i_end_f
 
           fqx( i, k) = ru(i,k,j)*flux3( field(i-2,k,j), field(i-1,k,j),  &
@@ -3912,6 +5598,9 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 !  second order flux close to boundaries (if not periodic or symmetric)
 
         IF( degrade_xs ) THEN
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO k=kts,ktf
             fqx(i_start, k) = 0.5*ru(i_start,k,j)             &
                    *(field(i_start,k,j)+field(i_start-1,k,j))
@@ -3919,6 +5608,9 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
         ENDIF
 
         IF( degrade_xe ) THEN
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO k=kts,ktf
             fqx(i_end+1,k ) = 0.5*ru(i_end+1,k,j)          &
                    *(field(i_end+1,k,j)+field(i_end,k,j))
@@ -3927,7 +5619,13 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 
 !  x flux-divergence into tendency
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start, i_end
           mrdx=msftx(i,j)*rdx        ! see ADT eqn 48 [rho->rho*q] dividing by my, 1st term RHS
           tendency(i,k,j) = tendency(i,k,j) - mrdx*(fqx(i+1,k)-fqx(i,k))
@@ -3965,17 +5663,32 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
     jp1 = 2
     jp0 = 1
 
+#ifdef WRF_GPU_DYN
+  !$acc loop seq
+#endif
   DO j = j_start, j_end+1
 
     IF ((j < j_start_f) .and. degrade_ys) THEN
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO k = kts, ktf
+#ifdef WRF_GPU_DYN
+      !$acc loop vector
+#endif
       DO i = i_start, i_end
          fqy(i,k,jp1) = 0.5*rv(i,k,j_start)             &
                 *(field(i,k,j_start)+field(i,k,j_start-1))
       ENDDO
       ENDDO
     ELSE IF ((j > j_end_f) .and. degrade_ye) THEN
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO k = kts, ktf
+#ifdef WRF_GPU_DYN
+      !$acc loop vector
+#endif
       DO i = i_start, i_end
          ! Assumes j>j_end_f is ONLY j_end+1 ...
 !         fqy(i,k,jp1) = 0.5*rv(i,k,j_end+1)          &
@@ -3986,7 +5699,13 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
       ENDDO
     ELSE
 !  3rd or 4th order flux
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO k = kts, ktf
+#ifdef WRF_GPU_DYN
+      !$acc loop vector
+#endif
       DO i = i_start, i_end
          fqy( i, k, jp1 ) = rv(i,k,j)*flux3( field(i,k,j-2), field(i,k,j-1),  &
                                             field(i,k,j  ), field(i,k,j+1),  &
@@ -4002,14 +5721,26 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
     ! (latitudes are as for u grid, longitudes are displaced)
     ! Therefore: flow is only from one side for points next to poles
     IF ( config_flags%polar .AND. (j == jds+1) ) THEN
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+      !$acc loop vector
+#endif
       DO i = i_start, i_end
         mrdy=msftx(i,j-1)*rdy     ! see ADT eqn 48 [rho->rho*q] dividing by my, 2nd term RHS
         tendency(i,k,j-1) = tendency(i,k,j-1) - mrdy*fqy(i,k,jp1)
       END DO
       END DO
     ELSE IF( config_flags%polar .AND. (j == jde) ) THEN
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+      !$acc loop vector
+#endif
       DO i = i_start, i_end
         mrdy=msftx(i,j-1)*rdy     ! see ADT eqn 48 [rho->rho*q] dividing by my, 2nd term RHS
         tendency(i,k,j-1) = tendency(i,k,j-1) + mrdy*fqy(i,k,jp0)
@@ -4019,7 +5750,13 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 
     IF ( j > j_start ) THEN
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+      !$acc loop vector
+#endif
       DO i = i_start, i_end
         mrdy=msftx(i,j-1)*rdy        ! see ADT eqn 48 [rho->rho*q] dividing by my, 2nd term RHS
         tendency(i,k,j-1) = tendency(i,k,j-1) - mrdy*(fqy(i,k,jp1)-fqy(i,k,jp0))
@@ -4048,8 +5785,17 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
         IF ( config_flags%open_xe .or. specified ) i_end   = MIN(ide-2,ite)
       ENDIF
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO k = kts, ktf
+#ifdef WRF_GPU_DYN
+      !$acc loop vector
+#endif
       DO i = i_start, i_end
          mrdx=msftx(i,j)*rdx         ! see ADT eqn 48 [rho->rho*q] dividing by my, 1st term RHS
          tendency(i,k,j)=tendency(i,k,j)-mrdx*0.5 &
@@ -4066,8 +5812,17 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
       IF ( config_flags%open_ys .or. specified .or. config_flags%polar ) j_start = MAX(jds+1,jts)
       IF ( config_flags%open_ye .or. specified .or. config_flags%polar ) j_end   = MIN(jde-2,jte)
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO k = kts, ktf
+#ifdef WRF_GPU_DYN
+      !$acc loop vector
+#endif
       DO i = i_start, i_end
          mrdy=msftx(i,j)*rdy         ! see ADT eqn 48 [rho->rho*q] dividing by my, 2nd term RHS
          tendency(i,k,j)=tendency(i,k,j) -mrdy*0.5 &
@@ -4081,7 +5836,13 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
       ! These won't be covered in the loop above...
       IF (config_flags%polar) THEN
          IF (jts == jds) THEN
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
                mrdy=msftx(i,jds)*rdy ! see ADT eqn 48 [rho->rho*q] dividing by my, 2nd term RHS
                tendency(i,k,jds)=tendency(i,k,jds) -mrdy*0.5 &
@@ -4090,7 +5851,13 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
             END DO
          END IF
          IF (jte == jde) THEN
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
                mrdy=msftx(i,jde-1)*rdy ! see ADT eqn 48 [rho->rho*q] dividing by my, 2nd term RHS
                tendency(i,k,jde-1)=tendency(i,k,jde-1) +mrdy*0.5 &
@@ -4105,9 +5872,12 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
       ! Just in case we want to turn horizontal advection off, we can do it
 
    ELSE
-
+!  unreachable under WRF_GPU_DYN: horz_order was validated on the host
+!  before entering this parallel region.
+#ifndef WRF_GPU_DYN
       WRITE ( wrf_err_message , * ) 'module_advect: advect_scalar_6a, h_order not known ',horz_order
       CALL wrf_error_fatal ( TRIM( wrf_err_message ) )
+#endif
 
    ENDIF horizontal_order_test
 
@@ -4124,7 +5894,13 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 
    IF( (config_flags%open_xs) .and. (its == ids) ) THEN
 
+#ifdef WRF_GPU_DYN
+       !$acc loop seq
+#endif
        DO j = j_start, j_end
+#ifdef WRF_GPU_DYN
+       !$acc loop vector
+#endif
        DO k = kts, ktf
          ub = MIN( 0.5*(ru(its,k,j)+ru(its+1,k,j)), 0. )
          tendency(its,k,j) = tendency(its,k,j)                     &
@@ -4140,7 +5916,13 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 
    IF( (config_flags%open_xe) .and. (ite == ide) ) THEN
 
+#ifdef WRF_GPU_DYN
+       !$acc loop seq
+#endif
        DO j = j_start, j_end
+#ifdef WRF_GPU_DYN
+       !$acc loop vector
+#endif
        DO k = kts, ktf
          ub = MAX( 0.5*(ru(ite-1,k,j)+ru(ite,k,j)), 0. )
          tendency(i_end,k,j) = tendency(i_end,k,j)                   &
@@ -4156,7 +5938,13 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 
    IF( (config_flags%open_ys) .and. (jts == jds) ) THEN
 
+#ifdef WRF_GPU_DYN
+       !$acc loop seq
+#endif
        DO i = i_start, i_end
+#ifdef WRF_GPU_DYN
+       !$acc loop vector
+#endif
        DO k = kts, ktf
          vb = MIN( 0.5*(rv(i,k,jts)+rv(i,k,jts+1)), 0. )
          tendency(i,k,jts) = tendency(i,k,jts)                     &
@@ -4172,7 +5960,13 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 
    IF( (config_flags%open_ye) .and. (jte == jde)) THEN
 
+#ifdef WRF_GPU_DYN
+       !$acc loop seq
+#endif
        DO i = i_start, i_end
+#ifdef WRF_GPU_DYN
+       !$acc loop vector
+#endif
        DO k = kts, ktf
          vb = MAX( 0.5*(rv(i,k,jte-1)+rv(i,k,jte)), 0. )
          tendency(i,k,j_end) = tendency(i,k,j_end)                   &
@@ -4197,6 +5991,9 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
       j_start = jts
       j_end   = MIN(jte,jde-1)
 
+#ifdef WRF_GPU_DYN
+      !$acc loop vector
+#endif
       DO i = i_start, i_end
          vflux(i,kts)=0.
          vflux(i,kte)=0.
@@ -4204,9 +6001,18 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 
     vert_order_test : IF (vert_order == 6) THEN    
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts+3,ktf-2
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
            vel=rom(i,k,j)
            vflux(i,k) = vel*flux6(                                 &
@@ -4215,6 +6021,9 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
          ENDDO
          ENDDO
 
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
 
            k=kts+1
@@ -4235,7 +6044,13 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
            vflux(i,k)=rom(i,k,j)*(fzm(k)*field(i,k,j)+fzp(k)*field(i,k-1,j))
          ENDDO
 
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
             tendency(i,k,j)=tendency(i,k,j)-rdzw(k)*(vflux(i,k+1)-vflux(i,k))
          ENDDO
@@ -4245,9 +6060,18 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 
    ELSE IF (vert_order == 5) THEN    
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts+3,ktf-2
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
            vel=rom(i,k,j)
            vflux(i,k) = vel*flux5(                                 &
@@ -4256,6 +6080,9 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
          ENDDO
          ENDDO
 
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
 
            k=kts+1
@@ -4276,7 +6103,13 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
            vflux(i,k)=rom(i,k,j)*(fzm(k)*field(i,k,j)+fzp(k)*field(i,k-1,j))
          ENDDO
 
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
             tendency(i,k,j)=tendency(i,k,j)-rdzw(k)*(vflux(i,k+1)-vflux(i,k))
          ENDDO
@@ -4286,9 +6119,18 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 
    ELSE IF (vert_order == 4) THEN    
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts+2,ktf-1
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
            vel=rom(i,k,j)
            vflux(i,k) = vel*flux4(                                 &
@@ -4297,6 +6139,9 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
          ENDDO
          ENDDO
 
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
 
            k=kts+1
@@ -4305,7 +6150,13 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
            vflux(i,k)=rom(i,k,j)*(fzm(k)*field(i,k,j)+fzp(k)*field(i,k-1,j))
          ENDDO
 
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
             tendency(i,k,j)=tendency(i,k,j)-rdzw(k)*(vflux(i,k+1)-vflux(i,k))
          ENDDO
@@ -4315,9 +6166,18 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 
    ELSE IF (vert_order == 3) THEN    
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts+2,ktf-1
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
            vel=rom(i,k,j)
            vflux(i,k) = vel*flux3(                      &
@@ -4326,6 +6186,9 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
          ENDDO
          ENDDO
 
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
 
            k=kts+1
@@ -4334,7 +6197,13 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
            vflux(i,k)=rom(i,k,j)*(fzm(k)*field(i,k,j)+fzp(k)*field(i,k-1,j))
          ENDDO
 
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
             tendency(i,k,j)=tendency(i,k,j)-rdzw(k)*(vflux(i,k+1)-vflux(i,k))
          ENDDO
@@ -4344,14 +6213,29 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
 
    ELSE IF (vert_order == 2) THEN    
 
+#ifdef WRF_GPU_DYN
+  !$acc loop seq
+#endif
   DO j = j_start, j_end
+#ifdef WRF_GPU_DYN
+     !$acc loop seq
+#endif
      DO k = kts+1, ktf
+#ifdef WRF_GPU_DYN
+     !$acc loop vector
+#endif
      DO i = i_start, i_end
             vflux(i,k)=rom(i,k,j)*(fzm(k)*field(i,k,j)+fzp(k)*field(i,k-1,j))
      ENDDO
      ENDDO
 
+#ifdef WRF_GPU_DYN
+     !$acc loop seq
+#endif
      DO k = kts, ktf
+#ifdef WRF_GPU_DYN
+     !$acc loop vector
+#endif
      DO i = i_start, i_end
        tendency(i,k,j)=tendency(i,k,j)-rdzw(k)*(vflux(i,k+1)-vflux(i,k))
      ENDDO
@@ -4360,12 +6244,19 @@ SUBROUTINE advect_scalar   ( field, field_old, tendency,    &
   ENDDO
 
    ELSE
-
+!  unreachable under WRF_GPU_DYN: vert_order was validated on the host
+!  before entering this parallel region.
+#ifndef WRF_GPU_DYN
       WRITE (wrf_err_message,*) ' advect_scalar_6a, v_order not known ',vert_order
       CALL wrf_error_fatal ( wrf_err_message )
+#endif
 
    ENDIF vert_order_test
 
+#ifdef WRF_GPU_DYN
+   !$acc end parallel
+   !$acc end data
+#endif
 END SUBROUTINE advect_scalar
 #if ( ! defined(ADVECT_KERNEL) )
 
@@ -4473,6 +6364,26 @@ SUBROUTINE advect_w    ( w, w_old, tendency,            &
   horz_order = config_flags%h_sca_adv_order
   vert_order = config_flags%v_sca_adv_order
 
+#ifdef WRF_GPU_DYN
+!  wrf_error_fatal/WRITE cannot run on the device, so validate the order
+!  arguments on the host before entering the parallel region; the ELSE
+!  branches inside horizontal_order_test/vert_order_test below are then
+!  unreachable and were emptied out (see there).
+   IF ( .NOT. ( horz_order==0 .OR. horz_order==2 .OR. horz_order==3 .OR. &
+                horz_order==4 .OR. horz_order==5 .OR. horz_order==6 ) ) THEN
+      WRITE ( wrf_err_message , * ) 'module_advect: advect_w: h_order not known ',horz_order
+      CALL wrf_error_fatal ( TRIM( wrf_err_message ) )
+   ENDIF
+   IF ( .NOT. ( vert_order==2 .OR. vert_order==3 .OR. &
+                vert_order==4 .OR. vert_order==5 .OR. vert_order==6 ) ) THEN
+      WRITE ( wrf_err_message , * ) 'module_advect: advect_w: v_order not known ',vert_order
+      CALL wrf_error_fatal ( TRIM( wrf_err_message ) )
+   ENDIF
+   !$acc data present(w,w_old,ru,rv,rom,mut,tendency,msfux,msfuy,msfvx,msfvy, &
+   !$acc& msftx,msfty,fzm,fzp,rdzu,c1,c2,config_flags) create(fqx,fqy,vflux)
+   !$acc parallel private(i,j,k) num_gangs(1)
+#endif
+
 !  here is the choice of flux operators
 
 !  begin with horizontal flux divergence
@@ -4534,11 +6445,20 @@ SUBROUTINE advect_w    ( w, w_old, tendency,            &
      jp1 = 2
      jp0 = 1
 
+#ifdef WRF_GPU_DYN
+     !$acc loop seq
+#endif
      j_loop_y_flux_6 : DO j = j_start, j_end+1
 
       IF( (j >= j_start_f ) .and. (j <= j_end_f) ) THEN
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts+1,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start, i_end
           vel = fzm(k)*rv(i,k,j)+fzp(k)*rv(i,k-1,j)
           fqy( i, k, jp1 ) = vel*flux6(                     &
@@ -4548,6 +6468,9 @@ SUBROUTINE advect_w    ( w, w_old, tendency,            &
         ENDDO
 
         k = ktf+1
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start, i_end
           vel = (2.-fzm(k-1))*rv(i,k-1,j)-fzp(k-1)*rv(i,k-2,j)
           fqy( i, k, jp1 ) = vel*flux6(                     &
@@ -4557,7 +6480,13 @@ SUBROUTINE advect_w    ( w, w_old, tendency,            &
 
       ELSE IF ( j == jds+1 ) THEN   ! 2nd order flux next to south boundary
 
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts+1,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               fqy(i, k, jp1) = 0.5*(fzm(k)*rv(i,k,j)+fzp(k)*rv(i,k-1,j))*          &
                      (w(i,k,j)+w(i,k,j-1))
@@ -4565,6 +6494,9 @@ SUBROUTINE advect_w    ( w, w_old, tendency,            &
             ENDDO
 
             k = ktf+1
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               fqy(i, k, jp1) = 0.5*((2.-fzm(k-1))*rv(i,k-1,j)-fzp(k-1)*rv(i,k-2,j))*          &
                      (w(i,k,j)+w(i,k,j-1))
@@ -4572,7 +6504,13 @@ SUBROUTINE advect_w    ( w, w_old, tendency,            &
 
      ELSE IF  ( j == jds+2 ) THEN  ! third of 4th order flux 2 in from south boundary
 
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts+1,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               vel = fzm(k)*rv(i,k,j)+fzp(k)*rv(i,k-1,j)
               fqy( i, k, jp1 ) = vel*flux4(              &
@@ -4581,6 +6519,9 @@ SUBROUTINE advect_w    ( w, w_old, tendency,            &
             ENDDO
 
             k = ktf+1
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               vel = (2.-fzm(k-1))*rv(i,k-1,j)-fzp(k-1)*rv(i,k-2,j)
               fqy( i, k, jp1 ) = vel*flux4(              &
@@ -4589,7 +6530,13 @@ SUBROUTINE advect_w    ( w, w_old, tendency,            &
 
      ELSE IF ( j == jde-1 ) THEN  ! 2nd order flux next to north boundary
 
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts+1,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               fqy(i, k, jp1) = 0.5*(fzm(k)*rv(i,k,j)+fzp(k)*rv(i,k-1,j))*      &
                      (w(i,k,j)+w(i,k,j-1))
@@ -4597,6 +6544,9 @@ SUBROUTINE advect_w    ( w, w_old, tendency,            &
             ENDDO
 
             k = ktf+1
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               fqy(i, k, jp1) = 0.5*((2.-fzm(k-1))*rv(i,k-1,j)-fzp(k-1)*rv(i,k-2,j))*      &
                      (w(i,k,j)+w(i,k,j-1))
@@ -4604,7 +6554,13 @@ SUBROUTINE advect_w    ( w, w_old, tendency,            &
 
      ELSE IF ( j == jde-2 ) THEN  ! 3rd or 4th order flux 2 in from north boundary
 
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts+1,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               vel = fzm(k)*rv(i,k,j)+fzp(k)*rv(i,k-1,j)
               fqy( i, k, jp1 ) = vel*flux4(             &
@@ -4614,6 +6570,9 @@ SUBROUTINE advect_w    ( w, w_old, tendency,            &
             ENDDO
 
             k = ktf+1
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               vel = (2.-fzm(k-1))*rv(i,k-1,j)-fzp(k-1)*rv(i,k-2,j)
               fqy( i, k, jp1 ) = vel*flux4(             &
@@ -4630,14 +6589,26 @@ SUBROUTINE advect_w    ( w, w_old, tendency,            &
         ! (latitudes are as for u grid, longitudes are displaced)
         ! Therefore: flow is only from one side for points next to poles
         IF ( config_flags%polar .AND. (j == jds+1) ) THEN
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             mrdy=msftx(i,j-1)*rdy    ! see ADT eqn 46 dividing by my, 2nd term RHS
             tendency(i,k,j-1) = tendency(i,k,j-1) - mrdy*fqy(i,k,jp1)
           END DO
           END DO
         ELSE IF( config_flags%polar .AND. (j == jde) ) THEN
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             mrdy=msftx(i,j-1)*rdy    ! see ADT eqn 46 dividing by my, 2nd term RHS
             tendency(i,k,j-1) = tendency(i,k,j-1) + mrdy*fqy(i,k,jp0)
@@ -4647,7 +6618,13 @@ SUBROUTINE advect_w    ( w, w_old, tendency,            &
 
         IF(j > j_start) THEN
 
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k=kts+1,ktf+1
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             mrdy=msftx(i,j-1)*rdy    ! see ADT eqn 46 dividing by my, 2nd term RHS
             tendency(i,k,j-1) = tendency(i,k,j-1) - mrdy*(fqy(i,k,jp1)-fqy(i,k,jp0))
@@ -4691,11 +6668,20 @@ SUBROUTINE advect_w    ( w, w_old, tendency,            &
 
 !  compute fluxes
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
 !  5th or 6th order flux
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts+1,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start_f, i_end_f
           vel = fzm(k)*ru(i,k,j)+fzp(k)*ru(i,k-1,j)
           fqx( i,k ) = vel*flux6( w(i-3,k,j), w(i-2,k,j),  &
@@ -4706,6 +6692,9 @@ SUBROUTINE advect_w    ( w, w_old, tendency,            &
         ENDDO
 
         k = ktf+1
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start_f, i_end_f
           vel = (2.-fzm(k-1))*ru(i,k-1,j)-fzp(k-1)*ru(i,k-2,j)
           fqx( i,k ) = vel*flux6( w(i-3,k,j), w(i-2,k,j),  &
@@ -4718,9 +6707,15 @@ SUBROUTINE advect_w    ( w, w_old, tendency,            &
 
         IF( degrade_xs ) THEN
 
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO i=i_start,i_start_f-1
 
             IF(i == ids+1) THEN ! second order
+#ifdef WRF_GPU_DYN
+              !$acc loop vector
+#endif
               DO k=kts+1,ktf
                 fqx(i,k) = 0.5*(fzm(k)*ru(i,k,j)+fzp(k)*ru(i,k-1,j)) &
                                 *(w(i,k,j)+w(i-1,k,j))
@@ -4731,6 +6726,9 @@ SUBROUTINE advect_w    ( w, w_old, tendency,            &
             ENDIF
 
             IF(i == ids+2) THEN  ! third order
+#ifdef WRF_GPU_DYN
+              !$acc loop vector
+#endif
               DO k=kts+1,ktf
                 vel = fzm(k)*ru(i,k,j)+fzp(k)*ru(i,k-1,j)
                 fqx( i,k ) = vel*flux4( w(i-2,k,j), w(i-1,k,j),  &
@@ -4750,9 +6748,15 @@ SUBROUTINE advect_w    ( w, w_old, tendency,            &
 
         IF( degrade_xe ) THEN
 
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO i = i_end_f+1, i_end+1
 
             IF( i == ide-1 ) THEN ! second order flux next to the boundary
+#ifdef WRF_GPU_DYN
+              !$acc loop vector
+#endif
               DO k=kts+1,ktf
                 fqx(i,k) = 0.5*(fzm(k)*ru(i,k,j)+fzp(k)*ru(i,k-1,j))      &
                                   *(w(i,k,j)+w(i-1,k,j))
@@ -4763,6 +6767,9 @@ SUBROUTINE advect_w    ( w, w_old, tendency,            &
             ENDIF
 
             IF( i == ide-2 ) THEN ! third order flux one in from the boundary
+#ifdef WRF_GPU_DYN
+              !$acc loop vector
+#endif
               DO k=kts+1,ktf
                 vel = fzm(k)*ru(i,k,j)+fzp(k)*ru(i,k-1,j)
                 fqx( i,k ) = vel*flux4( w(i-2,k,j), w(i-1,k,j),  &
@@ -4782,7 +6789,13 @@ SUBROUTINE advect_w    ( w, w_old, tendency,            &
 
 !  x flux-divergence into tendency
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts+1,ktf+1
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             mrdx=msftx(i,j)*rdx      ! see ADT eqn 46 dividing by my, 1st term RHS
             tendency(i,k,j) = tendency(i,k,j) - mrdx*(fqx(i+1,k)-fqx(i,k))
@@ -4848,11 +6861,20 @@ ELSE IF (horz_order == 5 ) THEN
      jp1 = 2
      jp0 = 1
 
+#ifdef WRF_GPU_DYN
+     !$acc loop seq
+#endif
      j_loop_y_flux_5 : DO j = j_start, j_end+1
 
       IF( (j >= j_start_f ) .and. (j <= j_end_f) ) THEN
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts+1,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start, i_end
           vel = fzm(k)*rv(i,k,j)+fzp(k)*rv(i,k-1,j)
           fqy( i, k, jp1 ) = vel*flux5(                     &
@@ -4862,6 +6884,9 @@ ELSE IF (horz_order == 5 ) THEN
         ENDDO
 
         k = ktf+1
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start, i_end
           vel = (2.-fzm(k-1))*rv(i,k-1,j)-fzp(k-1)*rv(i,k-2,j)
           fqy( i, k, jp1 ) = vel*flux5(                     &
@@ -4871,7 +6896,13 @@ ELSE IF (horz_order == 5 ) THEN
 
       ELSE IF ( j == jds+1 ) THEN   ! 2nd order flux next to south boundary
 
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts+1,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               fqy(i, k, jp1) = 0.5*(fzm(k)*rv(i,k,j)+fzp(k)*rv(i,k-1,j))*          &
                      (w(i,k,j)+w(i,k,j-1))
@@ -4879,6 +6910,9 @@ ELSE IF (horz_order == 5 ) THEN
             ENDDO
 
             k = ktf+1
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               fqy(i, k, jp1) = 0.5*((2.-fzm(k-1))*rv(i,k-1,j)-fzp(k-1)*rv(i,k-2,j))*          &
                      (w(i,k,j)+w(i,k,j-1))
@@ -4886,7 +6920,13 @@ ELSE IF (horz_order == 5 ) THEN
 
      ELSE IF  ( j == jds+2 ) THEN  ! third of 4th order flux 2 in from south boundary
 
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts+1,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               vel = fzm(k)*rv(i,k,j)+fzp(k)*rv(i,k-1,j)
               fqy( i, k, jp1 ) = vel*flux3(              &
@@ -4895,6 +6935,9 @@ ELSE IF (horz_order == 5 ) THEN
             ENDDO
 
             k = ktf+1
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               vel = (2.-fzm(k-1))*rv(i,k-1,j)-fzp(k-1)*rv(i,k-2,j)
               fqy( i, k, jp1 ) = vel*flux3(              &
@@ -4903,7 +6946,13 @@ ELSE IF (horz_order == 5 ) THEN
 
      ELSE IF ( j == jde-1 ) THEN  ! 2nd order flux next to north boundary
 
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts+1,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               fqy(i, k, jp1) = 0.5*(fzm(k)*rv(i,k,j)+fzp(k)*rv(i,k-1,j))*      &
                      (w(i,k,j)+w(i,k,j-1))
@@ -4911,6 +6960,9 @@ ELSE IF (horz_order == 5 ) THEN
             ENDDO
 
             k = ktf+1
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               fqy(i, k, jp1) = 0.5*((2.-fzm(k-1))*rv(i,k-1,j)-fzp(k-1)*rv(i,k-2,j))*      &
                      (w(i,k,j)+w(i,k,j-1))
@@ -4918,7 +6970,13 @@ ELSE IF (horz_order == 5 ) THEN
 
      ELSE IF ( j == jde-2 ) THEN  ! 3rd or 4th order flux 2 in from north boundary
 
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts+1,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               vel = fzm(k)*rv(i,k,j)+fzp(k)*rv(i,k-1,j)
               fqy( i, k, jp1 ) = vel*flux3(             &
@@ -4928,6 +6986,9 @@ ELSE IF (horz_order == 5 ) THEN
             ENDDO
 
             k = ktf+1
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
               vel = (2.-fzm(k-1))*rv(i,k-1,j)-fzp(k-1)*rv(i,k-2,j)
               fqy( i, k, jp1 ) = vel*flux3(             &
@@ -4944,14 +7005,26 @@ ELSE IF (horz_order == 5 ) THEN
         ! (latitudes are as for u grid, longitudes are displaced)
         ! Therefore: flow is only from one side for points next to poles
         IF ( config_flags%polar .AND. (j == jds+1) ) THEN
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             mrdy=msftx(i,j-1)*rdy    ! see ADT eqn 46 dividing by my, 2nd term RHS
             tendency(i,k,j-1) = tendency(i,k,j-1) - mrdy*fqy(i,k,jp1)
           END DO
           END DO
         ELSE IF( config_flags%polar .AND. (j == jde) ) THEN
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             mrdy=msftx(i,j-1)*rdy    ! see ADT eqn 46 dividing by my, 2nd term RHS
             tendency(i,k,j-1) = tendency(i,k,j-1) + mrdy*fqy(i,k,jp0)
@@ -4961,7 +7034,13 @@ ELSE IF (horz_order == 5 ) THEN
 
         IF(j > j_start) THEN
 
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k=kts+1,ktf+1
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             mrdy=msftx(i,j-1)*rdy    ! see ADT eqn 46 dividing by my, 2nd term RHS
             tendency(i,k,j-1) = tendency(i,k,j-1) - mrdy*(fqy(i,k,jp1)-fqy(i,k,jp0))
@@ -5005,11 +7084,20 @@ ELSE IF (horz_order == 5 ) THEN
 
 !  compute fluxes
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
 !  5th or 6th order flux
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts+1,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start_f, i_end_f
           vel = fzm(k)*ru(i,k,j)+fzp(k)*ru(i,k-1,j)
           fqx( i,k ) = vel*flux5( w(i-3,k,j), w(i-2,k,j),  &
@@ -5020,6 +7108,9 @@ ELSE IF (horz_order == 5 ) THEN
         ENDDO
 
         k = ktf+1
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start_f, i_end_f
           vel = (2.-fzm(k-1))*ru(i,k-1,j)-fzp(k-1)*ru(i,k-2,j)
           fqx( i,k ) = vel*flux5( w(i-3,k,j), w(i-2,k,j),  &
@@ -5032,9 +7123,15 @@ ELSE IF (horz_order == 5 ) THEN
 
         IF( degrade_xs ) THEN
 
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO i=i_start,i_start_f-1
 
             IF(i == ids+1) THEN ! second order
+#ifdef WRF_GPU_DYN
+              !$acc loop vector
+#endif
               DO k=kts+1,ktf
                 fqx(i,k) = 0.5*(fzm(k)*ru(i,k,j)+fzp(k)*ru(i,k-1,j)) &
                                 *(w(i,k,j)+w(i-1,k,j))
@@ -5045,6 +7142,9 @@ ELSE IF (horz_order == 5 ) THEN
             ENDIF
 
             IF(i == ids+2) THEN  ! third order
+#ifdef WRF_GPU_DYN
+              !$acc loop vector
+#endif
               DO k=kts+1,ktf
                 vel = fzm(k)*ru(i,k,j)+fzp(k)*ru(i,k-1,j)
                 fqx( i,k ) = vel*flux3( w(i-2,k,j), w(i-1,k,j),  &
@@ -5064,9 +7164,15 @@ ELSE IF (horz_order == 5 ) THEN
 
         IF( degrade_xe ) THEN
 
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO i = i_end_f+1, i_end+1
 
             IF( i == ide-1 ) THEN ! second order flux next to the boundary
+#ifdef WRF_GPU_DYN
+              !$acc loop vector
+#endif
               DO k=kts+1,ktf
                 fqx(i,k) = 0.5*(fzm(k)*ru(i,k,j)+fzp(k)*ru(i,k-1,j))      &
                                   *(w(i,k,j)+w(i-1,k,j))
@@ -5077,6 +7183,9 @@ ELSE IF (horz_order == 5 ) THEN
             ENDIF
 
             IF( i == ide-2 ) THEN ! third order flux one in from the boundary
+#ifdef WRF_GPU_DYN
+              !$acc loop vector
+#endif
               DO k=kts+1,ktf
                 vel = fzm(k)*ru(i,k,j)+fzp(k)*ru(i,k-1,j)
                 fqx( i,k ) = vel*flux3( w(i-2,k,j), w(i-1,k,j),  &
@@ -5096,7 +7205,13 @@ ELSE IF (horz_order == 5 ) THEN
 
 !  x flux-divergence into tendency
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts+1,ktf+1
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             mrdx=msftx(i,j)*rdx      ! see ADT eqn 46 dividing by my, 1st term RHS
             tendency(i,k,j) = tendency(i,k,j) - mrdx*(fqx(i+1,k)-fqx(i,k))
@@ -5155,9 +7270,18 @@ ELSE IF ( horz_order == 4 ) THEN
 
 !  compute fluxes
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts+1,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start_f, i_end_f
           vel = fzm(k)*ru(i,k,j)+fzp(k)*ru(i,k-1,j)
           fqx( i, k ) = vel*flux4( w(i-2,k,j), w(i-1,k,j),  &
@@ -5167,6 +7291,9 @@ ELSE IF ( horz_order == 4 ) THEN
         ENDDO
 
         k = ktf+1
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start_f, i_end_f
           vel = (2.-fzm(k-1))*ru(i,k-1,j)-fzp(k-1)*ru(i,k-2,j)
           fqx( i, k ) = vel*flux4( w(i-2,k,j), w(i-1,k,j),  &
@@ -5176,6 +7303,9 @@ ELSE IF ( horz_order == 4 ) THEN
 !  second order flux close to boundaries (if not periodic or symmetric)
 
         IF( degrade_xs ) THEN
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO k=kts+1,ktf
             fqx(i_start, k) =                            &
                0.5*(fzm(k)*ru(i_start,k,j)+fzp(k)*ru(i_start,k-1,j))  &
@@ -5188,6 +7318,9 @@ ELSE IF ( horz_order == 4 ) THEN
         ENDIF
 
         IF( degrade_xe ) THEN
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO k=kts+1,ktf
             fqx(i_end+1, k) =                            &
                0.5*(fzm(k)*ru(i_end+1,k,j)+fzp(k)*ru(i_end+1,k-1,j))  &
@@ -5201,7 +7334,13 @@ ELSE IF ( horz_order == 4 ) THEN
 
 !  x flux-divergence into tendency
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts+1,ktf+1
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start, i_end
           mrdx=msftx(i,j)*rdx        ! see ADT eqn 46 dividing by my, 1st term RHS
           tendency(i,k,j) = tendency(i,k,j) - mrdx*(fqx(i+1,k)-fqx(i,k))
@@ -5239,10 +7378,19 @@ ELSE IF ( horz_order == 4 ) THEN
         jp1 = 2
         jp0 = 1
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end+1
 
        IF ((j < j_start_f) .and. degrade_ys)  THEN
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k = kts+1, ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             fqy(i, k, jp1) =                             &
                0.5*(fzm(k)*rv(i,k,j_start)+fzp(k)*rv(i,k-1,j_start))   &
@@ -5250,13 +7398,22 @@ ELSE IF ( horz_order == 4 ) THEN
           ENDDO
           ENDDO
           k = ktf+1
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             fqy(i, k, jp1) =                             &
                0.5*((2.-fzm(k-1))*rv(i,k-1,j_start)-fzp(k-1)*rv(i,k-2,j_start))   &
                    *(w(i,k,j_start)+w(i,k,j_start-1))
           ENDDO
        ELSE IF ((j > j_end_f) .and. degrade_ye)  THEN
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k = kts+1, ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             ! Assumes j>j_end_f is ONLY j_end+1 ...
 !            fqy(i, k, jp1) =                             &
@@ -5268,6 +7425,9 @@ ELSE IF ( horz_order == 4 ) THEN
           ENDDO
           ENDDO
           k = ktf+1
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             ! Assumes j>j_end_f is ONLY j_end+1 ...
 !            fqy(i, k, jp1) =                                         &
@@ -5279,7 +7439,13 @@ ELSE IF ( horz_order == 4 ) THEN
           ENDDO
        ELSE
 !  3rd or 4th order flux
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k = kts+1, ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             vel = fzm(k)*rv(i,k,j)+fzp(k)*rv(i,k-1,j)
             fqy( i, k, jp1 ) = vel*flux4( w(i,k,j-2), w(i,k,j-1),  &
@@ -5288,6 +7454,9 @@ ELSE IF ( horz_order == 4 ) THEN
           ENDDO
           ENDDO
           k = ktf+1
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             vel = (2.-fzm(k-1))*rv(i,k-1,j)-fzp(k-1)*rv(i,k-2,j)
             fqy( i, k, jp1 ) = vel*flux4( w(i,k,j-2), w(i,k,j-1),  &
@@ -5303,14 +7472,26 @@ ELSE IF ( horz_order == 4 ) THEN
        ! (latitudes are as for u grid, longitudes are displaced)
        ! Therefore: flow is only from one side for points next to poles
        IF ( config_flags%polar .AND. (j == jds+1) ) THEN
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
            mrdy=msftx(i,j-1)*rdy    ! see ADT eqn 46 dividing by my, 2nd term RHS
            tendency(i,k,j-1) = tendency(i,k,j-1) - mrdy*fqy(i,k,jp1)
          END DO
          END DO
        ELSE IF( config_flags%polar .AND. (j == jde) ) THEN
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
            mrdy=msftx(i,j-1)*rdy    ! see ADT eqn 46 dividing by my, 2nd term RHS
            tendency(i,k,j-1) = tendency(i,k,j-1) + mrdy*fqy(i,k,jp0)
@@ -5320,7 +7501,13 @@ ELSE IF ( horz_order == 4 ) THEN
 
        IF( j > j_start ) THEN
 
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k = kts+1, ktf+1
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             mrdy=msftx(i,j-1)*rdy    ! see ADT eqn 46 dividing by my, 2nd term RHS
             tendency(i,k,j-1) = tendency(i,k,j-1) - mrdy*(fqy(i,k,jp1)-fqy(i,k,jp0))
@@ -5387,9 +7574,18 @@ ELSE IF ( horz_order == 3 ) THEN
 
 !  compute fluxes
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts+1,ktf
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start_f, i_end_f
           vel = fzm(k)*ru(i,k,j)+fzp(k)*ru(i,k-1,j)
           fqx( i, k ) = vel*flux3( w(i-2,k,j), w(i-1,k,j),  &
@@ -5398,6 +7594,9 @@ ELSE IF ( horz_order == 3 ) THEN
         ENDDO
         ENDDO
         k = ktf+1
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start_f, i_end_f
           vel = (2.-fzm(k-1))*ru(i,k-1,j)-fzp(k-1)*ru(i,k-2,j)
           fqx( i, k ) = vel*flux3( w(i-2,k,j), w(i-1,k,j),  &
@@ -5408,6 +7607,9 @@ ELSE IF ( horz_order == 3 ) THEN
 !  second order flux close to boundaries (if not periodic or symmetric)
 
         IF( degrade_xs ) THEN
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO k=kts+1,ktf
             fqx(i_start, k) =                            &
                0.5*(fzm(k)*ru(i_start,k,j)+fzp(k)*ru(i_start,k-1,j))  &
@@ -5420,6 +7622,9 @@ ELSE IF ( horz_order == 3 ) THEN
         ENDIF
 
         IF( degrade_xe ) THEN
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO k=kts+1,ktf
             fqx(i_end+1, k) =                            &
                0.5*(fzm(k)*ru(i_end+1,k,j)+fzp(k)*ru(i_end+1,k-1,j))  &
@@ -5433,7 +7638,13 @@ ELSE IF ( horz_order == 3 ) THEN
 
 !  x flux-divergence into tendency
 
+#ifdef WRF_GPU_DYN
+        !$acc loop seq
+#endif
         DO k=kts+1,ktf+1
+#ifdef WRF_GPU_DYN
+        !$acc loop vector
+#endif
         DO i = i_start, i_end
           mrdx=msftx(i,j)*rdx        ! see ADT eqn 46 dividing by my, 1st term RHS
           tendency(i,k,j) = tendency(i,k,j) - mrdx*(fqx(i+1,k)-fqx(i,k))
@@ -5471,10 +7682,19 @@ ELSE IF ( horz_order == 3 ) THEN
         jp1 = 2
         jp0 = 1
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end+1
 
        IF ((j < j_start_f) .and. degrade_ys)  THEN
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k = kts+1, ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             fqy(i, k, jp1) =                             &
                0.5*(fzm(k)*rv(i,k,j_start)+fzp(k)*rv(i,k-1,j_start))   &
@@ -5482,13 +7702,22 @@ ELSE IF ( horz_order == 3 ) THEN
           ENDDO
           ENDDO
           k = ktf+1
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             fqy(i, k, jp1) =                             &
                0.5*((2.-fzm(k-1))*rv(i,k-1,j_start)-fzp(k-1)*rv(i,k-2,j_start))   &
                    *(w(i,k,j_start)+w(i,k,j_start-1))
           ENDDO
        ELSE IF ((j > j_end_f) .and. degrade_ye)  THEN
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k = kts+1, ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             ! Assumes j>j_end_f is ONLY j_end+1 ...
 !            fqy(i, k, jp1) =                             &
@@ -5500,6 +7729,9 @@ ELSE IF ( horz_order == 3 ) THEN
           ENDDO
           ENDDO
           k = ktf+1
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             ! Assumes j>j_end_f is ONLY j_end+1 ...
 !            fqy(i, k, jp1) =                             &
@@ -5511,7 +7743,13 @@ ELSE IF ( horz_order == 3 ) THEN
           ENDDO
        ELSE
 !  3rd or 4th order flux
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k = kts+1, ktf
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             vel = fzm(k)*rv(i,k,j)+fzp(k)*rv(i,k-1,j)
             fqy( i, k, jp1 ) = vel*flux3( w(i,k,j-2), w(i,k,j-1),  &
@@ -5520,6 +7758,9 @@ ELSE IF ( horz_order == 3 ) THEN
           ENDDO
           ENDDO
           k = ktf+1
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             vel = (2.-fzm(k-1))*rv(i,k-1,j)-fzp(k-1)*rv(i,k-2,j)
             fqy( i, k, jp1 ) = vel*flux3( w(i,k,j-2), w(i,k,j-1),  &
@@ -5535,14 +7776,26 @@ ELSE IF ( horz_order == 3 ) THEN
        ! (latitudes are as for u grid, longitudes are displaced)
        ! Therefore: flow is only from one side for points next to poles
        IF ( config_flags%polar .AND. (j == jds+1) ) THEN
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
            mrdy=msftx(i,j-1)*rdy    ! see ADT eqn 46 dividing by my, 2nd term RHS
            tendency(i,k,j-1) = tendency(i,k,j-1) - mrdy*fqy(i,k,jp1)
          END DO
          END DO
        ELSE IF( config_flags%polar .AND. (j == jde) ) THEN
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts,ktf
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
            mrdy=msftx(i,j-1)*rdy    ! see ADT eqn 46 dividing by my, 2nd term RHS
            tendency(i,k,j-1) = tendency(i,k,j-1) + mrdy*fqy(i,k,jp0)
@@ -5552,7 +7805,13 @@ ELSE IF ( horz_order == 3 ) THEN
 
        IF( j > j_start ) THEN
 
+#ifdef WRF_GPU_DYN
+          !$acc loop seq
+#endif
           DO k = kts+1, ktf+1
+#ifdef WRF_GPU_DYN
+          !$acc loop vector
+#endif
           DO i = i_start, i_end
             mrdy=msftx(i,j-1)*rdy    ! see ADT eqn 46 dividing by my, 2nd term RHS
             tendency(i,k,j-1) = tendency(i,k,j-1) - mrdy*(fqy(i,k,jp1)-fqy(i,k,jp0))
@@ -5581,8 +7840,17 @@ ELSE IF (horz_order == 2 ) THEN
         IF ( config_flags%open_xe .or. specified ) i_end   = MIN(ide-2,ite)
       ENDIF
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO k=kts+1,ktf
+#ifdef WRF_GPU_DYN
+      !$acc loop vector
+#endif
       DO i = i_start, i_end
 
          mrdx=msftx(i,j)*rdx         ! see ADT eqn 46 dividing by my, 1st term RHS
@@ -5597,6 +7865,9 @@ ELSE IF (horz_order == 2 ) THEN
       ENDDO
 
       k = ktf+1
+#ifdef WRF_GPU_DYN
+      !$acc loop vector
+#endif
       DO i = i_start, i_end
 
          mrdx=msftx(i,j)*rdx         ! see ADT eqn 46 dividing by my, 1st term RHS
@@ -5617,8 +7888,17 @@ ELSE IF (horz_order == 2 ) THEN
       IF ( config_flags%open_ys .or. specified .or. config_flags%polar ) j_start = MAX(jds+1,jts)
       IF ( config_flags%open_ye .or. specified .or. config_flags%polar ) j_end   = MIN(jde-2,jte)
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO k=kts+1,ktf
+#ifdef WRF_GPU_DYN
+      !$acc loop vector
+#endif
       DO i = i_start, i_end
 
          mrdy=msftx(i,j)*rdy         !  see ADT eqn 46 dividing by my, 2nd term RHS
@@ -5633,6 +7913,9 @@ ELSE IF (horz_order == 2 ) THEN
       ENDDO
 
       k = ktf+1
+#ifdef WRF_GPU_DYN
+      !$acc loop vector
+#endif
       DO i = i_start, i_end
 
          mrdy=msftx(i,j)*rdy         ! see ADT eqn 46 dividing by my, 2nd term RHS
@@ -5650,7 +7933,13 @@ ELSE IF (horz_order == 2 ) THEN
       ! Polar boundary condition ... not covered in above j-loop
       IF (config_flags%polar) THEN
          IF (jts == jds) THEN
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts+1,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
                mrdy=msftx(i,jds)*rdy   ! see ADT eqn 46 dividing by my, 2nd term RHS
                tendency(i,k,jds)=tendency(i,k,jds) -mrdy*0.5 &
@@ -5659,6 +7948,9 @@ ELSE IF (horz_order == 2 ) THEN
             END DO
             END DO
             k = ktf+1
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
                mrdy=msftx(i,jds)*rdy   ! see ADT eqn 46 dividing by my, 2nd term RHS
                tendency(i,k,jds)=tendency(i,k,jds) -mrdy*0.5       &
@@ -5667,7 +7959,13 @@ ELSE IF (horz_order == 2 ) THEN
             ENDDO
          END IF
          IF (jte == jde) THEN
+#ifdef WRF_GPU_DYN
+            !$acc loop seq
+#endif
             DO k=kts+1,ktf
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
                mrdy=msftx(i,jde-1)*rdy ! see ADT eqn 46 dividing by my, 2nd term RHS
                tendency(i,k,jde-1)=tendency(i,k,jde-1) +mrdy*0.5 &
@@ -5676,6 +7974,9 @@ ELSE IF (horz_order == 2 ) THEN
             END DO
             END DO
             k = ktf+1
+#ifdef WRF_GPU_DYN
+            !$acc loop vector
+#endif
             DO i = i_start, i_end
                mrdy=msftx(i,jde-1)*rdy ! see ADT eqn 46 dividing by my, 2nd term RHS
                tendency(i,k,jde-1)=tendency(i,k,jde-1) +mrdy*0.5       &
@@ -5690,9 +7991,12 @@ ELSE IF (horz_order == 2 ) THEN
       ! Just in case we want to turn horizontal advection off, we can do it
 
    ELSE
-
+!  unreachable under WRF_GPU_DYN: horz_order was validated on the host
+!  before entering this parallel region.
+#ifndef WRF_GPU_DYN
       WRITE ( wrf_err_message ,*) ' advect_w_6a, h_order not known ',horz_order
       CALL wrf_error_fatal ( wrf_err_message )
+#endif
 
    ENDIF horizontal_order_test
 
@@ -5709,7 +8013,13 @@ ELSE IF (horz_order == 2 ) THEN
 
    IF( (config_flags%open_xs) .and. (its == ids)) THEN
 
+#ifdef WRF_GPU_DYN
+       !$acc loop seq
+#endif
        DO j = j_start, j_end
+#ifdef WRF_GPU_DYN
+       !$acc loop vector
+#endif
        DO k = kts+1, ktf
 
          uw = 0.5*(fzm(k)*(ru(its,k  ,j)+ru(its+1,k  ,j)) +  &
@@ -5727,6 +8037,9 @@ ELSE IF (horz_order == 2 ) THEN
        ENDDO
 
        k = ktf+1
+#ifdef WRF_GPU_DYN
+       !$acc loop vector
+#endif
        DO j = j_start, j_end
 
          uw = 0.5*( (2.-fzm(k-1))*(ru(its,k-1,j)+ru(its+1,k-1,j))   &
@@ -5746,7 +8059,13 @@ ELSE IF (horz_order == 2 ) THEN
 
    IF( (config_flags%open_xe) .and. (ite == ide)) THEN
 
+#ifdef WRF_GPU_DYN
+       !$acc loop seq
+#endif
        DO j = j_start, j_end
+#ifdef WRF_GPU_DYN
+       !$acc loop vector
+#endif
        DO k = kts+1, ktf
 
          uw = 0.5*(fzm(k)*(ru(ite-1,k  ,j)+ru(ite,k  ,j)) +  &
@@ -5764,6 +8083,9 @@ ELSE IF (horz_order == 2 ) THEN
        ENDDO
 
        k = ktf+1
+#ifdef WRF_GPU_DYN
+       !$acc loop vector
+#endif
        DO j = j_start, j_end
 
          uw = 0.5*( (2.-fzm(k-1))*(ru(ite-1,k-1,j)+ru(ite,k-1,j))    &
@@ -5784,7 +8106,13 @@ ELSE IF (horz_order == 2 ) THEN
 
    IF( (config_flags%open_ys) .and. (jts == jds)) THEN
 
+#ifdef WRF_GPU_DYN
+       !$acc loop seq
+#endif
        DO i = i_start, i_end
+#ifdef WRF_GPU_DYN
+       !$acc loop vector
+#endif
        DO k = kts+1, ktf
 
          vw = 0.5*( fzm(k)*(rv(i,k  ,jts)+rv(i,k  ,jts+1)) +  &
@@ -5802,6 +8130,9 @@ ELSE IF (horz_order == 2 ) THEN
        ENDDO
 
        k = ktf+1
+#ifdef WRF_GPU_DYN
+       !$acc loop vector
+#endif
        DO i = i_start, i_end
          vw = 0.5*( (2.-fzm(k-1))*(rv(i,k-1,jts)+rv(i,k-1,jts+1))    &
                    -fzp(k-1)*(rv(i,k-2,jts)+rv(i,k-2,jts+1))   )
@@ -5820,7 +8151,13 @@ ELSE IF (horz_order == 2 ) THEN
 
    IF( (config_flags%open_ye) .and. (jte == jde) ) THEN
 
+#ifdef WRF_GPU_DYN
+       !$acc loop seq
+#endif
        DO i = i_start, i_end
+#ifdef WRF_GPU_DYN
+       !$acc loop vector
+#endif
        DO k = kts+1, ktf
 
          vw = 0.5*( fzm(k)*(rv(i,k  ,jte-1)+rv(i,k  ,jte)) +  &
@@ -5838,6 +8175,9 @@ ELSE IF (horz_order == 2 ) THEN
        ENDDO
 
        k = ktf+1
+#ifdef WRF_GPU_DYN
+       !$acc loop vector
+#endif
        DO i = i_start, i_end
 
          vw = 0.5*( (2.-fzm(k-1))*(rv(i,k-1,jte-1)+rv(i,k-1,jte))    &
@@ -5865,6 +8205,9 @@ ELSE IF (horz_order == 2 ) THEN
       j_start = jts
       j_end   = MIN(jte,jde-1)
 
+#ifdef WRF_GPU_DYN
+      !$acc loop vector
+#endif
       DO i = i_start, i_end
          vflux(i,kts)=0.
          vflux(i,kte)=0.
@@ -5872,9 +8215,18 @@ ELSE IF (horz_order == 2 ) THEN
 
     vert_order_test : IF (vert_order == 6) THEN    
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts+3,ktf-1
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
            vel=0.5*(rom(i,k,j)+rom(i,k-1,j))
            vflux(i,k) = vel*flux6(                                   &
@@ -5883,6 +8235,9 @@ ELSE IF (horz_order == 2 ) THEN
          ENDDO
          ENDDO
 
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
 
            k=kts+1
@@ -5905,7 +8260,13 @@ ELSE IF (horz_order == 2 ) THEN
 
          ENDDO
 
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts+1,ktf
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
             tendency(i,k,j)=tendency(i,k,j)-rdzu(k)*(vflux(i,k+1)-vflux(i,k))
          ENDDO
@@ -5913,6 +8274,9 @@ ELSE IF (horz_order == 2 ) THEN
 
 ! pick up flux contribution for w at the lid. wcs, 13 march 2004
          k = ktf+1
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
            tendency(i,k,j)=tendency(i,k,j)+2.*rdzu(k-1)*(vflux(i,k))
          ENDDO
@@ -5921,9 +8285,18 @@ ELSE IF (horz_order == 2 ) THEN
 
  ELSE IF (vert_order == 5) THEN    
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts+3,ktf-1
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
            vel=0.5*(rom(i,k,j)+rom(i,k-1,j))
            vflux(i,k) = vel*flux5(                                   &
@@ -5932,6 +8305,9 @@ ELSE IF (horz_order == 2 ) THEN
          ENDDO
          ENDDO
 
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
 
            k=kts+1
@@ -5953,7 +8329,13 @@ ELSE IF (horz_order == 2 ) THEN
 
          ENDDO
 
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts+1,ktf
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
             tendency(i,k,j)=tendency(i,k,j)-rdzu(k)*(vflux(i,k+1)-vflux(i,k))
          ENDDO
@@ -5961,6 +8343,9 @@ ELSE IF (horz_order == 2 ) THEN
 
 ! pick up flux contribution for w at the lid, wcs. 13 march 2004
          k = ktf+1
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
            tendency(i,k,j)=tendency(i,k,j)+2.*rdzu(k-1)*(vflux(i,k))
          ENDDO
@@ -5969,9 +8354,18 @@ ELSE IF (horz_order == 2 ) THEN
 
  ELSE IF (vert_order == 4) THEN    
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts+2,ktf
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
            vel=0.5*(rom(i,k,j)+rom(i,k-1,j))
            vflux(i,k) = vel*flux4(              &
@@ -5980,6 +8374,9 @@ ELSE IF (horz_order == 2 ) THEN
          ENDDO
          ENDDO
 
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
 
            k=kts+1
@@ -5989,7 +8386,13 @@ ELSE IF (horz_order == 2 ) THEN
 
          ENDDO
 
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts+1,ktf
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
             tendency(i,k,j)=tendency(i,k,j)-rdzu(k)*(vflux(i,k+1)-vflux(i,k))
          ENDDO
@@ -5997,6 +8400,9 @@ ELSE IF (horz_order == 2 ) THEN
 
 ! pick up flux contribution for w at the lid, wcs. 13 march 2004
          k = ktf+1
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
            tendency(i,k,j)=tendency(i,k,j)+2.*rdzu(k-1)*(vflux(i,k))
          ENDDO
@@ -6005,10 +8411,19 @@ ELSE IF (horz_order == 2 ) THEN
 
  ELSE IF (vert_order == 3) THEN    
 
+#ifdef WRF_GPU_DYN
+      !$acc loop seq
+#endif
       DO j = j_start, j_end
 
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts+2,ktf
 !DEC$ vector always
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
            vel=0.5*(rom(i,k,j)+rom(i,k-1,j))
            vflux(i,k) = vel*flux3(              &
@@ -6017,6 +8432,9 @@ ELSE IF (horz_order == 2 ) THEN
          ENDDO
          ENDDO
 
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
 
            k=kts+1
@@ -6026,7 +8444,13 @@ ELSE IF (horz_order == 2 ) THEN
 
          ENDDO
 
+#ifdef WRF_GPU_DYN
+         !$acc loop seq
+#endif
          DO k=kts+1,ktf
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
             tendency(i,k,j)=tendency(i,k,j)-rdzu(k)*(vflux(i,k+1)-vflux(i,k))
          ENDDO
@@ -6034,6 +8458,9 @@ ELSE IF (horz_order == 2 ) THEN
 
 ! pick up flux contribution for w at the lid, wcs. 13 march 2004
          k = ktf+1
+#ifdef WRF_GPU_DYN
+         !$acc loop vector
+#endif
          DO i = i_start, i_end
            tendency(i,k,j)=tendency(i,k,j)+2.*rdzu(k-1)*(vflux(i,k))
          ENDDO
@@ -6042,14 +8469,29 @@ ELSE IF (horz_order == 2 ) THEN
 
  ELSE IF (vert_order == 2) THEN    
 
+#ifdef WRF_GPU_DYN
+  !$acc loop seq
+#endif
   DO j = j_start, j_end
+#ifdef WRF_GPU_DYN
+     !$acc loop seq
+#endif
      DO k=kts+1,ktf+1
+#ifdef WRF_GPU_DYN
+     !$acc loop vector
+#endif
      DO i = i_start, i_end
 
             vflux(i,k)=0.25*(rom(i,k,j)+rom(i,k-1,j))*(w(i,k,j)+w(i,k-1,j))
      ENDDO
      ENDDO
+#ifdef WRF_GPU_DYN
+     !$acc loop seq
+#endif
      DO k=kts+1,ktf
+#ifdef WRF_GPU_DYN
+     !$acc loop vector
+#endif
      DO i = i_start, i_end
             tendency(i,k,j)=tendency(i,k,j)-rdzu(k)*(vflux(i,k+1)-vflux(i,k))
 
@@ -6058,6 +8500,9 @@ ELSE IF (horz_order == 2 ) THEN
 
 ! pick up flux contribution for w at the lid, wcs. 13 march 2004
      k = ktf+1
+#ifdef WRF_GPU_DYN
+     !$acc loop vector
+#endif
      DO i = i_start, i_end
        tendency(i,k,j)=tendency(i,k,j)+2.*rdzu(k-1)*(vflux(i,k))
      ENDDO
@@ -6065,12 +8510,19 @@ ELSE IF (horz_order == 2 ) THEN
   ENDDO
 
    ELSE
-
+!  unreachable under WRF_GPU_DYN: vert_order was validated on the host
+!  before entering this parallel region.
+#ifndef WRF_GPU_DYN
       WRITE (wrf_err_message ,*) ' advect_w, v_order not known ',vert_order
       CALL wrf_error_fatal ( wrf_err_message )
+#endif
 
    ENDIF vert_order_test
 
+#ifdef WRF_GPU_DYN
+   !$acc end parallel
+   !$acc end data
+#endif
 END SUBROUTINE advect_w
 
 !----------------------------------------------------------------

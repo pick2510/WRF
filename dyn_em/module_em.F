@@ -33,6 +33,9 @@ MODULE module_em
    
    USE module_advect_em, only: advect_u, advect_v, advect_w, advect_scalar, advect_scalar_pd, advect_scalar_mono, &
         advect_weno_u, advect_weno_v, advect_weno_w, advect_scalar_weno,  advect_scalar_wenopd
+#ifdef WRF_GPU_DYN
+   USE module_advect_em, only: advect_u_o5v3
+#endif
    
    USE module_big_step_utilities_em, only: grid_config_rec_type, calculate_full, couple_momentum, calc_mu_uv, calc_ww_cp, &
         calc_cq, calc_alt, calc_php, set_tend, rhs_ph, &
@@ -442,6 +445,19 @@ SUBROUTINE rk_tendency ( config_flags, rk_step,                           &
    !  advection tendencies
    CALL nl_get_time_step ( 1, time_step )
 
+#ifdef WRF_GPU_DYN
+!  ru, rv, ww, mut, the map-scale-factor arrays, c1h/c2h, fnm/fnp, rdnw/rdn,
+!  and config_flags are read-only inputs shared by every advect_u/v/w/scalar
+!  call below (including the per-species scalar loop further down) and are
+!  never touched by host-only code in between (coriolis/curvature only read
+!  ru/rv/rw, they don't write them).  Bring them onto the device once here
+!  instead of once per call -- this is the dominant transfer cost since
+!  ru/rv/ww are full 3D arrays and this block is called up to a dozen times
+!  per RK substep (once per moisture/scalar species).  Matching exit data is
+!  at the end of this subroutine.
+!$acc enter data copyin(ru,rv,ww,c1h,c2h,mut,msfux,msfuy,msfvx,msfvy,msftx, &
+!$acc& msfty,fnm,fnp,rdnw,rdn,config_flags)
+#endif
 
     IF( (rk_step == 3) .and. ( adv_opt == WENO_MOM ) ) THEN
 
@@ -456,7 +472,27 @@ SUBROUTINE rk_tendency ( config_flags, rk_step,                           &
                    its, ite, jts, jte, kts, kte )
 
      ELSE
-     
+
+#ifdef WRF_GPU_DYN
+!  Only u and ru_tend are specific to this call; the rest of advect_u's
+!  inputs were made resident once, above, for the whole advection block.
+!$acc enter data copyin(u,ru_tend)
+!  Fast multi-gang path for the one order combination the real-data case
+!  actually runs (see plan.md "Restructuring strategy"); every other order
+!  combination keeps falling through to the verified num_gangs(1) advect_u.
+      IF ( config_flags%h_mom_adv_order == 5 .AND. &
+           config_flags%v_mom_adv_order == 3 ) THEN
+     CALL advect_u_o5v3 ( u, u , ru_tend, ru, rv, ww, &
+                   c1h, c2h,                     &
+                   mut, time_step, config_flags, &
+                   msfux, msfuy, msfvx, msfvy,   &
+                   msftx, msfty,                 &
+                   fnm, fnp, rdx, rdy, rdnw,     &
+                   ids, ide, jds, jde, kds, kde, &
+                   ims, ime, jms, jme, kms, kme, &
+                   its, ite, jts, jte, kts, kte )
+      ELSE
+#endif
      CALL advect_u ( u, u , ru_tend, ru, rv, ww, &
                    c1h, c2h,                     &
                    mut, time_step, config_flags, &
@@ -466,6 +502,11 @@ SUBROUTINE rk_tendency ( config_flags, rk_step,                           &
                    ids, ide, jds, jde, kds, kde, &
                    ims, ime, jms, jme, kms, kme, &
                    its, ite, jts, jte, kts, kte )
+#ifdef WRF_GPU_DYN
+      ENDIF
+!$acc update self(ru_tend)
+!$acc exit data delete(u,ru_tend)
+#endif
       ENDIF
 
      IF( (rk_step == 3) .and. ( adv_opt == WENO_MOM ) ) THEN
@@ -481,7 +522,10 @@ SUBROUTINE rk_tendency ( config_flags, rk_step,                           &
                    its, ite, jts, jte, kts, kte )
 
     ELSE
-     
+
+#ifdef WRF_GPU_DYN
+!$acc enter data copyin(v,rv_tend)
+#endif
      CALL advect_v ( v, v , rv_tend, ru, rv, ww,  &
                    c1h, c2h,                     &
                    mut, time_step, config_flags, &
@@ -491,6 +535,10 @@ SUBROUTINE rk_tendency ( config_flags, rk_step,                           &
                    ids, ide, jds, jde, kds, kde, &
                    ims, ime, jms, jme, kms, kme, &
                    its, ite, jts, jte, kts, kte )
+#ifdef WRF_GPU_DYN
+!$acc update self(rv_tend)
+!$acc exit data delete(v,rv_tend)
+#endif
     ENDIF
 
 
@@ -507,7 +555,10 @@ SUBROUTINE rk_tendency ( config_flags, rk_step,                           &
                      its, ite, jts, jte, kts, kte )
 
      ELSE
-     
+
+#ifdef WRF_GPU_DYN
+!$acc enter data copyin(w,rw_tend)
+#endif
      CALL advect_w ( w, w, rw_tend, ru, rv, ww,    &
                      c1h, c2h,                     &
                      mut, time_step, config_flags, &
@@ -517,6 +568,10 @@ SUBROUTINE rk_tendency ( config_flags, rk_step,                           &
                      ids, ide, jds, jde, kds, kde, &
                      ims, ime, jms, jme, kms, kme, &
                      its, ite, jts, jte, kts, kte )
+#ifdef WRF_GPU_DYN
+!$acc update self(rw_tend)
+!$acc exit data delete(w,rw_tend)
+#endif
      ENDIF
    ENDIF
 !  theta flux divergence
@@ -541,6 +596,9 @@ SUBROUTINE rk_tendency ( config_flags, rk_step,                           &
                                  its, ite, jts, jte, kts, kte  )
      ELSE
 
+#ifdef WRF_GPU_DYN
+!$acc enter data copyin(t,t_tend)
+#endif
      CALL advect_scalar ( t, t, t_tend, ru, rv, ww,     &
                           c1h, c2h,                     &
                           mut, time_step, config_flags, &
@@ -549,7 +607,11 @@ SUBROUTINE rk_tendency ( config_flags, rk_step,                           &
                           rdx, rdy, rdnw,               &
                           ids, ide, jds, jde, kds, kde, &
                           ims, ime, jms, jme, kms, kme, &
-                          its, ite, jts, jte, kts, kte ) 
+                          its, ite, jts, jte, kts, kte )
+#ifdef WRF_GPU_DYN
+!$acc update self(t_tend)
+!$acc exit data delete(t,t_tend)
+#endif
 
      ENDIF
      
@@ -798,6 +860,11 @@ SUBROUTINE rk_tendency ( config_flags, rk_step,                           &
 
   END IF forward_step
 
+#ifdef WRF_GPU_DYN
+!$acc exit data delete(ru,rv,ww,c1h,c2h,mut,msfux,msfuy,msfvx,msfvy,msftx, &
+!$acc& msfty,fnm,fnp,rdnw,rdn,config_flags)
+#endif
+
 END SUBROUTINE rk_tendency
 
 !-------------------------------------------------------------------------------
@@ -1041,6 +1108,15 @@ SUBROUTINE rk_scalar_tend ( scs, sce, config_flags,          &
    khdq = khdif/prandtl
    kvdq = kvdif/prandtl
 
+#ifdef WRF_GPU_DYN
+!  rk_scalar_tend is a separate subroutine from rk_tendency (not nested
+!  inside it) with its own call scope, so it needs its own copy of the
+!  shared-inputs residency block -- ru/rv/ww/etc. entered in rk_tendency
+!  are already gone (exit data at rk_tendency's end) by the time this runs.
+!$acc enter data copyin(ru,rv,ww,c1h,c2h,mut,msfux,msfuy,msfvx,msfvy,msftx, &
+!$acc& msfty,fnm,fnp,rdnw,rdn,config_flags)
+#endif
+
    scalar_loop : DO im = scs, sce
 
      CALL zero_tend ( advect_tend(ims,kms,jms),     &
@@ -1126,6 +1202,13 @@ SUBROUTINE rk_scalar_tend ( scs, sce, config_flags,          &
 
       ELSE
 
+#ifdef WRF_GPU_DYN
+!  scalar(...,im) is a different slice each iteration and advect_tend is a
+!  reused work array, so both still need per-call copyin/copyout; the
+!  shared inputs (ru,rv,ww,etc.) stay resident from the enter data at the
+!  top of this subroutine.
+!$acc enter data copyin(scalar(ims:ime,kms:kme,jms:jme,im),advect_tend)
+#endif
         CALL advect_scalar     ( scalar(ims,kms,jms,im),        &
                                  scalar(ims,kms,jms,im),        &
                                  advect_tend(ims,kms,jms),      &
@@ -1138,6 +1221,10 @@ SUBROUTINE rk_scalar_tend ( scs, sce, config_flags,          &
                                  ids, ide, jds, jde, kds, kde,  &
                                  ims, ime, jms, jme, kms, kme,  &
                                  its, ite, jts, jte, kts, kte  )
+#ifdef WRF_GPU_DYN
+!$acc update self(advect_tend)
+!$acc exit data delete(scalar(ims:ime,kms:kme,jms:jme,im),advect_tend)
+#endif
 
       END IF
 
@@ -1207,6 +1294,11 @@ SUBROUTINE rk_scalar_tend ( scs, sce, config_flags,          &
   ENDIF rk_step_1
 
  END DO scalar_loop
+
+#ifdef WRF_GPU_DYN
+!$acc exit data delete(ru,rv,ww,c1h,c2h,mut,msfux,msfuy,msfvx,msfvy,msftx, &
+!$acc& msfty,fnm,fnp,rdnw,rdn,config_flags)
+#endif
 
 END SUBROUTINE rk_scalar_tend
 
