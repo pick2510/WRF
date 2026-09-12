@@ -223,31 +223,82 @@ addition, original CPU per-column path untouched) that:
      diffed name-for-name, not just eyeballed — a single missing name is
      invisible until host memory happens to get reused at that address on
      a *later* call, which can take several iterations to surface.
-- **Still open**: after both fixes above, the real 1-rank Hong Kong case
-  (`run_minutes=2` for a quick check) got through 2 full radiation calls
-  (t=0 and t=00:25, both producing plausible-looking `dpsdt`/`dmudt`
-  domain-average diagnostics) but crashed on the 3rd with a genuine device
-  fault — `Accelerator Fatal Error: call to cuStreamSynchronize returned
-  error 700 (CUDA_ERROR_ILLEGAL_ADDRESS)` inside `taugb1_gpu` — not a
-  "data not present" error this time, an actual out-of-bounds/invalid
-  device memory access during kernel execution. `gpu_flush_lw_chunk`'s own
-  create/delete lists and `rrtmg_lw_gpu_chain_driver`'s internal
-  create/delete lists were both re-audited name-for-name after this crash
-  and are balanced (33/33 and matching, respectively), so this is very
-  likely a **different** bug: either a genuine out-of-range `jp`/`jt`/
-  `indself`/`indfor`/`indminor` index reaching `taugb1_gpu`'s table lookups
-  for some column somewhere in the real 15,876-column domain that the
-  single-synthetic-profile/single-dumped-column verification never
-  exercised, or a subtler device-memory lifecycle issue in the
-  repeated-every-timestep `ALLOCATE`/`enter data`/`exit data`/`DEALLOCATE`
-  cycle that only manifests after several timesteps' worth of churn. Not
-  yet root-caused — the next step is almost certainly running under
-  `compute-sanitizer` (or `NVCOMPILER_ACC_...` debug env vars) to get the
-  exact faulting address/column rather than guessing further from the
-  Fortran source. Until this is fixed, `WRF_GPU_RAD`'s LW path is **not
-  safe to run** on the real case beyond ~2 radiation calls; `run_minutes`
-  has been restored to `10` in the namelist but the GPU path itself should
-  be considered broken for real runs until this is resolved.
+- **`CUDA_ERROR_ILLEGAL_ADDRESS` crash — root-caused and fixed** (commit
+  `202f94469`). Debugging sequence, since each tool ruled out a different
+  cause:
+  1. `compute-sanitizer --tool memcheck` on the real 1-rank case ran
+     **clean (0 errors)** and the run completed — but this didn't mean the
+     bug was gone, it meant memcheck's own allocator doesn't reuse
+     freed host/device addresses the way glibc/the CUDA driver normally
+     do, so an address-reuse-dependent bug simply never gets triggered
+     under it. Don't treat a clean memcheck run as proof of correctness
+     for this class of bug.
+  2. `CUDA_LAUNCH_BLOCKING=1` on the plain (non-sanitizer) build still
+     crashed, identically (same simulated time, same function/line,
+     `CUDA_ERROR_INVALID_ADDRESS_SPACE` instead of `_ILLEGAL_ADDRESS` this
+     time — a launch-time failure, not an execution-time one). This ruled
+     out an async/missing-synchronization race as the cause.
+  3. Redesigning `gpu_flush_lw_chunk` to push its batch arrays to the
+     device once per `RRTMG_LWRAD` call (via `!$acc update device`/`update
+     host` on persistent arrays) instead of `ALLOCATE`/`enter data`/`exit
+     data`/`DEALLOCATE` on every flush did **not** fix the crash either —
+     same time, same function/line again. This ruled out the repeated
+     create/delete churn as the cause (though the redesign was kept: it's
+     simpler and more robust regardless).
+  4. A targeted host-side diagnostic (temporarily printing any column
+     with `play`/`tlay` outside physically sane bounds, right before
+     device dispatch) found the actual cause: **`play` (and `plev`) were
+     genuinely `NaN`** for the affected columns, while `tlay`/`tlev` at
+     the same columns/layers were finite. This is a **pre-existing bug**,
+     not something this port introduced — the `dpsdt`/`dmudt`
+     domain-average diagnostic WRF itself prints has been `NaN` from the
+     very first timestep in this same run, independent of `WRF_GPU_RAD`.
+     The original CPU `rrtmg_lw` path never crashed on it only by luck:
+     x86's REAL→INTEGER conversion of `NaN` (`int(...)`) yields `INT_MIN`,
+     which `setcoef`'s existing `IF (jp.lt.1) jp=1`-style bounds clamps
+     happen to catch; the GPU's conversion of the same NaN-derived
+     expression does not reliably land somewhere those same clamps catch,
+     so an out-of-range `jp`/`jt`/`indself`/`indfor`/`indminor` reached a
+     table lookup in `taugb1_gpu` and produced an invalid device address.
+     **General lesson**: a GPU port can silently change behavior on inputs
+     that were already undefined/garbage on the CPU side, even when the
+     port's arithmetic is bit-for-bit identical — REAL→INTEGER conversion
+     of `NaN`/`Inf` is implementation-defined and not guaranteed to match
+     between CPU and GPU codegen. Don't assume "the CPU path never
+     crashed on this" means "this input never occurs" — it may just mean
+     the CPU's specific undefined-behavior outcome happened to be caught
+     by a downstream clamp.
+  5. **Fix applied**: `gpu_flush_lw_chunk` now clamps any non-finite or
+     out-of-physical-range `play`/`plev`/`tlay`/`tlev`/`tsfc` to a nominal
+     value (1013.25 mb / 288 K) immediately before device dispatch, with
+     a permanent `wrf_message` warning (`WRF_GPU_RAD WARNING: non-physical
+     p/T at i=... j=...`) so the underlying issue stays visible rather
+     than silently disappearing. This does **not** fix the upstream NaN
+     bug — it only keeps this port from crashing on it, the same way the
+     CPU path was accidentally protected.
+  6. **Verified**: a full 10-minute real 1-rank run now reaches `SUCCESS
+     COMPLETE WRF` with no crash.
+  - **A much bigger finding surfaced by this same test, NOT fixed, and
+    outside this port's scope**: the warning fired for **15,625 of the
+    15,876 columns** in the domain over the 10-minute run — not an
+    isolated corner point. Combined with the `dpsdt`/`dmudt`
+    domain-average diagnostics growing from `NaN` at t=0 to huge
+    (thousands) and increasingly unstable values, and the model's adaptive
+    timestep visibly shrinking (25.0s → 19.0s) over the run, this looks
+    like **the simulation itself is going numerically unstable** across
+    nearly the whole domain, not a narrow edge case in one grid cell. This
+    predates (or is at least independent of) today's RRTMG-LW work — the
+    prior `dyn_em` OpenACC port's own verification (see "Prior work"
+    below) used these same `dpsdt`/`dmudt` diagnostics and found them
+    fine, so this is either a regression somewhere since then or a
+    genuine sensitivity of this exact case/config that was never exercised
+    long enough to show up before. **This has not been investigated and
+    is a real, separate, likely-serious correctness issue** — the
+    defensive clamp above only stops it from crashing RRTMG-GPU; it does
+    not mean the run's physics (on either the CPU or GPU radiation path)
+    is trustworthy while this is happening. Worth a dedicated
+    investigation before treating any output from this exact case as
+    meaningful, independent of the RRTMG GPU port's own correctness.
 - **Chunk sizing is solved, device-independently**:
   `rrtmg_lw_gpu_chunksize(nlayers, max_ncol)` (module `rrtmg_lw_gpu_chunk`,
   commit `01df733b0`) queries the *actual running device's* free memory at
@@ -499,6 +550,42 @@ fail ("attempt to read past end of file").
 ## OpenACC conventions (hard constraints, established during `dyn_em` port,
 ## reconfirmed during RRTMG)
 
+- **REAL→INTEGER conversion of NaN/Inf is implementation-defined and CPU
+  and GPU codegen are NOT guaranteed to agree on it.** x86's hardware
+  float-to-int conversion of NaN yields `INT_MIN`; NVHPC's GPU codegen for
+  the same Fortran `int(...)` on a NaN-derived expression does not. A CPU
+  routine with an explicit bounds clamp right after such a conversion
+  (`jp = int(...); IF (jp.lt.1) jp=1`) can "accidentally" tolerate NaN
+  input forever, simply because `INT_MIN` always fails the `.lt. 1` test —
+  while the GPU port of the identical arithmetic can produce a value the
+  same clamp doesn't catch, and an out-of-range table-lookup index turns
+  into an invalid device address at runtime. This bit `taugb1_gpu` for
+  real: a pre-existing NaN in the real Hong Kong case's pressure field
+  (unrelated to this port) never crashed the CPU path but crashed the GPU
+  one with `CUDA_ERROR_ILLEGAL_ADDRESS`/`CUDA_ERROR_INVALID_ADDRESS_SPACE`
+  — see the LW driver-integration status entry above for the full
+  debugging trail. Takeaway: "the CPU path never crashed on this input"
+  is not evidence the input is well-formed — it may just mean the CPU's
+  specific (unspecified) NaN-to-int outcome happened to fall inside a
+  downstream clamp. When a GPU port's crash is deterministic (same
+  simulated time/column every run) rather than address-layout-dependent,
+  suspect the *data*, not the port's data-lifecycle plumbing — sanitize
+  the primary physical inputs (pressure, temperature) for non-finite/
+  non-physical values defensively, with a permanent warning message so
+  the underlying data problem stays visible instead of silently
+  disappearing.
+- **A clean `compute-sanitizer --tool memcheck` run does not rule out a
+  device-address-reuse bug.** memcheck uses its own allocator, which does
+  not reuse freed host/device addresses the way the default allocator
+  does — so a bug that only manifests when a *later* allocation happens to
+  land at an address a stale mapping still references can run perfectly
+  clean under memcheck while crashing deterministically without it. If a
+  crash disappears under `compute-sanitizer` but is otherwise
+  reproducible, that is itself informative (points at data lifecycle /
+  address reuse), not proof of correctness. `CUDA_LAUNCH_BLOCKING=1` is a
+  much cheaper first test for ruling out an async/missing-synchronization
+  race specifically (forces every kernel launch to block), without the
+  full sanitizer's overhead or its allocator-behavior differences.
 - **No enclosing `!$acc data` / manually-delimited `!$acc parallel` +
   `!$acc end parallel` region spanning multiple subroutine calls.** This
   crashes NVHPC 26.5. Use standalone, auto-closing
