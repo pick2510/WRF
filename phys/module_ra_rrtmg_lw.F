@@ -16193,6 +16193,323 @@ contains
 
       end module rrtmg_lw_rad
 
+#ifdef WRF_GPU_RAD
+! ncol-batched OpenACC port of rrtmg_lw_rad's inatm -- converts the WRF/GCM
+! input profile (pressure, temperature, volume mixing ratios) into the
+! molecular column densities and cloud/aerosol arrays RRTMG's gas-optics
+! chain (setcoef/taumol/cldprmc) actually consumes. This is the missing
+! piece between mcica_subcol_lw_gpu's output and cldprmc_gpu/setcoef_gpu's
+! input in the real per-column call chain.
+!
+! Purely elementwise per (column, layer[, species/band]) except for one
+! genuine cross-layer reduction (amttl/wvttl, used only for the scalar
+! diffusivity-angle input pwvcm) -- split into its own kernel using OpenACC
+! `reduction()` rather than folded into the main per-layer kernel. No
+! STOP/GOTO/internal-procedure hazards at all, unlike most other stages.
+! `ixindx` (cross-section-molecule index remap) is the identity permutation
+! on its only active entries (ixindx(1:4)=(1,2,3,4), set in `lwdatinit`),
+! so the original's in-place `wx(ixindx(ix),l)=coldry(l)*wx(ix,l)*1.e-20`
+! scale-in-place is ported as a plain elementwise scale with no aliasing
+! hazard -- verified from the fixed `lwdatinit` assignment, not assumed.
+      MODULE rrtmg_lw_inatm_gpu
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrtm, only : nbndlw, ngptlw, nmol, maxxsec, mxmol
+
+      IMPLICIT NONE
+
+      CONTAINS
+
+! Per-(column,layer) elementwise setup: pressures/temperatures, raw
+! (unscaled) molecular volume-mixing-ratio and cross-section amounts, dry
+! air column density. Species-last layout throughout (wkl(iplon,l,species),
+! wx(iplon,l,ix)), per this project's ncol-major/species-last convention.
+      SUBROUTINE inatm_layers_gpu(ncol, nlay, play, plev, tlay, tlev, &
+                        h2ovmr, o3vmr, co2vmr, ch4vmr, n2ovmr, o2vmr, &
+                        ccl4vmr, cfc11vmr, cfc12vmr, cfc22vmr, &
+                        pavel, tavel, pz, tz, coldry, wkl, wx)
+
+      use rrlw_con, only: grav, avogad
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlay
+      REAL(kind=rb), INTENT(IN) :: play(ncol,nlay), tlay(ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: plev(ncol,nlay+1), tlev(ncol,nlay+1)
+      REAL(kind=rb), INTENT(IN) :: h2ovmr(ncol,nlay), o3vmr(ncol,nlay), co2vmr(ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: ch4vmr(ncol,nlay), n2ovmr(ncol,nlay), o2vmr(ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: ccl4vmr(ncol,nlay), cfc11vmr(ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: cfc12vmr(ncol,nlay), cfc22vmr(ncol,nlay)
+      REAL(kind=rb), INTENT(OUT) :: pavel(ncol,nlay), tavel(ncol,nlay)
+      REAL(kind=rb), INTENT(OUT) :: pz(ncol,0:nlay), tz(ncol,0:nlay)
+      REAL(kind=rb), INTENT(OUT) :: coldry(ncol,nlay)
+      REAL(kind=rb), INTENT(OUT) :: wkl(ncol,nlay,mxmol), wx(ncol,nlay,maxxsec)
+
+      REAL(kind=rb), PARAMETER :: amd = 28.9660_rb
+      REAL(kind=rb), PARAMETER :: amw = 18.0160_rb
+      INTEGER(kind=im) :: iplon, l
+      REAL(kind=rb) :: amm
+
+! pz(iplon,0) must be set before the layer loop below, since l=1's coldry
+! formula reads pz(iplon,l-1)=pz(iplon,0) -- the original sets pz(0) at the
+! very top of inatm for exactly this reason. (inatm_reduce_gpu separately
+! sets pz(:,0)/tz(:,0) again for its own purposes -- redundant but
+! harmless, both write the same value.)
+!$acc parallel loop present(plev, tlev, pz, tz)
+      DO iplon = 1, ncol
+         pz(iplon,0) = plev(iplon,1)
+         tz(iplon,0) = tlev(iplon,1)
+      ENDDO
+
+!$acc parallel loop collapse(2) private(amm) &
+!$acc   present(play, tlay, plev, tlev, h2ovmr, o3vmr, co2vmr, ch4vmr, n2ovmr, o2vmr) &
+!$acc   present(ccl4vmr, cfc11vmr, cfc12vmr, cfc22vmr) &
+!$acc   present(pavel, tavel, pz, tz, coldry, wkl, wx)
+      DO iplon = 1, ncol
+      DO l = 1, nlay
+         pavel(iplon,l) = play(iplon,l)
+         tavel(iplon,l) = tlay(iplon,l)
+         pz(iplon,l) = plev(iplon,l+1)
+         tz(iplon,l) = tlev(iplon,l+1)
+
+         wkl(iplon,l,1) = h2ovmr(iplon,l)
+         wkl(iplon,l,2) = co2vmr(iplon,l)
+         wkl(iplon,l,3) = o3vmr(iplon,l)
+         wkl(iplon,l,4) = n2ovmr(iplon,l)
+         wkl(iplon,l,5) = 0._rb
+         wkl(iplon,l,6) = ch4vmr(iplon,l)
+         wkl(iplon,l,7) = o2vmr(iplon,l)
+
+         amm = (1._rb - wkl(iplon,l,1)) * amd + wkl(iplon,l,1) * amw
+         coldry(iplon,l) = (pz(iplon,l-1)-pz(iplon,l)) * 1.e3_rb * avogad / &
+                     (1.e2_rb * grav * amm * (1._rb + wkl(iplon,l,1)))
+
+         wx(iplon,l,1) = ccl4vmr(iplon,l)
+         wx(iplon,l,2) = cfc11vmr(iplon,l)
+         wx(iplon,l,3) = cfc12vmr(iplon,l)
+         wx(iplon,l,4) = cfc22vmr(iplon,l)
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE inatm_layers_gpu
+
+! Scales wkl/wx from raw volume-mixing-ratio to molec/cm2 using coldry, and
+! computes wbrodl (broadening-gas column density). Purely per-(column,
+! layer) elementwise (the cross-layer amttl/wvttl reduction is a separate
+! kernel, see inatm_reduce_gpu below) -- must run after inatm_layers_gpu
+! (needs its coldry) and before inatm_reduce_gpu (needs its scaled wkl).
+      SUBROUTINE inatm_scale_gpu(ncol, nlay, coldry, wkl, wx, wbrodl)
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlay
+      REAL(kind=rb), INTENT(IN) :: coldry(ncol,nlay)
+      REAL(kind=rb), INTENT(INOUT) :: wkl(ncol,nlay,mxmol), wx(ncol,nlay,maxxsec)
+      REAL(kind=rb), INTENT(OUT) :: wbrodl(ncol,nlay)
+
+      INTEGER(kind=im) :: iplon, l, imol, ix
+      REAL(kind=rb) :: summol
+
+!$acc parallel loop collapse(2) private(summol, imol, ix) &
+!$acc   present(coldry, wkl, wx, wbrodl)
+      DO iplon = 1, ncol
+      DO l = 1, nlay
+         summol = 0._rb
+!$acc loop seq
+         DO imol = 2, nmol
+            summol = summol + wkl(iplon,l,imol)
+         ENDDO
+         wbrodl(iplon,l) = coldry(iplon,l) * (1._rb - summol)
+!$acc loop seq
+         DO imol = 1, nmol
+            wkl(iplon,l,imol) = coldry(iplon,l) * wkl(iplon,l,imol)
+         ENDDO
+!$acc loop seq
+         DO ix = 1, maxxsec
+            wx(iplon,l,ix) = coldry(iplon,l) * wx(iplon,l,ix) * 1.e-20_rb
+         ENDDO
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE inatm_scale_gpu
+
+! The one genuine cross-layer reduction in inatm: total column dry-air +
+! water-vapor amount, used only to derive the scalar precipitable water
+! vapor pwvcm (a diffusivity-angle input to rtrnmc). Also sets the
+! column-level (not per-layer) outputs: surface boundary pz/tz(0), tbound,
+! and semiss.
+      SUBROUTINE inatm_reduce_gpu(ncol, nlay, plev, tlev, tsfc, emis, &
+                        pz, tz, coldry, wkl, tbound, pwvcm, semiss)
+
+      use rrlw_con, only: grav
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlay
+      REAL(kind=rb), INTENT(IN) :: plev(ncol,nlay+1), tlev(ncol,nlay+1), tsfc(ncol)
+      REAL(kind=rb), INTENT(IN) :: emis(ncol,nbndlw)
+      REAL(kind=rb), INTENT(INOUT) :: pz(ncol,0:nlay), tz(ncol,0:nlay)
+      REAL(kind=rb), INTENT(IN) :: coldry(ncol,nlay), wkl(ncol,nlay,mxmol)
+      REAL(kind=rb), INTENT(OUT) :: tbound(ncol), pwvcm(ncol)
+      REAL(kind=rb), INTENT(OUT) :: semiss(ncol,nbndlw)
+
+      REAL(kind=rb), PARAMETER :: amd = 28.9660_rb
+      REAL(kind=rb), PARAMETER :: amw = 18.0160_rb
+      INTEGER(kind=im) :: iplon, l, n
+      REAL(kind=rb) :: amttl, wvttl, wvsh
+
+!$acc parallel loop private(amttl, wvttl, wvsh, l, n) &
+!$acc   present(plev, tlev, tsfc, emis, pz, tz, coldry, wkl, tbound, pwvcm, semiss)
+      DO iplon = 1, ncol
+         pz(iplon,0) = plev(iplon,1)
+         tz(iplon,0) = tlev(iplon,1)
+         tbound(iplon) = tsfc(iplon)
+
+         amttl = 0._rb
+         wvttl = 0._rb
+!$acc loop seq reduction(+:amttl,wvttl)
+         DO l = 1, nlay
+            amttl = amttl + coldry(iplon,l) + wkl(iplon,l,1)
+            wvttl = wvttl + wkl(iplon,l,1)
+         ENDDO
+
+         wvsh = (amw * wvttl) / (amd * amttl)
+         pwvcm(iplon) = wvsh * (1.e3_rb * pz(iplon,0)) / (1.e2_rb * grav)
+
+!$acc loop seq
+         DO n = 1, nbndlw
+            semiss(iplon,n) = emis(iplon,n)
+         ENDDO
+      ENDDO
+
+      END SUBROUTINE inatm_reduce_gpu
+
+! Aerosol optical depth transfer (elementwise, collapse(3)). iaer<1 (no
+! aerosols) is handled by the host pre-zeroing taua before this is called,
+! matching the original's "only touch taua if iaer>=1, else it was already
+! zeroed by the caller's initialization block" structure.
+      SUBROUTINE inatm_aerosol_gpu(ncol, nlay, tauaer, taua)
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlay
+      REAL(kind=rb), INTENT(IN) :: tauaer(ncol,nlay,nbndlw)
+      REAL(kind=rb), INTENT(OUT) :: taua(ncol,nlay,nbndlw)
+
+      INTEGER(kind=im) :: iplon, l, ib
+
+!$acc parallel loop collapse(3) present(tauaer, taua)
+      DO ib = 1, nbndlw
+      DO l = 1, nlay
+      DO iplon = 1, ncol
+         taua(iplon,l,ib) = tauaer(iplon,l,ib)
+      ENDDO
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE inatm_aerosol_gpu
+
+! McICA cloud property transfer (elementwise reindex from mcica_subcol_lw's
+! (ngptlw,ncol,nlay) layout to this project's (ncol,nlay,ngptlw)
+! species-last layout, collapse(3)). icld<1 (clear sky) is handled by the
+! host pre-zeroing these arrays before this is called, matching the
+! original's "only touch cldfmc/etc if icld>=1" structure.
+      SUBROUTINE inatm_cloud_gpu(ncol, nlay, cldfmcl, taucmcl, ciwpmcl, cswpmcl, clwpmcl, &
+                        reicmcl, relqmcl, resnmcl, &
+                        cldfmc, taucmc, ciwpmc, cswpmc, clwpmc, reicmc, relqmc, resnmc)
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlay
+      REAL(kind=rb), INTENT(IN) :: cldfmcl(ngptlw,ncol,nlay), taucmcl(ngptlw,ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: ciwpmcl(ngptlw,ncol,nlay), cswpmcl(ngptlw,ncol,nlay), clwpmcl(ngptlw,ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: reicmcl(ncol,nlay), relqmcl(ncol,nlay), resnmcl(ncol,nlay)
+      REAL(kind=rb), INTENT(OUT) :: cldfmc(ncol,nlay,ngptlw), taucmc(ncol,nlay,ngptlw)
+      REAL(kind=rb), INTENT(OUT) :: ciwpmc(ncol,nlay,ngptlw), cswpmc(ncol,nlay,ngptlw), clwpmc(ncol,nlay,ngptlw)
+      REAL(kind=rb), INTENT(OUT) :: reicmc(ncol,nlay), relqmc(ncol,nlay), resnmc(ncol,nlay)
+
+      INTEGER(kind=im) :: iplon, l, ig
+
+!$acc parallel loop collapse(3) present(cldfmcl, taucmcl, ciwpmcl, cswpmcl, clwpmcl, cldfmc, taucmc, ciwpmc, cswpmc, clwpmc)
+      DO ig = 1, ngptlw
+      DO l = 1, nlay
+      DO iplon = 1, ncol
+         cldfmc(iplon,l,ig) = cldfmcl(ig,iplon,l)
+         taucmc(iplon,l,ig) = taucmcl(ig,iplon,l)
+         ciwpmc(iplon,l,ig) = ciwpmcl(ig,iplon,l)
+         cswpmc(iplon,l,ig) = cswpmcl(ig,iplon,l)
+         clwpmc(iplon,l,ig) = clwpmcl(ig,iplon,l)
+      ENDDO
+      ENDDO
+      ENDDO
+
+!$acc parallel loop collapse(2) present(reicmcl, relqmcl, resnmcl, reicmc, relqmc, resnmc)
+      DO l = 1, nlay
+      DO iplon = 1, ncol
+         reicmc(iplon,l) = reicmcl(iplon,l)
+         relqmc(iplon,l) = relqmcl(iplon,l)
+         resnmc(iplon,l) = resnmcl(iplon,l)
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE inatm_cloud_gpu
+
+! Single entry point bundling the whole gas/cloud/aerosol setup, mirroring
+! the other stages' *_driver_gpu bundling convention. `taua`/cloud arrays
+! must already be host-zeroed by the caller when iaer<1/icld<1
+! respectively -- inatm_aerosol_gpu/inatm_cloud_gpu are only called in the
+! active (iaer>=1 / icld>=1) case, matching the original's structure
+! exactly (WRF's real call shape always has icld>=1, but iaer's value
+! depends on the aer_opt namelist option and both branches are ported).
+      SUBROUTINE inatm_driver_gpu(ncol, nlay, icld, iaer, &
+                        play, plev, tlay, tlev, tsfc, h2ovmr, o3vmr, co2vmr, ch4vmr, n2ovmr, o2vmr, &
+                        ccl4vmr, cfc11vmr, cfc12vmr, cfc22vmr, emis, tauaer, &
+                        cldfmcl, taucmcl, ciwpmcl, cswpmcl, clwpmcl, reicmcl, relqmcl, resnmcl, &
+                        pavel, tavel, pz, tz, tbound, coldry, wbrodl, wkl, wx, pwvcm, semiss, &
+                        cldfmc, taucmc, ciwpmc, cswpmc, clwpmc, reicmc, relqmc, resnmc, taua)
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlay, icld, iaer
+      REAL(kind=rb), INTENT(IN) :: play(ncol,nlay), tlay(ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: plev(ncol,nlay+1), tlev(ncol,nlay+1), tsfc(ncol)
+      REAL(kind=rb), INTENT(IN) :: h2ovmr(ncol,nlay), o3vmr(ncol,nlay), co2vmr(ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: ch4vmr(ncol,nlay), n2ovmr(ncol,nlay), o2vmr(ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: ccl4vmr(ncol,nlay), cfc11vmr(ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: cfc12vmr(ncol,nlay), cfc22vmr(ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: emis(ncol,nbndlw), tauaer(ncol,nlay,nbndlw)
+      REAL(kind=rb), INTENT(IN) :: cldfmcl(ngptlw,ncol,nlay), taucmcl(ngptlw,ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: ciwpmcl(ngptlw,ncol,nlay), cswpmcl(ngptlw,ncol,nlay), clwpmcl(ngptlw,ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: reicmcl(ncol,nlay), relqmcl(ncol,nlay), resnmcl(ncol,nlay)
+      REAL(kind=rb), INTENT(OUT) :: pavel(ncol,nlay), tavel(ncol,nlay)
+      REAL(kind=rb), INTENT(OUT) :: pz(ncol,0:nlay), tz(ncol,0:nlay), tbound(ncol)
+      REAL(kind=rb), INTENT(OUT) :: coldry(ncol,nlay), wbrodl(ncol,nlay)
+      REAL(kind=rb), INTENT(OUT) :: wkl(ncol,nlay,mxmol), wx(ncol,nlay,maxxsec)
+      REAL(kind=rb), INTENT(OUT) :: pwvcm(ncol), semiss(ncol,nbndlw)
+      REAL(kind=rb), INTENT(OUT) :: cldfmc(ncol,nlay,ngptlw), taucmc(ncol,nlay,ngptlw)
+      REAL(kind=rb), INTENT(OUT) :: ciwpmc(ncol,nlay,ngptlw), cswpmc(ncol,nlay,ngptlw), clwpmc(ncol,nlay,ngptlw)
+      REAL(kind=rb), INTENT(OUT) :: reicmc(ncol,nlay), relqmc(ncol,nlay), resnmc(ncol,nlay)
+      REAL(kind=rb), INTENT(OUT) :: taua(ncol,nlay,nbndlw)
+
+      CALL inatm_layers_gpu(ncol, nlay, play, plev, tlay, tlev, &
+                h2ovmr, o3vmr, co2vmr, ch4vmr, n2ovmr, o2vmr, &
+                ccl4vmr, cfc11vmr, cfc12vmr, cfc22vmr, &
+                pavel, tavel, pz, tz, coldry, wkl, wx)
+
+      CALL inatm_scale_gpu(ncol, nlay, coldry, wkl, wx, wbrodl)
+
+      CALL inatm_reduce_gpu(ncol, nlay, plev, tlev, tsfc, emis, &
+                pz, tz, coldry, wkl, tbound, pwvcm, semiss)
+
+      IF (iaer .ge. 1) THEN
+         CALL inatm_aerosol_gpu(ncol, nlay, tauaer, taua)
+      ENDIF
+
+      IF (icld .ge. 1) THEN
+         CALL inatm_cloud_gpu(ncol, nlay, cldfmcl, taucmcl, ciwpmcl, cswpmcl, clwpmcl, &
+                   reicmcl, relqmcl, resnmcl, &
+                   cldfmc, taucmc, ciwpmc, cswpmc, clwpmc, reicmc, relqmc, resnmc)
+      ENDIF
+
+      END SUBROUTINE inatm_driver_gpu
+
+      END MODULE rrtmg_lw_inatm_gpu
+#endif
+
 !------------------------------------------------------------------
 MODULE module_ra_rrtmg_lw
 
