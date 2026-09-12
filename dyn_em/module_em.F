@@ -34,7 +34,7 @@ MODULE module_em
    USE module_advect_em, only: advect_u, advect_v, advect_w, advect_scalar, advect_scalar_pd, advect_scalar_mono, &
         advect_weno_u, advect_weno_v, advect_weno_w, advect_scalar_weno,  advect_scalar_wenopd
 #ifdef WRF_GPU_DYN
-   USE module_advect_em, only: advect_u_o5v3
+   USE module_advect_em, only: advect_u_o5v3, advect_scalar_o5v3
 #endif
    
    USE module_big_step_utilities_em, only: grid_config_rec_type, calculate_full, couple_momentum, calc_mu_uv, calc_ww_cp, &
@@ -598,6 +598,21 @@ SUBROUTINE rk_tendency ( config_flags, rk_step,                           &
 
 #ifdef WRF_GPU_DYN
 !$acc enter data copyin(t,t_tend)
+!  Fast multi-gang path for the one order combination the real-data case
+!  actually runs (see plan.md "Restructuring strategy"); every other order
+!  combination keeps falling through to the verified num_gangs(1) advect_scalar.
+      IF ( config_flags%h_sca_adv_order == 5 .AND. &
+           config_flags%v_sca_adv_order == 3 ) THEN
+     CALL advect_scalar_o5v3 ( t, t, t_tend, ru, rv, ww,     &
+                          c1h, c2h,                     &
+                          mut, time_step, config_flags, &
+                          msfux, msfuy, msfvx, msfvy,   &
+                          msftx, msfty, fnm, fnp,       &
+                          rdx, rdy, rdnw,               &
+                          ids, ide, jds, jde, kds, kde, &
+                          ims, ime, jms, jme, kms, kme, &
+                          its, ite, jts, jte, kts, kte )
+      ELSE
 #endif
      CALL advect_scalar ( t, t, t_tend, ru, rv, ww,     &
                           c1h, c2h,                     &
@@ -609,6 +624,7 @@ SUBROUTINE rk_tendency ( config_flags, rk_step,                           &
                           ims, ime, jms, jme, kms, kme, &
                           its, ite, jts, jte, kts, kte )
 #ifdef WRF_GPU_DYN
+      ENDIF
 !$acc update self(t_tend)
 !$acc exit data delete(t,t_tend)
 #endif
@@ -1208,6 +1224,24 @@ SUBROUTINE rk_scalar_tend ( scs, sce, config_flags,          &
 !  shared inputs (ru,rv,ww,etc.) stay resident from the enter data at the
 !  top of this subroutine.
 !$acc enter data copyin(scalar(ims:ime,kms:kme,jms:jme,im),advect_tend)
+!  Fast multi-gang path for the one order combination the real-data case
+!  actually runs (see plan.md "Restructuring strategy"); every other order
+!  combination keeps falling through to the verified num_gangs(1) advect_scalar.
+        IF ( config_flags%h_sca_adv_order == 5 .AND. &
+             config_flags%v_sca_adv_order == 3 ) THEN
+        CALL advect_scalar_o5v3 ( scalar(ims,kms,jms,im),        &
+                                 scalar(ims,kms,jms,im),        &
+                                 advect_tend(ims,kms,jms),      &
+                                 ru, rv, ww, c1h, c2h,          &
+                                 mut, time_step,                &
+                                 config_flags,                  &
+                                 msfux, msfuy, msfvx, msfvy,    &
+                                 msftx, msfty, fnm, fnp,        &
+                                 rdx, rdy, rdnw,                &
+                                 ids, ide, jds, jde, kds, kde,  &
+                                 ims, ime, jms, jme, kms, kme,  &
+                                 its, ite, jts, jte, kts, kte  )
+        ELSE
 #endif
         CALL advect_scalar     ( scalar(ims,kms,jms,im),        &
                                  scalar(ims,kms,jms,im),        &
@@ -1222,6 +1256,7 @@ SUBROUTINE rk_scalar_tend ( scs, sce, config_flags,          &
                                  ims, ime, jms, jme, kms, kme,  &
                                  its, ite, jts, jte, kts, kte  )
 #ifdef WRF_GPU_DYN
+        ENDIF
 !$acc update self(advect_tend)
 !$acc exit data delete(scalar(ims:ime,kms:kme,jms:jme,im),advect_tend)
 #endif
