@@ -3474,6 +3474,253 @@
 
       end module rrtmg_sw_setcoef
 
+#ifdef WRF_GPU_RAD
+!-------------------------------------------------------------------------------
+!  GPU (OpenACC) port of setcoef_sw, RRTMG-SW's per-column pressure/
+!  temperature interpolation setup -- see plan.md "GPU Port: RRTMG
+!  Radiation" and the LW setcoef_gpu header comment (module_ra_rrtmg_lw.F)
+!  for the general restructuring rationale, which carries over directly.
+!  The original CPU setcoef_sw above is untouched.
+!
+!  setcoef_sw has no STOP/wrf_error_fatal calls and no Planck-function work
+!  (that is LW-only) -- it is substantially simpler than LW's setcoef: no
+!  minor-gas scale factors, no chi_mls mixing-ratio-profile ratios, no
+!  boundary/level Planck terms. The only branch is the single troposphere/
+!  stratosphere split, implemented in the original via a backward GOTO
+!  (label 5300/5400) driven by a running "laytrop" counter; since pressure
+!  decreases monotonically with layer index, "plog(lay) > 4.56" is true for
+!  exactly the contiguous prefix of layers 1..laytrop, so recomputing the
+!  same test per cell (as done in setcoef_sw_gpu below) and consulting a
+!  host/device-computed laytrop(ncol) count are equivalent -- the identical
+!  reasoning and the identical laytrop kernel already used for LW's
+!  laytrop_gpu, duplicated here as laytrop_sw_gpu so this module has no
+!  cross-module dependency on the LW port.
+!
+!  Two local variables computed in the original (indbound, tbndfrac,
+!  indlev0, t0frac) are dead: they are assigned but never read again in the
+!  subroutine and are not part of its output argument list (apparently a
+!  vestige of adapting this routine from the LW version, which does use
+!  the equivalent quantities for boundary Planck terms). They are omitted
+!  here entirely, not silently miscomputed.
+!
+!  layswtch and laylow (also present in the original signature) are
+!  likewise write-only outputs: grep of the whole file shows every other
+!  call site of taumol_sw passes only "laytrop" onward, never these two,
+!  so they carry no downstream effect. They are omitted from this port's
+!  argument list; any future integration code should simply not look for
+!  them.
+!
+!  wkl follows the same species-last convention adopted for the LW port:
+!  original is wkl(species,layer) (mxmol species, only 1,2,3,4,6,7 used
+!  by either scheme); here it is wkl(iplon,lay,species), truncated to the
+!  7 slots actually referenced (species 5, CO, is unused by SW).
+!-------------------------------------------------------------------------------
+      MODULE rrtmg_sw_setcoef_gpu
+
+      CONTAINS
+
+      SUBROUTINE laytrop_sw_gpu(ncol, nlayers, pavel, laytrop)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers
+      REAL(kind=rb), INTENT(IN) :: pavel(ncol,nlayers)
+      INTEGER(kind=im), INTENT(OUT) :: laytrop(ncol)
+
+      INTEGER(kind=im) :: iplon, lay, cnt
+
+!$acc parallel loop private(cnt) &
+!$acc   present(pavel, laytrop)
+      DO iplon = 1, ncol
+         cnt = 0
+!$acc loop vector reduction(+:cnt)
+         DO lay = 1, nlayers
+            IF (log(pavel(iplon,lay)) .gt. 4.56_rb) THEN
+               cnt = cnt + 1
+            ENDIF
+         ENDDO
+         laytrop(iplon) = cnt
+      ENDDO
+
+      END SUBROUTINE laytrop_sw_gpu
+
+      SUBROUTINE setcoef_sw_gpu(ncol, nlayers, pavel, tavel, coldry, wkl, laytrop, &
+                                 jp, jt, jt1, co2mult, colch4, colco2, colh2o, colmol, &
+                                 coln2o, colo2, colo3, fac00, fac01, fac10, fac11, &
+                                 selffac, selffrac, indself, forfac, forfrac, indfor)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use rrsw_ref, only: preflog, tref
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers
+      REAL(kind=rb), INTENT(IN) :: pavel(ncol,nlayers), tavel(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: coldry(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: wkl(ncol,nlayers,7)
+      INTEGER(kind=im), INTENT(IN) :: laytrop(ncol)
+
+      INTEGER(kind=im), INTENT(OUT) :: jp(ncol,nlayers), jt(ncol,nlayers), jt1(ncol,nlayers)
+      REAL(kind=rb), INTENT(OUT) :: colh2o(ncol,nlayers), colco2(ncol,nlayers), &
+                                     colo3(ncol,nlayers), coln2o(ncol,nlayers), &
+                                     colch4(ncol,nlayers), colo2(ncol,nlayers), &
+                                     colmol(ncol,nlayers), co2mult(ncol,nlayers)
+      INTEGER(kind=im), INTENT(OUT) :: indself(ncol,nlayers), indfor(ncol,nlayers)
+      REAL(kind=rb), INTENT(OUT) :: selffac(ncol,nlayers), selffrac(ncol,nlayers), &
+                                     forfac(ncol,nlayers), forfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(OUT) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                     fac10(ncol,nlayers), fac11(ncol,nlayers)
+
+      INTEGER(kind=im) :: iplon, lay, jp1
+      REAL(kind=rb) :: stpfac, plog, fp, ft, ft1, water, scalefac, factor, compfp, co2reg
+
+      stpfac = 296._rb/1013._rb
+
+!$acc parallel loop collapse(2) &
+!$acc   private(plog, jp1, fp, ft, ft1, water, scalefac, factor, compfp, co2reg) &
+!$acc   present(pavel, tavel, coldry, wkl, laytrop) &
+!$acc   present(jp, jt, jt1, colh2o, colco2, colo3, coln2o, colch4, colo2, colmol, co2mult) &
+!$acc   present(indself, indfor, selffac, selffrac, forfac, forfrac) &
+!$acc   present(fac00, fac01, fac10, fac11) &
+!$acc   present(preflog, tref)
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+
+         plog = log(pavel(iplon,lay))
+         jp(iplon,lay) = int(36._rb - 5*(plog+0.04_rb))
+         IF (jp(iplon,lay) .lt. 1) THEN
+            jp(iplon,lay) = 1
+         ELSEIF (jp(iplon,lay) .gt. 58) THEN
+            jp(iplon,lay) = 58
+         ENDIF
+         jp1 = jp(iplon,lay) + 1
+         fp = 5._rb * (preflog(jp(iplon,lay)) - plog)
+
+         jt(iplon,lay) = int(3._rb + (tavel(iplon,lay)-tref(jp(iplon,lay)))/15._rb)
+         IF (jt(iplon,lay) .lt. 1) THEN
+            jt(iplon,lay) = 1
+         ELSEIF (jt(iplon,lay) .gt. 4) THEN
+            jt(iplon,lay) = 4
+         ENDIF
+         ft = ((tavel(iplon,lay)-tref(jp(iplon,lay)))/15._rb) - float(jt(iplon,lay)-3)
+         jt1(iplon,lay) = int(3._rb + (tavel(iplon,lay)-tref(jp1))/15._rb)
+         IF (jt1(iplon,lay) .lt. 1) THEN
+            jt1(iplon,lay) = 1
+         ELSEIF (jt1(iplon,lay) .gt. 4) THEN
+            jt1(iplon,lay) = 4
+         ENDIF
+         ft1 = ((tavel(iplon,lay)-tref(jp1))/15._rb) - float(jt1(iplon,lay)-3)
+
+         water = wkl(iplon,lay,1)/coldry(iplon,lay)
+         scalefac = pavel(iplon,lay) * stpfac / tavel(iplon,lay)
+
+         IF (lay .le. laytrop(iplon)) THEN
+
+            forfac(iplon,lay) = scalefac / (1.+water)
+            factor = (332.0_rb-tavel(iplon,lay))/36.0_rb
+            indfor(iplon,lay) = min(2, max(1, int(factor)))
+            forfrac(iplon,lay) = factor - float(indfor(iplon,lay))
+
+            selffac(iplon,lay) = water * forfac(iplon,lay)
+            factor = (tavel(iplon,lay)-188.0_rb)/7.2_rb
+            indself(iplon,lay) = min(9, max(1, int(factor)-7))
+            selffrac(iplon,lay) = factor - float(indself(iplon,lay) + 7)
+
+            colh2o(iplon,lay) = 1.e-20_rb * wkl(iplon,lay,1)
+            colco2(iplon,lay) = 1.e-20_rb * wkl(iplon,lay,2)
+            colo3(iplon,lay) = 1.e-20_rb * wkl(iplon,lay,3)
+            coln2o(iplon,lay) = 1.e-20_rb * wkl(iplon,lay,4)
+            colch4(iplon,lay) = 1.e-20_rb * wkl(iplon,lay,6)
+            colo2(iplon,lay) = 1.e-20_rb * wkl(iplon,lay,7)
+            colmol(iplon,lay) = 1.e-20_rb * coldry(iplon,lay) + colh2o(iplon,lay)
+            IF (colco2(iplon,lay) .eq. 0._rb) colco2(iplon,lay) = 1.e-32_rb * coldry(iplon,lay)
+            IF (coln2o(iplon,lay) .eq. 0._rb) coln2o(iplon,lay) = 1.e-32_rb * coldry(iplon,lay)
+            IF (colch4(iplon,lay) .eq. 0._rb) colch4(iplon,lay) = 1.e-32_rb * coldry(iplon,lay)
+            IF (colo2(iplon,lay) .eq. 0._rb) colo2(iplon,lay) = 1.e-32_rb * coldry(iplon,lay)
+            co2reg = 3.55e-24_rb * coldry(iplon,lay)
+            co2mult(iplon,lay) = (colco2(iplon,lay) - co2reg) * &
+                  272.63_rb*exp(-1919.4_rb/tavel(iplon,lay))/(8.7604e-4_rb*tavel(iplon,lay))
+
+         ELSE
+
+            forfac(iplon,lay) = scalefac / (1.+water)
+            factor = (tavel(iplon,lay)-188.0_rb)/36.0_rb
+            indfor(iplon,lay) = 3
+            forfrac(iplon,lay) = factor - 1.0_rb
+
+            colh2o(iplon,lay) = 1.e-20_rb * wkl(iplon,lay,1)
+            colco2(iplon,lay) = 1.e-20_rb * wkl(iplon,lay,2)
+            colo3(iplon,lay)  = 1.e-20_rb * wkl(iplon,lay,3)
+            coln2o(iplon,lay) = 1.e-20_rb * wkl(iplon,lay,4)
+            colch4(iplon,lay) = 1.e-20_rb * wkl(iplon,lay,6)
+            colo2(iplon,lay)  = 1.e-20_rb * wkl(iplon,lay,7)
+            colmol(iplon,lay) = 1.e-20_rb * coldry(iplon,lay) + colh2o(iplon,lay)
+            IF (colco2(iplon,lay) .eq. 0._rb) colco2(iplon,lay) = 1.e-32_rb * coldry(iplon,lay)
+            IF (coln2o(iplon,lay) .eq. 0._rb) coln2o(iplon,lay) = 1.e-32_rb * coldry(iplon,lay)
+            IF (colch4(iplon,lay) .eq. 0._rb) colch4(iplon,lay) = 1.e-32_rb * coldry(iplon,lay)
+            IF (colo2(iplon,lay)  .eq. 0._rb) colo2(iplon,lay)  = 1.e-32_rb * coldry(iplon,lay)
+            co2reg = 3.55e-24_rb * coldry(iplon,lay)
+            co2mult(iplon,lay) = (colco2(iplon,lay) - co2reg) * &
+                  272.63_rb*exp(-1919.4_rb/tavel(iplon,lay))/(8.7604e-4_rb*tavel(iplon,lay))
+
+            selffac(iplon,lay) = 0._rb
+            selffrac(iplon,lay) = 0._rb
+            indself(iplon,lay) = 0
+
+         ENDIF
+
+         compfp = 1._rb - fp
+         fac10(iplon,lay) = compfp * ft
+         fac00(iplon,lay) = compfp * (1._rb - ft)
+         fac11(iplon,lay) = fp * ft1
+         fac01(iplon,lay) = fp * (1._rb - ft1)
+
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE setcoef_sw_gpu
+
+      SUBROUTINE setcoef_sw_driver_gpu(ncol, nlayers, pavel, tavel, coldry, wkl, &
+                                        laytrop, jp, jt, jt1, co2mult, colch4, colco2, &
+                                        colh2o, colmol, coln2o, colo2, colo3, &
+                                        fac00, fac01, fac10, fac11, &
+                                        selffac, selffrac, indself, forfac, forfrac, indfor)
+
+      use parkind, only : im => kind_im, rb => kind_rb
+
+      IMPLICIT NONE
+
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers
+      REAL(kind=rb), INTENT(IN) :: pavel(ncol,nlayers), tavel(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: coldry(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: wkl(ncol,nlayers,7)
+
+      INTEGER(kind=im), INTENT(OUT) :: laytrop(ncol)
+      INTEGER(kind=im), INTENT(OUT) :: jp(ncol,nlayers), jt(ncol,nlayers), jt1(ncol,nlayers)
+      REAL(kind=rb), INTENT(OUT) :: colh2o(ncol,nlayers), colco2(ncol,nlayers), &
+                                     colo3(ncol,nlayers), coln2o(ncol,nlayers), &
+                                     colch4(ncol,nlayers), colo2(ncol,nlayers), &
+                                     colmol(ncol,nlayers), co2mult(ncol,nlayers)
+      INTEGER(kind=im), INTENT(OUT) :: indself(ncol,nlayers), indfor(ncol,nlayers)
+      REAL(kind=rb), INTENT(OUT) :: selffac(ncol,nlayers), selffrac(ncol,nlayers), &
+                                     forfac(ncol,nlayers), forfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(OUT) :: fac00(ncol,nlayers), fac01(ncol,nlayers), &
+                                     fac10(ncol,nlayers), fac11(ncol,nlayers)
+
+      CALL laytrop_sw_gpu(ncol, nlayers, pavel, laytrop)
+
+      CALL setcoef_sw_gpu(ncol, nlayers, pavel, tavel, coldry, wkl, laytrop, &
+                           jp, jt, jt1, co2mult, colch4, colco2, colh2o, colmol, &
+                           coln2o, colo2, colo3, fac00, fac01, fac10, fac11, &
+                           selffac, selffrac, indself, forfac, forfrac, indfor)
+
+      END SUBROUTINE setcoef_sw_driver_gpu
+
+      END MODULE rrtmg_sw_setcoef_gpu
+#endif
+
 !     path:      $Source: /cvsroot/NWP/WRFV3/phys/module_ra_rrtmg_sw.F,v $
 !     author:    $Author: trn $
 !     revision:  $Revision: 1.3 $
@@ -9653,8 +9900,7 @@
                          colo2, colo3, fac00, fac01, fac10, fac11, &
                          selffac, selffrac, indself, forfac, forfrac, indfor)
 
-
-! Cosine of the solar zenith angle 
+! Cosine of the solar zenith angle
 !  Prevent using value of zero; ideally, SW model is not called from host model when sun 
 !  is below horizon
 
