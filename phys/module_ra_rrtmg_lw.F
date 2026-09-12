@@ -16593,6 +16593,352 @@ contains
       END SUBROUTINE inatm_driver_gpu
 
       END MODULE rrtmg_lw_inatm_gpu
+
+! ncol-batched GPU replacement for RRTMG_LWRAD's per-column
+! mcica_subcol_lw + rrtmg_lw call pair (module_ra_rrtmg_lw.F:17114-17197 in
+! the CPU code) -- i.e. everything from "cloud optics has already produced
+! a per-band in-cloud optical depth" through to final fluxes/heating
+! rates. This is the single largest already-assembled piece of the real
+! LW column chain, but it is NOT the whole of RRTMG_LWRAD:
+!
+!   RRTMG_LWRAD's ~650 lines of host-side per-column setup (unit
+!   conversions, ozone table interpolation, aerosol handling, and
+!   critically the inline CLOUD OPTICS calculation that turns cloud
+!   water/ice paths into the in-cloud optical depth `tauc` this driver
+!   takes as input -- module_ra_rrtmg_lw.F:~17490-17730, an empirical
+!   `abcw*clwp+abice*ciwp`-style formula, never examined or ported) all
+!   still run per-column on the host, exactly as today. Only once `tauc`
+!   (and the other inputs below) are assembled does this driver take over.
+!
+! Inputs mirror mcica_subcol_lw's + rrtmg_lw's own signatures directly
+! (pre-mcica cloud fraction/water paths/optical depth, not mcica's
+! stochastic output) so this driver subsumes the mcica_subcol_lw_gpu call
+! too, rather than requiring the caller to run it separately.
+      MODULE rrtmg_lw_gpu_chain
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrtm, only : nbndlw, ngptlw, mxmol, maxxsec
+
+      IMPLICIT NONE
+
+      CONTAINS
+
+! Host-side pre-validation of cloud particle-size bounds, reformulated to
+! run on PRE-mcica per-column data instead of mcica's per-subcolumn
+! stochastic output (cldprmc_prep_gpu, from the earlier cldprmc port,
+! needs cldfmc/ciwpmc/etc which only exist once mcica has run on-device --
+! copying them back to host just for this check would be an expensive
+! round-trip). This is an EXACT reformulation, not an approximation: mcica
+! only ever assigns a g-point's subcolumn either 0 or exactly this
+! column's clwp/ciwp/cswp and exactly tauc(band-of-that-g-point,:,:), so
+! "does any of this band's g-points have tauc>=cldmin, given this layer's
+! cldfrac makes it possible for mcica to mark some subcolumn cloudy"
+! reproduces the identical trigger condition as the original's per-g-point
+! check, just grouped by band (16) instead of by g-point (140) -- an exact
+! restructuring, since every g-point in a band shares that band's tauc.
+! The one deliberate conservatism: a layer with cldfrac>=cldmin is
+! validated even on a random draw where mcica happens to mark zero
+! subcolumns cloudy there (vanishingly likely for cldmin=1e-20, and only
+! ever means checking a bound that would have been safe to skip -- never
+! the reverse).
+      SUBROUTINE cldprmc_prep_batch_gpu(ncol, nlayers, inflag, iceflag, liqflag, &
+                        cldfrac, ciwp, clwp, cswp, tauc, rei, rel, res)
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, inflag, iceflag, liqflag
+      REAL(kind=rb), INTENT(IN) :: cldfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: ciwp(ncol,nlayers), clwp(ncol,nlayers), cswp(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: tauc(nbndlw,ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: rei(ncol,nlayers), rel(ncol,nlayers), res(ncol,nlayers)
+
+      INTEGER(kind=im) :: iplon, lay, ib
+      REAL(kind=rb) :: cwp, radice, radliq, radsno
+      REAL(kind=rb), PARAMETER :: cldmin = 1.e-20_rb
+      CHARACTER*80 :: errmess
+
+      IF (inflag .eq. 1) THEN
+         CALL wrf_error_fatal('cldprmc_prep_batch_gpu: INFLAG = 1 OPTION NOT AVAILABLE WITH MCICA')
+      ENDIF
+      IF (inflag .lt. 2) RETURN
+
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+         IF (cldfrac(iplon,lay) .lt. cldmin) CYCLE
+         cwp = ciwp(iplon,lay) + clwp(iplon,lay) + cswp(iplon,lay)
+
+         DO ib = 1, nbndlw
+            IF (cwp .lt. cldmin .and. tauc(ib,iplon,lay) .lt. cldmin) CYCLE
+
+            radice = rei(iplon,lay)
+            IF ((ciwp(iplon,lay)+cswp(iplon,lay)) .ne. 0.0_rb) THEN
+               IF (iceflag .eq. 0) THEN
+                  IF (radice .lt. 10.0_rb) CALL wrf_error_fatal('cldprmc_prep_batch_gpu: ICE RADIUS TOO SMALL')
+               ELSEIF (iceflag .eq. 1) THEN
+                  IF (radice .lt. 13.0_rb .or. radice .gt. 130._rb) &
+                     CALL wrf_error_fatal('cldprmc_prep_batch_gpu: ICE RADIUS OUT OF BOUNDS')
+               ELSEIF (iceflag .eq. 2) THEN
+                  IF (radice .lt. 5.0_rb .or. radice .gt. 131.0_rb) &
+                     CALL wrf_error_fatal('cldprmc_prep_batch_gpu: ICE RADIUS OUT OF BOUNDS')
+               ELSEIF (iceflag .ge. 3) THEN
+                  IF (radice .lt. 5.0_rb .or. radice .gt. 140.0_rb) THEN
+                     WRITE(errmess,'(A,i5,i5,f8.2,f8.2)') &
+                        'cldprmc_prep_batch_gpu: ICE GENERALIZED EFFECTIVE SIZE OUT OF BOUNDS', &
+                        ib, lay, ciwp(iplon,lay), radice
+                     CALL wrf_error_fatal(errmess)
+                  ENDIF
+               ENDIF
+            ENDIF
+
+            IF (cswp(iplon,lay) .gt. 0.0_rb .and. iceflag .eq. 5) THEN
+               radsno = res(iplon,lay)
+               IF (radsno .lt. 5.0_rb .or. radsno .gt. 140.0_rb) THEN
+                  WRITE(errmess,'(A,i5,i5,f8.2,f8.2)') &
+                     'cldprmc_prep_batch_gpu: SNOW GENERALIZED EFFECTIVE SIZE OUT OF BOUNDS', &
+                     ib, lay, cswp(iplon,lay), radsno
+                  CALL wrf_error_fatal(errmess)
+               ENDIF
+            ENDIF
+
+            IF (clwp(iplon,lay) .ne. 0.0_rb .and. liqflag .eq. 1) THEN
+               radliq = rel(iplon,lay)
+               IF (radliq .lt. 2.5_rb .or. radliq .gt. 60._rb) &
+                  CALL wrf_error_fatal('cldprmc_prep_batch_gpu: LIQUID EFFECTIVE RADIUS OUT OF BOUNDS')
+            ENDIF
+         ENDDO
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE cldprmc_prep_batch_gpu
+
+! Combine gaseous (taumol) and aerosol optical depths (rrtmg_lw's own
+! "Combine gaseous and aerosol optical depths" step, right before
+! rtrnmc). iaer=0 (no aerosol) is a plain copy; iaer=10 (WRF's only other
+! call shape, direct aerosol optical depth input) adds taua via the
+! g-point-to-band map ngb.
+      SUBROUTINE lw_combine_taua_gpu(ncol, nlayers, iaer, taug, taua, taut)
+
+      use rrlw_wvn, only : ngb
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, iaer
+      REAL(kind=rb), INTENT(IN) :: taug(ncol,nlayers,ngptlw)
+      REAL(kind=rb), INTENT(IN) :: taua(ncol,nlayers,nbndlw)
+      REAL(kind=rb), INTENT(OUT) :: taut(ncol,nlayers,ngptlw)
+
+      INTEGER(kind=im) :: iplon, l, ig
+
+      IF (iaer .eq. 0) THEN
+!$acc parallel loop collapse(3) present(taug, taut)
+         DO ig = 1, ngptlw
+         DO l = 1, nlayers
+         DO iplon = 1, ncol
+            taut(iplon,l,ig) = taug(iplon,l,ig)
+         ENDDO
+         ENDDO
+         ENDDO
+      ELSE
+!$acc parallel loop collapse(3) present(taug, taua, taut, ngb)
+         DO ig = 1, ngptlw
+         DO l = 1, nlayers
+         DO iplon = 1, ncol
+            taut(iplon,l,ig) = taug(iplon,l,ig) + taua(iplon,l,ngb(ig))
+         ENDDO
+         ENDDO
+         ENDDO
+      ENDIF
+
+      END SUBROUTINE lw_combine_taua_gpu
+
+! Single entry point chaining mcica_subcol_lw -> inatm -> cldprmc ->
+! setcoef -> taumol -> [combine aerosol] -> rtrnmc for a whole column
+! batch, mirroring the *_driver_gpu bundling convention used throughout.
+! Allocates and device-creates every intermediate array the chain needs,
+! runs the sequence, tears it down. Asserts WRF's only call shape
+! (istart=1, iend=16, iout=0 -- see rtrnmc_driver_gpu's own header
+! comment) since that assumption is already baked into rtrnmc_driver_gpu.
+      SUBROUTINE rrtmg_lw_gpu_chain_driver(ncol, nlayers, icld, iaer, irng, changeSeed, &
+                        play, plev, tlay, tlev, tsfc, h2ovmr, o3vmr, co2vmr, ch4vmr, n2ovmr, o2vmr, &
+                        ccl4vmr, cfc11vmr, cfc12vmr, cfc22vmr, emis, &
+                        inflglw, iceflglw, liqflglw, &
+                        cldfrac, ciwp, clwp, cswp, tauc, rei, rel, res, tauaer, &
+                        totuflux, totdflux, fnet, htr, totuclfl, totdclfl, fnetc, htrc)
+
+      use mcica_subcol_gen_lw_gpu, only : mcica_subcol_lw_driver_gpu
+      use rrtmg_lw_inatm_gpu, only : inatm_driver_gpu
+      use rrtmg_lw_cldprmc_gpu, only : cldprmc_gpu
+      use rrtmg_lw_setcoef_gpu, only : setcoef_driver_gpu
+      use rrtmg_lw_taumol_gpu, only : taumol_gpu
+      use rrtmg_lw_rtrnmc_gpu, only : rtrnmc_driver_gpu
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, icld, iaer, irng, changeSeed
+      REAL(kind=rb), INTENT(IN) :: play(ncol,nlayers), tlay(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: plev(ncol,nlayers+1), tlev(ncol,nlayers+1), tsfc(ncol)
+      REAL(kind=rb), INTENT(IN) :: h2ovmr(ncol,nlayers), o3vmr(ncol,nlayers), co2vmr(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: ch4vmr(ncol,nlayers), n2ovmr(ncol,nlayers), o2vmr(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: ccl4vmr(ncol,nlayers), cfc11vmr(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: cfc12vmr(ncol,nlayers), cfc22vmr(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: emis(ncol,nbndlw)
+      INTEGER(kind=im), INTENT(IN) :: inflglw, iceflglw, liqflglw
+      REAL(kind=rb), INTENT(IN) :: cldfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: ciwp(ncol,nlayers), clwp(ncol,nlayers), cswp(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: tauc(nbndlw,ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: rei(ncol,nlayers), rel(ncol,nlayers), res(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: tauaer(ncol,nlayers,nbndlw)
+      REAL(kind=rb), INTENT(OUT) :: totuflux(ncol,0:nlayers), totdflux(ncol,0:nlayers)
+      REAL(kind=rb), INTENT(OUT) :: fnet(ncol,0:nlayers), htr(ncol,0:nlayers)
+      REAL(kind=rb), INTENT(OUT) :: totuclfl(ncol,0:nlayers), totdclfl(ncol,0:nlayers)
+      REAL(kind=rb), INTENT(OUT) :: fnetc(ncol,0:nlayers), htrc(ncol,0:nlayers)
+
+      INTEGER(kind=im), PARAMETER :: istart = 1, iend = 16, iout = 0
+
+! mcica_subcol_lw outputs (host-resident inputs to the host validation,
+! device-resident for everything else)
+      REAL(kind=rb), ALLOCATABLE :: cldfmcl(:,:,:), ciwpmcl(:,:,:), clwpmcl(:,:,:), cswpmcl(:,:,:)
+      REAL(kind=rb), ALLOCATABLE :: reicmcl(:,:), relqmcl(:,:), resnmcl(:,:), taucmcl(:,:,:)
+
+! inatm outputs
+      REAL(kind=rb), ALLOCATABLE :: pavel(:,:), tavel(:,:), pz(:,:), tz(:,:), tbound(:)
+      REAL(kind=rb), ALLOCATABLE :: coldry(:,:), wbrodl(:,:), wkl(:,:,:), wx(:,:,:)
+      REAL(kind=rb), ALLOCATABLE :: pwvcm(:), semiss(:,:)
+      REAL(kind=rb), ALLOCATABLE :: cldfmc(:,:,:), taucmc(:,:,:), ciwpmc(:,:,:), cswpmc(:,:,:), clwpmc(:,:,:)
+      REAL(kind=rb), ALLOCATABLE :: reicmc(:,:), relqmc(:,:), resnmc(:,:), taua(:,:,:)
+
+! setcoef outputs
+      INTEGER(kind=im), ALLOCATABLE :: laytrop(:), jp(:,:), jt(:,:), jt1(:,:)
+      REAL(kind=rb), ALLOCATABLE :: planklay(:,:,:), planklev(:,:,:), plankbnd(:,:)
+      REAL(kind=rb), ALLOCATABLE :: colh2o(:,:), colco2(:,:), colo3(:,:), coln2o(:,:)
+      REAL(kind=rb), ALLOCATABLE :: colco(:,:), colch4(:,:), colo2(:,:), colbrd(:,:)
+      INTEGER(kind=im), ALLOCATABLE :: indself(:,:), indfor(:,:), indminor(:,:)
+      REAL(kind=rb), ALLOCATABLE :: selffac(:,:), selffrac(:,:), forfac(:,:), forfrac(:,:)
+      REAL(kind=rb), ALLOCATABLE :: minorfrac(:,:), scaleminor(:,:), scaleminorn2(:,:)
+      REAL(kind=rb), ALLOCATABLE :: fac00(:,:), fac01(:,:), fac10(:,:), fac11(:,:)
+      REAL(kind=rb), ALLOCATABLE :: rat_h2oco2(:,:), rat_h2oco2_1(:,:), rat_h2oo3(:,:), rat_h2oo3_1(:,:)
+      REAL(kind=rb), ALLOCATABLE :: rat_h2on2o(:,:), rat_h2on2o_1(:,:), rat_h2och4(:,:), rat_h2och4_1(:,:)
+      REAL(kind=rb), ALLOCATABLE :: rat_n2oco2(:,:), rat_n2oco2_1(:,:), rat_o3co2(:,:), rat_o3co2_1(:,:)
+
+! taumol outputs / combine output
+      REAL(kind=rb), ALLOCATABLE :: fracs(:,:,:), taug(:,:,:), taut(:,:,:)
+
+      INTEGER(kind=im) :: nl1
+
+      nl1 = nlayers + 1
+
+! --- Host-side pre-validation (before anything touches the device) ---
+      CALL cldprmc_prep_batch_gpu(ncol, nlayers, inflglw, iceflglw, liqflglw, &
+                cldfrac, ciwp, clwp, cswp, tauc, rei, rel, res)
+
+! --- Allocate everything ---
+      ALLOCATE(cldfmcl(ngptlw,ncol,nlayers), ciwpmcl(ngptlw,ncol,nlayers))
+      ALLOCATE(clwpmcl(ngptlw,ncol,nlayers), cswpmcl(ngptlw,ncol,nlayers))
+      ALLOCATE(reicmcl(ncol,nlayers), relqmcl(ncol,nlayers), resnmcl(ncol,nlayers))
+      ALLOCATE(taucmcl(ngptlw,ncol,nlayers))
+
+      ALLOCATE(pavel(ncol,nlayers), tavel(ncol,nlayers), pz(ncol,0:nlayers), tz(ncol,0:nlayers), tbound(ncol))
+      ALLOCATE(coldry(ncol,nlayers), wbrodl(ncol,nlayers), wkl(ncol,nlayers,mxmol), wx(ncol,nlayers,maxxsec))
+      ALLOCATE(pwvcm(ncol), semiss(ncol,nbndlw))
+      ALLOCATE(cldfmc(ncol,ngptlw,nlayers), taucmc(ncol,ngptlw,nlayers))
+      ALLOCATE(ciwpmc(ncol,ngptlw,nlayers), cswpmc(ncol,ngptlw,nlayers), clwpmc(ncol,ngptlw,nlayers))
+      ALLOCATE(reicmc(ncol,nlayers), relqmc(ncol,nlayers), resnmc(ncol,nlayers), taua(ncol,nlayers,nbndlw))
+
+      ALLOCATE(laytrop(ncol), jp(ncol,nlayers), jt(ncol,nlayers), jt1(ncol,nlayers))
+      ALLOCATE(planklay(ncol,nlayers,nbndlw), planklev(ncol,0:nlayers,nbndlw), plankbnd(ncol,nbndlw))
+      ALLOCATE(colh2o(ncol,nlayers), colco2(ncol,nlayers), colo3(ncol,nlayers), coln2o(ncol,nlayers))
+      ALLOCATE(colco(ncol,nlayers), colch4(ncol,nlayers), colo2(ncol,nlayers), colbrd(ncol,nlayers))
+      ALLOCATE(indself(ncol,nlayers), indfor(ncol,nlayers), indminor(ncol,nlayers))
+      ALLOCATE(selffac(ncol,nlayers), selffrac(ncol,nlayers), forfac(ncol,nlayers), forfrac(ncol,nlayers))
+      ALLOCATE(minorfrac(ncol,nlayers), scaleminor(ncol,nlayers), scaleminorn2(ncol,nlayers))
+      ALLOCATE(fac00(ncol,nlayers), fac01(ncol,nlayers), fac10(ncol,nlayers), fac11(ncol,nlayers))
+      ALLOCATE(rat_h2oco2(ncol,nlayers), rat_h2oco2_1(ncol,nlayers), rat_h2oo3(ncol,nlayers), rat_h2oo3_1(ncol,nlayers))
+      ALLOCATE(rat_h2on2o(ncol,nlayers), rat_h2on2o_1(ncol,nlayers), rat_h2och4(ncol,nlayers), rat_h2och4_1(ncol,nlayers))
+      ALLOCATE(rat_n2oco2(ncol,nlayers), rat_n2oco2_1(ncol,nlayers), rat_o3co2(ncol,nlayers), rat_o3co2_1(ncol,nlayers))
+
+      ALLOCATE(fracs(ncol,nlayers,ngptlw), taug(ncol,nlayers,ngptlw), taut(ncol,nlayers,ngptlw))
+
+!$acc enter data create(cldfmcl, ciwpmcl, clwpmcl, cswpmcl, reicmcl, relqmcl, resnmcl, taucmcl) &
+!$acc   create(pavel, tavel, pz, tz, tbound, coldry, wbrodl, wkl, wx, pwvcm, semiss) &
+!$acc   create(cldfmc, taucmc, ciwpmc, cswpmc, clwpmc, reicmc, relqmc, resnmc, taua) &
+!$acc   create(laytrop, jp, jt, jt1, planklay, planklev, plankbnd) &
+!$acc   create(colh2o, colco2, colo3, coln2o, colco, colch4, colo2, colbrd) &
+!$acc   create(indself, indfor, indminor, selffac, selffrac, forfac, forfrac) &
+!$acc   create(minorfrac, scaleminor, scaleminorn2, fac00, fac01, fac10, fac11) &
+!$acc   create(rat_h2oco2, rat_h2oco2_1, rat_h2oo3, rat_h2oo3_1) &
+!$acc   create(rat_h2on2o, rat_h2on2o_1, rat_h2och4, rat_h2och4_1) &
+!$acc   create(rat_n2oco2, rat_n2oco2_1, rat_o3co2, rat_o3co2_1) &
+!$acc   create(fracs, taug, taut)
+
+      CALL mcica_subcol_lw_driver_gpu(ncol, nlayers, icld, irng, changeSeed, play, &
+                cldfrac, ciwp, clwp, cswp, tauc, rei, rel, res, &
+                cldfmcl, ciwpmcl, clwpmcl, cswpmcl, &
+                reicmcl, relqmcl, resnmcl, taucmcl)
+
+      CALL inatm_driver_gpu(ncol, nlayers, icld, iaer, &
+                play, plev, tlay, tlev, tsfc, h2ovmr, o3vmr, co2vmr, ch4vmr, n2ovmr, o2vmr, &
+                ccl4vmr, cfc11vmr, cfc12vmr, cfc22vmr, emis, tauaer, &
+                cldfmcl, taucmcl, ciwpmcl, cswpmcl, clwpmcl, reicmcl, relqmcl, resnmcl, &
+                pavel, tavel, pz, tz, tbound, coldry, wbrodl, wkl, wx, pwvcm, semiss, &
+                cldfmc, taucmc, ciwpmc, cswpmc, clwpmc, reicmc, relqmc, resnmc, taua)
+
+      CALL cldprmc_gpu(ncol, nlayers, inflglw, iceflglw, liqflglw, &
+                cldfmc, ciwpmc, clwpmc, cswpmc, reicmc, relqmc, resnmc, taucmc)
+
+      CALL setcoef_driver_gpu(ncol, nlayers, istart, pavel, tavel, tz, &
+                tbound, semiss, coldry, wkl(:,:,1:7), wbrodl, &
+                laytrop, jp, jt, jt1, planklay, planklev, plankbnd, &
+                colh2o, colco2, colo3, coln2o, colco, colch4, colo2, &
+                colbrd, fac00, fac01, fac10, fac11, &
+                rat_h2oco2, rat_h2oco2_1, rat_h2oo3, rat_h2oo3_1, &
+                rat_h2on2o, rat_h2on2o_1, rat_h2och4, rat_h2och4_1, &
+                rat_n2oco2, rat_n2oco2_1, rat_o3co2, rat_o3co2_1, &
+                selffac, selffrac, indself, forfac, forfrac, indfor, &
+                minorfrac, scaleminor, scaleminorn2, indminor)
+
+      CALL taumol_gpu(ncol, nlayers, pavel, wx, coldry, &
+                laytrop, jp, jt, jt1, &
+                colh2o, colco2, colo3, coln2o, colco, colch4, colo2, &
+                colbrd, fac00, fac01, fac10, fac11, &
+                rat_h2oco2, rat_h2oco2_1, rat_h2oo3, rat_h2oo3_1, &
+                rat_h2on2o, rat_h2on2o_1, rat_h2och4, rat_h2och4_1, &
+                rat_n2oco2, rat_n2oco2_1, rat_o3co2, rat_o3co2_1, &
+                selffac, selffrac, indself, forfac, forfrac, indfor, &
+                minorfrac, scaleminor, scaleminorn2, indminor, &
+                ngptlw, fracs, taug)
+
+      CALL lw_combine_taua_gpu(ncol, nlayers, iaer, taug, taua, taut)
+
+      CALL rtrnmc_driver_gpu(ncol, nlayers, istart, iend, iout, pz, semiss, &
+                cldfmc, taucmc, planklay, planklev, plankbnd, &
+                pwvcm, fracs, taut, &
+                totuflux, totdflux, fnet, htr, &
+                totuclfl, totdclfl, fnetc, htrc)
+
+!$acc exit data delete(cldfmcl, ciwpmcl, clwpmcl, cswpmcl, reicmcl, relqmcl, resnmcl, taucmcl) &
+!$acc   delete(pavel, tavel, pz, tz, tbound, coldry, wbrodl, wkl, wx, pwvcm, semiss) &
+!$acc   delete(cldfmc, taucmc, ciwpmc, cswpmc, clwpmc, reicmc, relqmc, resnmc, taua) &
+!$acc   delete(laytrop, jp, jt, jt1, planklay, planklev, plankbnd) &
+!$acc   delete(colh2o, colco2, colo3, coln2o, colco, colch4, colo2, colbrd) &
+!$acc   delete(indself, indfor, indminor, selffac, selffrac, forfac, forfrac) &
+!$acc   delete(minorfrac, scaleminor, scaleminorn2, fac00, fac01, fac10, fac11) &
+!$acc   delete(rat_h2oco2, rat_h2oco2_1, rat_h2oo3, rat_h2oo3_1) &
+!$acc   delete(rat_h2on2o, rat_h2on2o_1, rat_h2och4, rat_h2och4_1) &
+!$acc   delete(rat_n2oco2, rat_n2oco2_1, rat_o3co2, rat_o3co2_1) &
+!$acc   delete(fracs, taug, taut)
+
+      DEALLOCATE(cldfmcl, ciwpmcl, clwpmcl, cswpmcl, reicmcl, relqmcl, resnmcl, taucmcl)
+      DEALLOCATE(pavel, tavel, pz, tz, tbound, coldry, wbrodl, wkl, wx, pwvcm, semiss)
+      DEALLOCATE(cldfmc, taucmc, ciwpmc, cswpmc, clwpmc, reicmc, relqmc, resnmc, taua)
+      DEALLOCATE(laytrop, jp, jt, jt1, planklay, planklev, plankbnd)
+      DEALLOCATE(colh2o, colco2, colo3, coln2o, colco, colch4, colo2, colbrd)
+      DEALLOCATE(indself, indfor, indminor, selffac, selffrac, forfac, forfrac)
+      DEALLOCATE(minorfrac, scaleminor, scaleminorn2, fac00, fac01, fac10, fac11)
+      DEALLOCATE(rat_h2oco2, rat_h2oco2_1, rat_h2oo3, rat_h2oo3_1)
+      DEALLOCATE(rat_h2on2o, rat_h2on2o_1, rat_h2och4, rat_h2och4_1)
+      DEALLOCATE(rat_n2oco2, rat_n2oco2_1, rat_o3co2, rat_o3co2_1)
+      DEALLOCATE(fracs, taug, taut)
+
+      END SUBROUTINE rrtmg_lw_gpu_chain_driver
+
+      END MODULE rrtmg_lw_gpu_chain
 #endif
 
 !------------------------------------------------------------------
