@@ -476,7 +476,19 @@ SUBROUTINE rk_tendency ( config_flags, rk_step,                           &
 #ifdef WRF_GPU_DYN
 !  Only u and ru_tend are specific to this call; the rest of advect_u's
 !  inputs were made resident once, above, for the whole advection block.
-!$acc enter data copyin(u,ru_tend)
+!  ru_tend was just zeroed on the host by zero_tend above -- rather than
+!  copying that all-zero array across PCIe, create it un-initialized on the
+!  device and zero it there directly (a trivial kernel vs. a full 3-D
+!  host->device transfer).
+!$acc enter data copyin(u) create(ru_tend)
+!$acc parallel loop collapse(3) present(ru_tend)
+      DO j = jts, jte
+      DO k = kts, kte
+      DO i = its, ite
+         ru_tend(i,k,j) = 0.
+      ENDDO
+      ENDDO
+      ENDDO
 !  Fast multi-gang path for the one order combination the real-data case
 !  actually runs (see plan.md "Restructuring strategy"); every other order
 !  combination keeps falling through to the verified num_gangs(1) advect_u.
@@ -524,7 +536,17 @@ SUBROUTINE rk_tendency ( config_flags, rk_step,                           &
     ELSE
 
 #ifdef WRF_GPU_DYN
-!$acc enter data copyin(v,rv_tend)
+!  rv_tend was just zeroed on the host by zero_tend above -- zero it directly
+!  on the device instead of copying that all-zero array across PCIe.
+!$acc enter data copyin(v) create(rv_tend)
+!$acc parallel loop collapse(3) present(rv_tend)
+      DO j = jts, jte
+      DO k = kts, kte
+      DO i = its, ite
+         rv_tend(i,k,j) = 0.
+      ENDDO
+      ENDDO
+      ENDDO
 #endif
      CALL advect_v ( v, v , rv_tend, ru, rv, ww,  &
                    c1h, c2h,                     &
@@ -557,7 +579,17 @@ SUBROUTINE rk_tendency ( config_flags, rk_step,                           &
      ELSE
 
 #ifdef WRF_GPU_DYN
-!$acc enter data copyin(w,rw_tend)
+!  rw_tend was just zeroed on the host by zero_tend above -- zero it directly
+!  on the device instead of copying that all-zero array across PCIe.
+!$acc enter data copyin(w) create(rw_tend)
+!$acc parallel loop collapse(3) present(rw_tend)
+      DO j = jts, jte
+      DO k = kts, kte
+      DO i = its, ite
+         rw_tend(i,k,j) = 0.
+      ENDDO
+      ENDDO
+      ENDDO
 #endif
      CALL advect_w ( w, w, rw_tend, ru, rv, ww,    &
                      c1h, c2h,                     &
@@ -597,7 +629,17 @@ SUBROUTINE rk_tendency ( config_flags, rk_step,                           &
      ELSE
 
 #ifdef WRF_GPU_DYN
-!$acc enter data copyin(t,t_tend)
+!  t_tend was just zeroed on the host by zero_tend above -- zero it directly
+!  on the device instead of copying that all-zero array across PCIe.
+!$acc enter data copyin(t) create(t_tend)
+!$acc parallel loop collapse(3) present(t_tend)
+      DO j = jts, jte
+      DO k = kts, kte
+      DO i = its, ite
+         t_tend(i,k,j) = 0.
+      ENDDO
+      ENDDO
+      ENDDO
 !  Fast multi-gang path for the one order combination the real-data case
 !  actually runs (see plan.md "Restructuring strategy"); every other order
 !  combination keeps falling through to the verified num_gangs(1) advect_scalar.
@@ -1219,11 +1261,24 @@ SUBROUTINE rk_scalar_tend ( scs, sce, config_flags,          &
       ELSE
 
 #ifdef WRF_GPU_DYN
-!  scalar(...,im) is a different slice each iteration and advect_tend is a
-!  reused work array, so both still need per-call copyin/copyout; the
-!  shared inputs (ru,rv,ww,etc.) stay resident from the enter data at the
-!  top of this subroutine.
-!$acc enter data copyin(scalar(ims:ime,kms:kme,jms:jme,im),advect_tend)
+!  scalar(...,im) is a different slice each iteration and still needs a
+!  per-call copyin; the shared inputs (ru,rv,ww,etc.) stay resident from the
+!  enter data at the top of this subroutine. advect_tend was just zeroed on
+!  the host by zero_tend above -- this is the single largest data-movement
+!  cost in the profiled acoustic+advection GPU build (this enter data runs
+!  once per species per call, 144x in a 2-minute profiled run, ~552ms total)
+!  and half of every one of those transfers is a full 3-D array of nothing
+!  but zeros. Create it un-initialized on the device and zero it there
+!  directly instead, cutting this cost roughly in half.
+!$acc enter data copyin(scalar(ims:ime,kms:kme,jms:jme,im)) create(advect_tend)
+!$acc parallel loop collapse(3) present(advect_tend)
+        DO j = jts, jte
+        DO k = kts, kte
+        DO i = its, ite
+           advect_tend(i,k,j) = 0.
+        ENDDO
+        ENDDO
+        ENDDO
 !  Fast multi-gang path for the one order combination the real-data case
 !  actually runs (see plan.md "Restructuring strategy"); every other order
 !  combination keeps falling through to the verified num_gangs(1) advect_scalar.
