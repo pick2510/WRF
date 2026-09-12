@@ -64,7 +64,59 @@ MODULE module_small_step_em
    USE module_configure
    USE module_model_constants
 
+#ifdef WRF_GPU_DYN
+!  Fast multi-gang scratch buffers for advance_uv_fast/advance_mu_t_fast/
+!  advance_w_fast (see plan.md "Restructuring strategy"). Each subroutine's
+!  per-j 2D scratch (kept in the original code only for buffer reuse across a
+!  sequential j loop, not because of a real data dependency) is promoted to a
+!  3-D buffer indexed by the real j, removing the need for num_gangs(1).
+!  Buffers are never live across subroutines that don't use them, so they are
+!  declared per-subroutine but share one allocation-tracking helper pattern.
+   REAL, ALLOCATABLE, DIMENSION(:,:,:), SAVE :: fast_dpn3, fast_dpxy3
+   REAL, ALLOCATABLE, DIMENSION(:,:,:), SAVE :: fast_dvdxi3, fast_wdtn3
+   REAL, ALLOCATABLE, DIMENSION(:,:),   SAVE :: fast_dmdt2
+   REAL, ALLOCATABLE, DIMENSION(:,:,:), SAVE :: fast_rhs3, fast_wdwn3
+   REAL, ALLOCATABLE, DIMENSION(:,:),   SAVE :: fast_msft_inv2
+   INTEGER, SAVE :: fastss_its = -999999, fastss_ite, fastss_jts, fastss_jte, &
+                    fastss_kts, fastss_kte
+#endif
+
 CONTAINS
+
+#ifdef WRF_GPU_DYN
+SUBROUTINE smallstep_fast_ensure_buffers ( its, ite, jts, jte, kts, kte )
+!  (Re)allocate the shared acoustic-loop fast-path scratch buffers if the
+!  tile bounds have changed, and (re)establish their device residency.
+   IMPLICIT NONE
+   INTEGER, INTENT(IN) :: its, ite, jts, jte, kts, kte
+
+   IF ( its == fastss_its .AND. ite == fastss_ite .AND. jts == fastss_jts .AND. &
+        jte == fastss_jte .AND. kts == fastss_kts .AND. kte == fastss_kte ) RETURN
+
+   IF ( ALLOCATED( fast_dpn3 ) ) THEN
+      !$acc exit data delete(fast_dpn3,fast_dpxy3,fast_dvdxi3,fast_wdtn3, &
+      !$acc& fast_dmdt2,fast_rhs3,fast_wdwn3,fast_msft_inv2)
+      DEALLOCATE( fast_dpn3, fast_dpxy3, fast_dvdxi3, fast_wdtn3, &
+                  fast_dmdt2, fast_rhs3, fast_wdwn3, fast_msft_inv2 )
+   ENDIF
+
+   ALLOCATE( fast_dpn3     ( its:ite, kts:kte, jts:jte ) )
+   ALLOCATE( fast_dpxy3    ( its:ite, kts:kte, jts:jte ) )
+   ALLOCATE( fast_dvdxi3   ( its:ite, kts:kte, jts:jte ) )
+   ALLOCATE( fast_wdtn3    ( its:ite, kts:kte, jts:jte ) )
+   ALLOCATE( fast_dmdt2    ( its:ite, jts:jte ) )
+   ALLOCATE( fast_rhs3     ( its:ite, kts:kte, jts:jte ) )
+   ALLOCATE( fast_wdwn3    ( its:ite, kts:kte, jts:jte ) )
+   ALLOCATE( fast_msft_inv2( its:ite, jts:jte ) )
+   !$acc enter data create(fast_dpn3,fast_dpxy3,fast_dvdxi3,fast_wdtn3, &
+   !$acc& fast_dmdt2,fast_rhs3,fast_wdwn3,fast_msft_inv2)
+
+   fastss_its = its ; fastss_ite = ite
+   fastss_jts = jts ; fastss_jte = jte
+   fastss_kts = kts ; fastss_kte = kte
+
+END SUBROUTINE smallstep_fast_ensure_buffers
+#endif
 
 !----------------------------------------------------------------------
 
@@ -500,6 +552,12 @@ END SUBROUTINE small_step_finish
 
 !-----------------------------------------------------------------------
 
+#ifdef WRF_GPU_DYN_CPU_P
+#ifdef WRF_GPU_DYN
+#undef WRF_GPU_DYN
+#define WRF_GPU_DYN_RESTORE_AFTER_P
+#endif
+#endif
 SUBROUTINE calc_p_rho( al, p, ph,                    &
                        alt, t_2, t_1, c2a, pm1,      &
                        mu, mut,                      &
@@ -653,6 +711,10 @@ SUBROUTINE calc_p_rho( al, p, ph,                    &
        ENDDO
      END IF
 
+#ifdef WRF_GPU_DYN_RESTORE_AFTER_P
+#define WRF_GPU_DYN
+#undef WRF_GPU_DYN_RESTORE_AFTER_P
+#endif
 END SUBROUTINE calc_p_rho
 
 !----------------------------------------------------------------------
@@ -816,6 +878,12 @@ END SUBROUTINE calc_coef_w
 
 !----------------------------------------------------------------------
 
+#ifdef WRF_GPU_DYN_CPU_UV
+#ifdef WRF_GPU_DYN
+#undef WRF_GPU_DYN
+#define WRF_GPU_DYN_RESTORE_AFTER_UV
+#endif
+#endif
 SUBROUTINE advance_uv ( u, ru_tend, v, rv_tend,        &
                         p, pb,                         &
                         ph, php, alt, al, mu,          &
@@ -1001,19 +1069,38 @@ SUBROUTINE advance_uv ( u, ru_tend, v, rv_tend,        &
 !  start real calculations.
 !  first, u
 
+#ifdef WRF_GPU_DYN
+!$acc data present(u,ru_tend,v,rv_tend,p,pb,ph,php,alt,al,mu,muu,cqu,muv,cqv,mudf, &
+!$acc& fnm,fnp,rdnw,msfux,msfuy,msfvx,msfvx_inv,msfvy) create(dpn,dpxy,mudf_xy)
+!$acc parallel private(i,j,k) num_gangs(1)
+!$acc loop seq
+#endif
   u_outer_j_loop: DO j = j_start, j_end
 
+#ifdef WRF_GPU_DYN
+!$acc loop seq
+#endif
    DO k = k_start, k_end
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
    DO i = i_start_u_tend, i_end_u_tend
      u(i,k,j) = u(i,k,j) + dts*ru_tend(i,k,j)
    ENDDO
    ENDDO
-
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
    DO i = i_start_up, i_end_up
      MUDF_XY(i)= -emdiv*dx*(MUDF(i,j)-MUDF(i-1,j))/msfuy(i,j)
    ENDDO
-
+#ifdef WRF_GPU_DYN
+!$acc loop seq
+#endif
    DO k = k_start, k_end
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
    DO i = i_start_up, i_end_up
 
 !     Comments on map scale factors:   
@@ -1041,6 +1128,9 @@ SUBROUTINE advance_uv ( u, ru_tend, v, rv_tend,        &
 
    IF (non_hydrostatic) THEN
 
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
      DO i = i_start_up, i_end_up
        dpn(i,1) = .5*( cf1*(p(i,1,j)+p(i-1,1,j))  &
                       +cf2*(p(i,2,j)+p(i-1,2,j))  &
@@ -1048,6 +1138,9 @@ SUBROUTINE advance_uv ( u, ru_tend, v, rv_tend,        &
        dpn(i,kde) = 0.
      ENDDO
      IF (top_lid) THEN
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
        DO i = i_start_up, i_end_up
          dpn(i,kde) =.5*( cf1*(p(i-1,kde-1,j)+p(i,kde-1,j))   &
                          +cf2*(p(i-1,kde-2,j)+p(i,kde-2,j))   &
@@ -1055,7 +1148,13 @@ SUBROUTINE advance_uv ( u, ru_tend, v, rv_tend,        &
        ENDDO
      ENDIF
 
+#ifdef WRF_GPU_DYN
+!$acc loop seq
+#endif
      DO k = k_start+1, k_end
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
        DO i = i_start_up, i_end_up
          dpn(i,k) = .5*( fnm(k)*(p(i,k  ,j)+p(i-1,k  ,j))   &
                         +fnp(k)*(p(i,k-1,j)+p(i-1,k-1,j)) )
@@ -1068,9 +1167,15 @@ SUBROUTINE advance_uv ( u, ru_tend, v, rv_tend,        &
 !    since we want tendency to fit ADT eqn 44 (coupled) we need to
 !    multiply by (mx/my):
 
+#ifdef WRF_GPU_DYN
+!$acc loop seq
+#endif
      DO k = k_start, k_end
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
        DO i = i_start_up, i_end_up
-         dpxy(i,k)=dpxy(i,k) + (msfux(i,j)/msfuy(i,j))*rdx*(php(i,k,j)-php(i-1,k,j))*        &
+       dpxy(i,k)=dpxy(i,k) + (msfux(i,j)/msfuy(i,j))*rdx*(php(i,k,j)-php(i-1,k,j))*        &
            (rdnw(k)*(dpn(i,k+1)-dpn(i,k))-.5*(mu(i-1,j)+mu(i,j)))
        ENDDO
      ENDDO
@@ -1078,8 +1183,13 @@ SUBROUTINE advance_uv ( u, ru_tend, v, rv_tend,        &
  
    END IF
 
-
+#ifdef WRF_GPU_DYN
+!$acc loop seq
+#endif
    DO k = k_start, k_end
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
      DO i = i_start_up, i_end_up
        u(i,k,j)=u(i,k,j)-dts*cqu(i,k,j)*dpxy(i,k)+mudf_xy(i) 
      ENDDO
@@ -1089,15 +1199,26 @@ SUBROUTINE advance_uv ( u, ru_tend, v, rv_tend,        &
 
 ! now v
 
+#ifdef WRF_GPU_DYN
+!$acc loop seq
+#endif
   v_outer_j_loop: DO j = j_start_v_tend, j_end_v_tend
 
 
+#ifdef WRF_GPU_DYN
+!$acc loop seq
+#endif
    DO k = k_start, k_end
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
    DO i = i_start, i_end
      v(i,k,j) = v(i,k,j) + dts*rv_tend(i,k,j)
    ENDDO
    ENDDO
-
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
    DO i = i_start, i_end
      MUDF_XY(i)= -emdiv*dy*(MUDF(i,j)-MUDF(i,j-1))*msfvx_inv(i,j)
    ENDDO
@@ -1105,7 +1226,15 @@ SUBROUTINE advance_uv ( u, ru_tend, v, rv_tend,        &
      IF (     ( j >= j_start_vp)  &
        .and.( j <= j_end_vp  ) )  THEN
 
+
+#ifdef WRF_GPU_DYN
+!$acc loop seq
+#endif
          DO k = k_start, k_end
+
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
 	 DO i = i_start, i_end
 
 !      Comments on map scale factors:
@@ -1135,6 +1264,9 @@ SUBROUTINE advance_uv ( u, ru_tend, v, rv_tend,        &
 
      IF (non_hydrostatic) THEN
 
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
        DO i = i_start, i_end     
          dpn(i,1) = .5*( cf1*(p(i,1,j)+p(i,1,j-1))  &
                         +cf2*(p(i,2,j)+p(i,2,j-1))  &
@@ -1142,6 +1274,9 @@ SUBROUTINE advance_uv ( u, ru_tend, v, rv_tend,        &
          dpn(i,kde) = 0.
        ENDDO
      IF (top_lid) THEN
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
        DO i = i_start, i_end
          dpn(i,kde) =.5*( cf1*(p(i,kde-1,j-1)+p(i,kde-1,j))   &
                          +cf2*(p(i,kde-2,j-1)+p(i,kde-2,j))   &
@@ -1149,7 +1284,13 @@ SUBROUTINE advance_uv ( u, ru_tend, v, rv_tend,        &
        ENDDO
      ENDIF
 
+#ifdef WRF_GPU_DYN
+!$acc loop seq
+#endif
        DO k = k_start+1, k_end
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
          DO i = i_start, i_end
            dpn(i,k) = .5*( fnm(k)*(p(i,k  ,j)+p(i,k  ,j-1))  &
                           +fnp(k)*(p(i,k-1,j)+p(i,k-1,j-1)) )
@@ -1162,7 +1303,13 @@ SUBROUTINE advance_uv ( u, ru_tend, v, rv_tend,        &
 !      since we want tendency to fit ADT eqn 45 (coupled) we need to
 !      multiply by (my/mx):
 
+#ifdef WRF_GPU_DYN
+!$acc loop seq
+#endif
        DO k = k_start, k_end
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
          DO i = i_start, i_end
            dpxy(i,k)=dpxy(i,k) + (msfvy(i,j)/msfvx(i,j))*rdy*(php(i,k,j)-php(i,k,j-1))*    &
              (rdnw(k)*(dpn(i,k+1)-dpn(i,k))-.5*(mu(i,j-1)+mu(i,j)))
@@ -1172,8 +1319,13 @@ SUBROUTINE advance_uv ( u, ru_tend, v, rv_tend,        &
 
      END IF
 
-
+#ifdef WRF_GPU_DYN
+!$acc loop seq
+#endif
      DO k = k_start, k_end
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
        DO i = i_start, i_end
          v(i,k,j)=v(i,k,j)-dts*cqv(i,k,j)*dpxy(i,k)+mudf_xy(i) 
        ENDDO
@@ -1181,6 +1333,14 @@ SUBROUTINE advance_uv ( u, ru_tend, v, rv_tend,        &
    END IF
 
   ENDDO  v_outer_j_loop
+
+#ifdef WRF_GPU_DYN
+!$acc end parallel
+!$acc end data
+  IF (config_flags%polar) THEN
+!$acc update self(u,v)
+  END IF
+#endif
 
   ! The check for j_start_vp and j_end_vp makes sure that the edges in v
   ! are not updated.  Let's add a polar boundary condition check here for
@@ -1203,11 +1363,395 @@ SUBROUTINE advance_uv ( u, ru_tend, v, rv_tend,        &
      END IF
   END IF
 
+#ifdef WRF_GPU_DYN
+  IF (config_flags%polar) THEN
+!$acc update device(u,v)
+  END IF
+#endif
 
+#ifdef WRF_GPU_DYN_RESTORE_AFTER_UV
+#define WRF_GPU_DYN
+#undef WRF_GPU_DYN_RESTORE_AFTER_UV
+#endif
 END SUBROUTINE advance_uv
+
+#ifdef WRF_GPU_DYN
+!---------------------------------------------------------------------
+!  Fast multi-gang path for advance_uv (see plan.md "Restructuring
+!  strategy"). Unlike advect_u, advance_uv's per-j scratch (dpn/dpxy) has NO
+!  real cross-j dependency at all -- the original outer "!$acc loop seq" over
+!  j exists purely because dpn/dpxy are 2-D (i,k) scratch reused serially,
+!  not because of a real recurrence. Promoting them to 3-D (i,k,j) buffers
+!  therefore makes the ENTIRE subroutine collapse(3)-able; no gang/seq-k
+!  pattern is needed here (contrast advance_mu_t_fast/advance_w_fast, which
+!  do have genuine k-recurrences). mudf_xy is a pure function of (i,j) with
+!  no k dependence and is used exactly once right after being computed, so it
+!  is inlined directly rather than materialized as its own buffer.
+!  Applicable unconditionally -- there is no order-dependent branching here
+!  the way advect_u had, so advance_uv itself is kept only as reference/
+!  fallback and is no longer called from solve_em.F.
+SUBROUTINE advance_uv_fast ( u, ru_tend, v, rv_tend,   &
+                        p, pb,                         &
+                        ph, php, alt, al, mu,          &
+                        muu, cqu, muv, cqv, mudf,      &
+                        c1h, c2h, c1f, c2f,            &
+                        c3h, c4h, c3f, c4f,            &
+                        msfux, msfuy, msfvx,           &
+                        msfvx_inv, msfvy,              &
+                        rdx, rdy, dts,                 &
+                        cf1, cf2, cf3, fnm, fnp,       &
+                        emdiv,                         &
+                        rdnw, config_flags, spec_zone, &
+                        non_hydrostatic, top_lid,      &
+                        ids, ide, jds, jde, kds, kde,  &
+                        ims, ime, jms, jme, kms, kme,  &
+                        its, ite, jts, jte, kts, kte  )
+
+      IMPLICIT NONE
+
+      TYPE(grid_config_rec_type), INTENT(IN   ) :: config_flags
+
+      LOGICAL, INTENT(IN   ) :: non_hydrostatic, top_lid
+
+      INTEGER,      INTENT(IN   )    :: ids,ide, jds,jde, kds,kde
+      INTEGER,      INTENT(IN   )    :: ims,ime, jms,jme, kms,kme
+      INTEGER,      INTENT(IN   )    :: its,ite, jts,jte, kts,kte
+      INTEGER,      INTENT(IN   )    :: spec_zone
+
+      REAL, DIMENSION( ims:ime , kms:kme, jms:jme ),  &
+            INTENT(INOUT) ::                          &
+                                                  u,  &
+                                                  v
+
+      REAL, DIMENSION( ims:ime , kms:kme, jms:jme ), &
+            INTENT(IN   ) ::                          &
+                                             ru_tend, &
+                                             rv_tend, &
+                                             ph,      &
+                                             php,     &
+                                             p,       &
+                                             pb,      &
+                                             alt,     &
+                                             al,      &
+                                             cqu,     &
+                                             cqv
+
+
+      REAL, DIMENSION( ims:ime , jms:jme ),    INTENT(IN   ) :: muu,  &
+                                                                muv,  &
+                                                                mu,   &
+                                                                mudf
+
+
+      REAL, DIMENSION( kms:kme ),              INTENT(IN   ) :: fnm,    &
+                                                                fnp ,   &
+                                                                rdnw
+
+      REAL, DIMENSION( ims:ime , jms:jme ),    INTENT(IN   ) :: msfux,  &
+                                                                msfuy,  &
+                                                                msfvx,  &
+                                                                msfvy,  &
+                                                                msfvx_inv
+
+      REAL,                                    INTENT(IN   ) :: rdx,    &
+                                                                rdy,    &
+                                                                dts,    &
+                                                                cf1,    &
+                                                                cf2,    &
+                                                                cf3,    &
+                                                                emdiv
+
+      REAL, DIMENSION( kms:kme ),INTENT(IN   ) :: c1h, c2h, c1f, c2f, &
+                                                  c3h, c4h, c3f, c4f
+
+      INTEGER :: i,j,k, i_start, i_end, j_start, j_end, k_start, k_end
+      INTEGER :: i_endu, j_endv
+      INTEGER :: i_start_up, i_end_up, j_start_up, j_end_up
+      INTEGER :: i_start_vp, i_end_vp, j_start_vp, j_end_vp
+      INTEGER :: i_start_u_tend, i_end_u_tend, j_start_v_tend, j_end_v_tend
+      INTEGER :: j_lo_v, j_hi_v
+      REAL    :: dx, dy
+
+!  set the loop bounds -- verbatim from advance_uv
+
+    IF( config_flags%nested .or. config_flags%specified ) THEN
+      i_start = max( its,ids+spec_zone )
+      i_end   = min( ite,ide-spec_zone-1 )
+      j_start = max( jts,jds+spec_zone )
+      j_end   = min( jte,jde-spec_zone-1 )
+      k_start = kts
+      k_end   = min( kte, kde-1 )
+
+      i_endu = min( ite,ide-spec_zone )
+      j_endv = min( jte,jde-spec_zone )
+
+      IF( config_flags%periodic_x) THEN
+        i_start = its
+        i_end   = min(ite,ide-1)
+        i_endu = ite
+      ENDIF
+    ELSE
+      i_start = its
+      i_end   = min(ite,ide-1)
+      j_start = jts
+      j_end   = min(jte,jde-1)
+      k_start = kts
+      k_end   = kte-1
+
+      i_endu = ite
+      j_endv = jte
+    ENDIF
+
+      i_start_up = i_start
+      i_end_up   = i_endu
+      j_start_up = j_start
+      j_end_up   = j_end
+
+      i_start_vp = i_start
+      i_end_vp   = i_end
+      j_start_vp = j_start
+      j_end_vp   = j_endv
+
+      IF ( (config_flags%open_xs   .or.     &
+            config_flags%symmetric_xs   )   &
+            .and. (its == ids) )            &
+                 i_start_up = i_start_up + 1
+
+      IF ( (config_flags%open_xe    .or.  &
+            config_flags%symmetric_xe   ) &
+             .and. (ite == ide) )         &
+                 i_end_up   = i_end_up - 1
+
+      IF ( (config_flags%open_ys    .or.   &
+            config_flags%symmetric_ys  .or.   &
+            config_flags%polar   )  &
+                     .and. (jts == jds) )  &
+                 j_start_vp = j_start_vp + 1
+
+      IF ( (config_flags%open_ye     .or. &
+            config_flags%symmetric_ye  .or.   &
+            config_flags%polar   )  &
+            .and. (jte == jde) )          &
+                 j_end_vp   = j_end_vp - 1
+
+      i_start_u_tend = i_start
+      i_end_u_tend   = i_endu
+      j_start_v_tend = j_start
+      j_end_v_tend   = j_endv
+
+      IF ( config_flags%symmetric_xs .and. (its == ids) ) &
+                     i_start_u_tend = i_start_u_tend+1
+      IF ( config_flags%symmetric_xe .and. (ite == ide) ) &
+                     i_end_u_tend = i_end_u_tend-1
+      IF ( config_flags%symmetric_ys .and. (jts == jds) ) &
+                     j_start_v_tend = j_start_v_tend+1
+      IF ( config_flags%symmetric_ye .and. (jte == jde) ) &
+                     j_end_v_tend = j_end_v_tend-1
+
+   dx = 1./rdx
+   dy = 1./rdy
+
+   CALL smallstep_fast_ensure_buffers( its, ite, jts, jte, kts, kte )
+
+!-------------------------------- u --------------------------------------
+
+!$acc parallel loop collapse(3) present(u,ru_tend)
+   DO j = j_start, j_end
+   DO k = k_start, k_end
+   DO i = i_start_u_tend, i_end_u_tend
+     u(i,k,j) = u(i,k,j) + dts*ru_tend(i,k,j)
+   ENDDO
+   ENDDO
+   ENDDO
+
+!$acc parallel loop collapse(3) present(p,pb,ph,alt,al,muu,msfux,msfuy,fast_dpxy3)
+   DO j = j_start, j_end
+   DO k = k_start, k_end
+   DO i = i_start_up, i_end_up
+     fast_dpxy3(i,k,j)= (msfux(i,j)/msfuy(i,j))*.5*rdx*muu(i,j)*(         &
+       ((ph (i,k+1,j)-ph (i-1,k+1,j))+(ph (i,k,j)-ph (i-1,k,j)))  &
+      +(alt(i,k  ,j)+alt(i-1,k  ,j))*(p  (i,k,j)-p  (i-1,k,j))  &
+      +(al (i,k  ,j)+al (i-1,k  ,j))*(pb (i,k,j)-pb (i-1,k,j)) )
+   ENDDO
+   ENDDO
+   ENDDO
+
+   IF (non_hydrostatic) THEN
+
+!$acc parallel loop collapse(2) present(p,fast_dpn3)
+      DO j = j_start, j_end
+      DO i = i_start_up, i_end_up
+        fast_dpn3(i,1,j) = .5*( cf1*(p(i,1,j)+p(i-1,1,j))  &
+                       +cf2*(p(i,2,j)+p(i-1,2,j))  &
+                       +cf3*(p(i,3,j)+p(i-1,3,j)) )
+        fast_dpn3(i,kde,j) = 0.
+      ENDDO
+      ENDDO
+
+      IF (top_lid) THEN
+!$acc parallel loop collapse(2) present(p,fast_dpn3)
+        DO j = j_start, j_end
+        DO i = i_start_up, i_end_up
+          fast_dpn3(i,kde,j) =.5*( cf1*(p(i-1,kde-1,j)+p(i,kde-1,j))   &
+                          +cf2*(p(i-1,kde-2,j)+p(i,kde-2,j))   &
+                          +cf3*(p(i-1,kde-3,j)+p(i,kde-3,j))  )
+        ENDDO
+        ENDDO
+      ENDIF
+
+!$acc parallel loop collapse(3) present(p,fnm,fnp,fast_dpn3)
+      DO j = j_start, j_end
+      DO k = k_start+1, k_end
+      DO i = i_start_up, i_end_up
+        fast_dpn3(i,k,j) = .5*( fnm(k)*(p(i,k  ,j)+p(i-1,k  ,j))   &
+                       +fnp(k)*(p(i,k-1,j)+p(i-1,k-1,j)) )
+      ENDDO
+      ENDDO
+      ENDDO
+
+!$acc parallel loop collapse(3) present(php,mu,msfux,msfuy,rdnw,fast_dpn3,fast_dpxy3)
+      DO j = j_start, j_end
+      DO k = k_start, k_end
+      DO i = i_start_up, i_end_up
+        fast_dpxy3(i,k,j)=fast_dpxy3(i,k,j) + (msfux(i,j)/msfuy(i,j))*rdx*(php(i,k,j)-php(i-1,k,j))*        &
+            (rdnw(k)*(fast_dpn3(i,k+1,j)-fast_dpn3(i,k,j))-.5*(mu(i-1,j)+mu(i,j)))
+      ENDDO
+      ENDDO
+      ENDDO
+
+   END IF
+
+!$acc parallel loop collapse(3) present(u,cqu,fast_dpxy3,mudf,msfuy)
+   DO j = j_start, j_end
+   DO k = k_start, k_end
+   DO i = i_start_up, i_end_up
+     u(i,k,j)=u(i,k,j)-dts*cqu(i,k,j)*fast_dpxy3(i,k,j) &
+              -emdiv*dx*(mudf(i,j)-mudf(i-1,j))/msfuy(i,j)
+   ENDDO
+   ENDDO
+   ENDDO
+
+!-------------------------------- v --------------------------------------
+
+!$acc parallel loop collapse(3) present(v,rv_tend)
+   DO j = j_start_v_tend, j_end_v_tend
+   DO k = k_start, k_end
+   DO i = i_start, i_end
+     v(i,k,j) = v(i,k,j) + dts*rv_tend(i,k,j)
+   ENDDO
+   ENDDO
+   ENDDO
+
+   j_lo_v = MAX(j_start_v_tend, j_start_vp)
+   j_hi_v = MIN(j_end_v_tend,   j_end_vp)
+
+   IF ( j_hi_v .GE. j_lo_v ) THEN
+
+!$acc parallel loop collapse(3) present(ph,alt,al,p,pb,muv,msfvx,msfvy,fast_dpxy3)
+      DO j = j_lo_v, j_hi_v
+      DO k = k_start, k_end
+      DO i = i_start, i_end
+        fast_dpxy3(i,k,j)= (msfvy(i,j)/msfvx(i,j))*.5*rdy*muv(i,j)*(       &
+         ((ph(i,k+1,j)-ph(i,k+1,j-1))+(ph (i,k,j)-ph (i,k,j-1)))   &
+         +(alt(i,k  ,j)+alt(i,k  ,j-1))*(p  (i,k,j)-p  (i,k,j-1))  &
+         +(al (i,k  ,j)+al (i,k  ,j-1))*(pb (i,k,j)-pb (i,k,j-1)) )
+      ENDDO
+      ENDDO
+      ENDDO
+
+      IF (non_hydrostatic) THEN
+
+!$acc parallel loop collapse(2) present(p,fast_dpn3)
+        DO j = j_lo_v, j_hi_v
+        DO i = i_start, i_end
+          fast_dpn3(i,1,j) = .5*( cf1*(p(i,1,j)+p(i,1,j-1))  &
+                         +cf2*(p(i,2,j)+p(i,2,j-1))  &
+                         +cf3*(p(i,3,j)+p(i,3,j-1)) )
+          fast_dpn3(i,kde,j) = 0.
+        ENDDO
+        ENDDO
+
+        IF (top_lid) THEN
+!$acc parallel loop collapse(2) present(p,fast_dpn3)
+          DO j = j_lo_v, j_hi_v
+          DO i = i_start, i_end
+            fast_dpn3(i,kde,j) =.5*( cf1*(p(i,kde-1,j-1)+p(i,kde-1,j))   &
+                            +cf2*(p(i,kde-2,j-1)+p(i,kde-2,j))   &
+                            +cf3*(p(i,kde-3,j-1)+p(i,kde-3,j))  )
+          ENDDO
+          ENDDO
+        ENDIF
+
+!$acc parallel loop collapse(3) present(p,fnm,fnp,fast_dpn3)
+        DO j = j_lo_v, j_hi_v
+        DO k = k_start+1, k_end
+        DO i = i_start, i_end
+          fast_dpn3(i,k,j) = .5*( fnm(k)*(p(i,k  ,j)+p(i,k  ,j-1))  &
+                         +fnp(k)*(p(i,k-1,j)+p(i,k-1,j-1)) )
+        ENDDO
+        ENDDO
+        ENDDO
+
+!$acc parallel loop collapse(3) present(php,mu,msfvx,msfvy,rdnw,fast_dpn3,fast_dpxy3)
+        DO j = j_lo_v, j_hi_v
+        DO k = k_start, k_end
+        DO i = i_start, i_end
+          fast_dpxy3(i,k,j)=fast_dpxy3(i,k,j) + (msfvy(i,j)/msfvx(i,j))*rdy*(php(i,k,j)-php(i,k,j-1))*    &
+            (rdnw(k)*(fast_dpn3(i,k+1,j)-fast_dpn3(i,k,j))-.5*(mu(i,j-1)+mu(i,j)))
+        ENDDO
+        ENDDO
+        ENDDO
+
+      END IF
+
+!$acc parallel loop collapse(3) present(v,cqv,fast_dpxy3,mudf,msfvx_inv)
+      DO j = j_lo_v, j_hi_v
+      DO k = k_start, k_end
+      DO i = i_start, i_end
+        v(i,k,j)=v(i,k,j)-dts*cqv(i,k,j)*fast_dpxy3(i,k,j) &
+                 -emdiv*dy*(mudf(i,j)-mudf(i,j-1))*msfvx_inv(i,j)
+      ENDDO
+      ENDDO
+      ENDDO
+
+   ENDIF
+
+  IF (config_flags%polar) THEN
+!$acc update self(u,v)
+  END IF
+
+  IF (config_flags%polar) THEN
+     IF (jts == jds) THEN
+        DO k = k_start, k_end
+        DO i = i_start, i_end
+           v(i,k,jds) = 0.
+        ENDDO
+        ENDDO
+     END IF
+     IF (jte == jde) THEN
+        DO k = k_start, k_end
+        DO i = i_start, i_end
+           v(i,k,jde) = 0.
+        ENDDO
+        ENDDO
+     END IF
+  END IF
+
+  IF (config_flags%polar) THEN
+!$acc update device(u,v)
+  END IF
+
+END SUBROUTINE advance_uv_fast
+#endif
 
 !---------------------------------------------------------------------
 
+#ifdef WRF_GPU_DYN_CPU_MU
+#ifdef WRF_GPU_DYN
+#undef WRF_GPU_DYN
+#define WRF_GPU_DYN_RESTORE_AFTER_MU
+#endif
+#endif
 SUBROUTINE advance_mu_t( ww, ww_1, u, u_1, v, v_1,            &
                          mu, mut, muave, muts, muu, muv, mudf,&
                          c1h, c2h, c1f, c2f,                  &
@@ -1327,8 +1871,18 @@ SUBROUTINE advance_mu_t( ww, ww_1, u, u_1, v, v_1,            &
   j_endv = jte
 
 !        CALCULATION OF WW (dETA/dt)
+#ifdef WRF_GPU_DYN
+!$acc data present(ww,ww_1,u,u_1,v,v_1,mu,mut,muave,muts,muu,muv,mudf, &
+!$acc& uam,vam,wwam,t,t_1,t_ave,ft,mu_tend,dnw,fnm,fnp,rdnw,msfux,msfuy, &
+!$acc& msfvx,msfvx_inv,msfvy,msftx,msfty) create(wdtn,dvdxi,dmdt)
+!$acc parallel private(i,j,k,kk)
+!$acc loop seq
+#endif
    DO j = j_start, j_end
 
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
      DO i=i_start, i_end
             DMDT(i) = 0.
      ENDDO
@@ -1354,8 +1908,13 @@ SUBROUTINE advance_mu_t( ww, ww_1, u, u_1, v, v_1,            &
 !
 !  [don't divide the below by msfty until find ww, since dmdt is used in
 !   the meantime]
-
+#ifdef WRF_GPU_DYN
+!$acc loop seq
+#endif
      DO k=k_start, k_end
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
      DO i=i_start, i_end
          dvdxi(i,k) = msftx(i,j)*msfty(i,j)*(                                      &
                      rdy*( (v(i,k,j+1)+muv(i,j+1)*v_1(i,k,j+1)*msfvx_inv(i,j+1))   &
@@ -1365,6 +1924,9 @@ SUBROUTINE advance_mu_t( ww, ww_1, u, u_1, v, v_1,            &
         DMDT(i)    = DMDT(i) + dnw(k)*dvdxi(i,k)
      ENDDO
      ENDDO
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
      DO i=i_start, i_end
        MUAVE(i,j) = MU(i,j)
        MU(i,j) = MU(i,j)+dts*(DMDT(i)+MU_TEND(i,j))
@@ -1372,9 +1934,14 @@ SUBROUTINE advance_mu_t( ww, ww_1, u, u_1, v, v_1,            &
        MUTS(i,j) = MUT(i,j)+MU(i,j)
        MUAVE(i,j) =.5*((1.+epssm)*MU(i,j)+(1.-epssm)*MUAVE(i,j))
      ENDDO
-
+#ifdef WRF_GPU_DYN
+!$acc loop seq
+#endif
      DO kk=2,k_end
      k=kk-1
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
      DO i=i_start, i_end
        ww(i,kk,j)=ww(i,kk-1,j)-dnw(kk-1)*(dmdt(i)+dvdxi(i,kk-1)+mu_tend(i,j))/msfty(i,j)
      ENDDO
@@ -1382,8 +1949,13 @@ SUBROUTINE advance_mu_t( ww, ww_1, u, u_1, v, v_1,            &
 
 !  NOTE:  ww_1 (large timestep ww) is already coupled with the 
 !         map scale factor
-
+#ifdef WRF_GPU_DYN
+!$acc loop seq
+#endif
      DO k=1,k_end
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
      DO i=i_start, i_end
        ww(i,k,j)=ww(i,k,j)-ww_1(i,k,j)
      END DO
@@ -1408,24 +1980,42 @@ SUBROUTINE advance_mu_t( ww, ww_1, u, u_1, v, v_1,            &
 ! adding previous tendency contribution which was map scale factor coupled
 ! (had been divided by msfty)
 ! need to uncouple before updating uncoupled Theta (by adding)
-
+#ifdef WRF_GPU_DYN
+!$acc loop seq
+#endif
    DO j=j_start, j_end
+#ifdef WRF_GPU_DYN
+!$acc loop seq
+#endif
      DO k=1,k_end
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
      DO i=i_start, i_end
        t_ave(i,k,j) = t(i,k,j)
        t   (i,k,j) = t(i,k,j) + msfty(i,j)*dts*ft(i,k,j)
      END DO
      END DO
    ENDDO   
-
+#ifdef WRF_GPU_DYN
+!$acc loop seq
+#endif
    DO j=j_start, j_end
 
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
      DO i=i_start, i_end
        wdtn(i,1  )=0.
        wdtn(i,kde)=0.
      ENDDO
-
+#ifdef WRF_GPU_DYN
+!$acc loop seq
+#endif
      DO k=2,k_end
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
      DO i=i_start, i_end
         ! for scalar eqn RHS term 3
         wdtn(i,k)= ww(i,k,j)*(fnm(k)*t_1(i,k  ,j)+fnp(k)*t_1(i,k-1,j))
@@ -1434,8 +2024,13 @@ SUBROUTINE advance_mu_t( ww, ww_1, u, u_1, v, v_1,            &
 
 ! scalar eqn, RHS terms 1, 2 and 3
 ! multiply by msfty to uncouple result for Theta from map scale factor
-
+#ifdef WRF_GPU_DYN
+!$acc loop seq
+#endif
      DO k=1,k_end
+#ifdef WRF_GPU_DYN
+!$acc loop vector
+#endif
      DO i=i_start, i_end
        ! multiplication by msfty uncouples result for Theta
        t(i,k,j) = t(i,k,j) - dts*msfty(i,j)*(              &
@@ -1452,13 +2047,247 @@ SUBROUTINE advance_mu_t( ww, ww_1, u, u_1, v, v_1,            &
      ENDDO
 
    ENDDO
+#ifdef WRF_GPU_DYN
+!$acc end parallel
+!$acc end data
+#endif
 
+#ifdef WRF_GPU_DYN_RESTORE_AFTER_MU
+#define WRF_GPU_DYN
+#undef WRF_GPU_DYN_RESTORE_AFTER_MU
+#endif
 END SUBROUTINE advance_mu_t
-          
 
+#ifdef WRF_GPU_DYN
+!------------------------------------------------------------
+!  Fast multi-gang path for advance_mu_t (see plan.md "Restructuring
+!  strategy"). dvdxi/wdtn have no cross-j dependency (same reused-scratch
+!  situation as advance_uv) and are promoted to 3-D buffers with no further
+!  change in semantics. dmdt IS a genuine reduction over k for fixed (i,j) --
+!  computed in its own gang/vector kernel with a private per-thread
+!  accumulator. The ww column update is a genuine k-recurrence
+!  (ww(i,kk,j) depends on ww(i,kk-1,j) computed earlier in the SAME sweep)
+!  and keeps the proven "parallel loop gang" + plain DO k (sequential per
+!  gang) + "loop vector" pattern already used by calc_p_rho's hydrostatic
+!  branch elsewhere in this file. Applicable unconditionally.
+SUBROUTINE advance_mu_t_fast( ww, ww_1, u, u_1, v, v_1,       &
+                         mu, mut, muave, muts, muu, muv, mudf,&
+                         c1h, c2h, c1f, c2f,                  &
+                         c3h, c4h, c3f, c4f,                  &
+                         uam, vam, wwam, t, t_1,              &
+                         t_ave, ft, mu_tend,                  &
+                         rdx, rdy, dts, epssm,                &
+                         dnw, fnm, fnp, rdnw,                 &
+                         msfux, msfuy, msfvx, msfvx_inv,      &
+                         msfvy, msftx, msfty,                 &
+                         step, config_flags,                  &
+                         ids, ide, jds, jde, kds, kde,        &
+                         ims, ime, jms, jme, kms, kme,        &
+                         its, ite, jts, jte, kts, kte        )
+
+  IMPLICIT NONE
+
+  TYPE(grid_config_rec_type), INTENT(IN   ) :: config_flags
+
+  INTEGER,      INTENT(IN   )    :: ids,ide, jds,jde, kds,kde
+  INTEGER,      INTENT(IN   )    :: ims,ime, jms,jme, kms,kme
+  INTEGER,      INTENT(IN   )    :: its,ite, jts,jte, kts,kte
+
+  INTEGER,      INTENT(IN   )    :: step
+
+  REAL, DIMENSION( ims:ime , kms:kme, jms:jme ),   &
+            INTENT(IN   ) ::                       &
+                                              u,   &
+                                              v,   &
+                                              u_1, &
+                                              v_1, &
+                                              t_1, &
+                                              ft
+
+  REAL, DIMENSION( ims:ime , kms:kme, jms:jme ),      &
+            INTENT(INOUT) ::                          &
+                                              ww,     &
+                                              ww_1,   &
+                                              t,      &
+                                              t_ave,  &
+                                              uam,    &
+                                              vam,    &
+                                              wwam
+
+  REAL, DIMENSION( ims:ime , jms:jme ),    INTENT(IN   ) :: muu,  &
+                                                            muv,  &
+                                                            mut,  &
+                                                            msfux,&
+                                                            msfuy,&
+                                                            msfvx,&
+                                                            msfvx_inv,&
+                                                            msfvy,&
+                                                            msftx,&
+                                                            msfty,&
+                                                            mu_tend
+
+  REAL, DIMENSION( ims:ime , jms:jme ),    INTENT(  OUT) :: muave, &
+                                                            muts,  &
+                                                            mudf
+
+  REAL, DIMENSION( ims:ime , jms:jme ),    INTENT(INOUT) :: mu
+
+  REAL, DIMENSION( kms:kme ),              INTENT(IN   ) :: fnm,    &
+                                                            fnp,    &
+                                                            dnw,    &
+                                                            rdnw
+
+
+  REAL,                                    INTENT(IN   ) :: rdx,    &
+                                                            rdy,    &
+                                                            dts,    &
+                                                            epssm
+
+  REAL, DIMENSION( kms:kme ),INTENT(IN   ) :: c1h, c2h, c1f, c2f, &
+                                              c3h, c4h, c3f, c4f
+
+  INTEGER :: i, j, k, kk, i_start, i_end, j_start, j_end, k_start, k_end
+  INTEGER :: i_endu, j_endv
+
+!  set the loop bounds -- verbatim from advance_mu_t
+
+  i_start = its
+  i_end   = min(ite,ide-1)
+  j_start = jts
+  j_end   = min(jte,jde-1)
+  k_start = kts
+  k_end   = kte-1
+  IF ( .NOT. config_flags%periodic_x )THEN
+     IF ( config_flags%specified .or. config_flags%nested ) then
+       i_start = max(its,ids+1)
+       i_end   = min(ite,ide-2)
+     ENDIF
+  ENDIF
+  IF ( config_flags%specified .or. config_flags%nested ) then
+     j_start = max(jts,jds+1)
+     j_end   = min(jte,jde-2)
+  ENDIF
+
+  i_endu = ite
+  j_endv = jte
+
+  CALL smallstep_fast_ensure_buffers( its, ite, jts, jte, kts, kte )
+
+!        CALCULATION OF WW (dETA/dt)
+
+!$acc parallel loop collapse(3) present(v,u,muv,v_1,msfvx_inv,muu,u_1,msfuy,msftx,msfty,fast_dvdxi3)
+   DO j = j_start, j_end
+   DO k = k_start, k_end
+   DO i = i_start, i_end
+       fast_dvdxi3(i,k,j) = msftx(i,j)*msfty(i,j)*(                                    &
+                   rdy*( (v(i,k,j+1)+muv(i,j+1)*v_1(i,k,j+1)*msfvx_inv(i,j+1))   &
+                        -(v(i,k,j  )+muv(i,j  )*v_1(i,k,j  )*msfvx_inv(i,j  )) ) &
+                  +rdx*( (u(i+1,k,j)+muu(i+1,j)*u_1(i+1,k,j)/msfuy(i+1,j))       &
+                        -(u(i,k,j  )+muu(i  ,j)*u_1(i,k,j  )/msfuy(i  ,j)) ))
+   ENDDO
+   ENDDO
+   ENDDO
+
+!$acc parallel loop collapse(2) private(k) present(dnw,fast_dvdxi3,fast_dmdt2)
+   DO j = j_start, j_end
+   DO i = i_start, i_end
+     fast_dmdt2(i,j) = 0.
+     DO k = k_start, k_end
+       fast_dmdt2(i,j) = fast_dmdt2(i,j) + dnw(k)*fast_dvdxi3(i,k,j)
+     ENDDO
+   ENDDO
+   ENDDO
+
+!$acc parallel loop collapse(2) present(mu,mu_tend,mut,fast_dmdt2,muave,mudf,muts)
+   DO j = j_start, j_end
+   DO i = i_start, i_end
+       MUAVE(i,j) = MU(i,j)
+       MU(i,j) = MU(i,j)+dts*(fast_dmdt2(i,j)+MU_TEND(i,j))
+       MUDF(i,j) = (fast_dmdt2(i,j)+MU_TEND(i,j))
+       MUTS(i,j) = MUT(i,j)+MU(i,j)
+       MUAVE(i,j) =.5*((1.+epssm)*MU(i,j)+(1.-epssm)*MUAVE(i,j))
+   ENDDO
+   ENDDO
+
+!  ww column recurrence -- genuine k-dependence, kept sequential per column
+
+!$acc parallel loop gang present(ww,fast_dmdt2,fast_dvdxi3,mu_tend,dnw,msfty)
+   DO j = j_start, j_end
+     DO kk=2,k_end
+     k=kk-1
+!$acc loop vector
+     DO i=i_start, i_end
+       ww(i,kk,j)=ww(i,kk-1,j)-dnw(kk-1)*(fast_dmdt2(i,j)+fast_dvdxi3(i,kk-1,j)+mu_tend(i,j))/msfty(i,j)
+     ENDDO
+     END DO
+   ENDDO
+
+!$acc parallel loop collapse(3) present(ww,ww_1)
+   DO j = j_start, j_end
+   DO k=1,k_end
+   DO i=i_start, i_end
+     ww(i,k,j)=ww(i,k,j)-ww_1(i,k,j)
+   END DO
+   END DO
+   ENDDO
+
+! CALCULATION OF THETA
+
+!$acc parallel loop collapse(3) present(t,t_ave,ft,msfty)
+   DO j=j_start, j_end
+     DO k=1,k_end
+     DO i=i_start, i_end
+       t_ave(i,k,j) = t(i,k,j)
+       t   (i,k,j) = t(i,k,j) + msfty(i,j)*dts*ft(i,k,j)
+     END DO
+     END DO
+   ENDDO
+
+!$acc parallel loop collapse(2) present(fast_wdtn3)
+   DO j=j_start, j_end
+     DO i=i_start, i_end
+       fast_wdtn3(i,1,j)  =0.
+       fast_wdtn3(i,kde,j)=0.
+     ENDDO
+   ENDDO
+
+!$acc parallel loop collapse(3) present(ww,t_1,fnm,fnp,fast_wdtn3)
+   DO j=j_start, j_end
+     DO k=2,k_end
+     DO i=i_start, i_end
+        fast_wdtn3(i,k,j)= ww(i,k,j)*(fnm(k)*t_1(i,k  ,j)+fnp(k)*t_1(i,k-1,j))
+     ENDDO
+     ENDDO
+   ENDDO
+
+!$acc parallel loop collapse(3) present(t,msfty,msftx,v,t_1,u,rdnw,fast_wdtn3)
+   DO j=j_start, j_end
+     DO k=1,k_end
+     DO i=i_start, i_end
+       t(i,k,j) = t(i,k,j) - dts*msfty(i,j)*(              &
+                          msftx(i,j)*(                     &
+               .5*rdy*                                     &
+              ( v(i,k,j+1)*(t_1(i,k,j+1)+t_1(i,k, j ))     &
+               -v(i,k,j  )*(t_1(i,k, j )+t_1(i,k,j-1)) )   &
+             + .5*rdx*                                     &
+              ( u(i+1,k,j)*(t_1(i+1,k,j)+t_1(i  ,k,j))     &
+               -u(i  ,k,j)*(t_1(i  ,k,j)+t_1(i-1,k,j)) ) ) &
+             + rdnw(k)*( fast_wdtn3(i,k+1,j)-fast_wdtn3(i,k,j) ) )
+     ENDDO
+     ENDDO
+   ENDDO
+
+END SUBROUTINE advance_mu_t_fast
+#endif
 
 !------------------------------------------------------------
 
+#ifdef WRF_GPU_DYN_CPU_W
+#ifdef WRF_GPU_DYN
+#undef WRF_GPU_DYN
+#define WRF_GPU_DYN_RESTORE_AFTER_W
+#endif
+#endif
 SUBROUTINE advance_w( w, rw_tend, ww, w_save, u, v,  &
                       mu1, mut, muave, muts,      &
                       c1h, c2h, c1f, c2f,         &
@@ -1842,7 +2671,313 @@ SUBROUTINE advance_w( w, rw_tend, ww, w_save, u, v,  &
 !$acc end data
 #endif
 
+#ifdef WRF_GPU_DYN_RESTORE_AFTER_W
+#define WRF_GPU_DYN
+#undef WRF_GPU_DYN_RESTORE_AFTER_W
+#endif
 END SUBROUTINE advance_w
+
+#ifdef WRF_GPU_DYN
+!---------------------------------------------------------------------
+!  Fast multi-gang path for advance_w (see plan.md "Restructuring
+!  strategy"). rhs/wdwn/msft_inv have no cross-j dependency and are
+!  promoted to 3-D (2-D for msft_inv) buffers exactly as in advance_uv_fast/
+!  advance_mu_t_fast. This subroutine has TWO genuine k-recurrences -- the
+!  forward and backward sweeps of the implicit (Thomas-algorithm) vertical
+!  solve for w -- each kept sequential per column using the same
+!  "parallel loop gang" + plain DO k + "loop vector" pattern as
+!  advance_mu_t_fast's ww column update. The two "backwards" loops that
+!  are NOT recurrences (damping and final ph update, which only read
+!  already-final values of w) are collapse(3)-able despite counting down,
+!  since Fortran DO direction has no bearing on OpenACC dependence analysis
+!  once there is no genuine cross-index read of the same array being written.
+!  Applicable unconditionally.
+SUBROUTINE advance_w_fast( w, rw_tend, ww, w_save, u, v,  &
+                      mu1, mut, muave, muts,      &
+                      c1h, c2h, c1f, c2f,         &
+                      c3h, c4h, c3f, c4f,         &
+                      t_2ave, t_2, t_1,           &
+                      ph, ph_1, phb, ph_tend,     &
+                      ht, c2a, cqw, alt, alb,     &
+                      a, alpha, gamma,            &
+                      rdx, rdy, dts, t0, epssm,   &
+                      dnw, fnm, fnp, rdnw, rdn,   &
+                      cf1, cf2, cf3, msftx, msfty,&
+                      config_flags, top_lid,      &
+                      ids,ide, jds,jde, kds,kde,  &
+                      ims,ime, jms,jme, kms,kme,  &
+                      its,ite, jts,jte, kts,kte  )
+
+  IMPLICIT NONE
+
+  TYPE(grid_config_rec_type), INTENT(IN   ) :: config_flags
+
+  INTEGER,      INTENT(IN   )    :: ids,ide, jds,jde, kds,kde
+  INTEGER,      INTENT(IN   )    :: ims,ime, jms,jme, kms,kme
+  INTEGER,      INTENT(IN   )    :: its,ite, jts,jte, kts,kte
+
+  LOGICAL,      INTENT(IN   )    :: top_lid
+
+      REAL, DIMENSION( ims:ime , kms:kme , jms:jme ), &
+            INTENT(INOUT) ::                          &
+                                             t_2ave,  &
+                                             w,       &
+                                             ph
+
+      REAL, DIMENSION(  ims:ime , kms:kme, jms:jme ), &
+            INTENT(IN   ) ::                          &
+                                             rw_tend, &
+                                             ww,      &
+                                             w_save,  &
+                                             u,       &
+                                             v,       &
+                                             t_2,     &
+                                             t_1,     &
+                                             ph_1,    &
+                                             phb,     &
+                                             ph_tend, &
+                                             alpha,   &
+                                             gamma,   &
+                                             a,       &
+                                             c2a,     &
+                                             cqw,     &
+                                             alb,     &
+                                             alt
+
+      REAL, DIMENSION( ims:ime , jms:jme ), &
+            INTENT(IN   )  ::               &
+                                   mu1,     &
+                                   mut,     &
+                                   muave,   &
+                                   muts,    &
+                                   ht,      &
+                                   msftx,   &
+                                   msfty
+
+      REAL, DIMENSION( kms:kme ),  INTENT(IN   )  :: fnp,     &
+                                                     fnm,     &
+                                                     rdnw,    &
+                                                     rdn,     &
+                                                     dnw
+
+      REAL,   INTENT(IN   )  :: rdx,     &
+                                rdy,     &
+                                dts,     &
+                                cf1,     &
+                                cf2,     &
+                                cf3,     &
+                                t0,      &
+                                epssm
+
+      REAL, DIMENSION( kms:kme ),INTENT(IN   ) :: c1h, c2h, c1f, c2f, &
+                                                  c3h, c4h, c3f, c4f
+
+      INTEGER :: i,j,k, i_start, i_end, j_start, j_end, k_start, k_end
+      real :: dampwt, htop, hbot, hdepth, hk
+      real    :: pi,dampmag
+      logical :: damp_enabled
+      REAL :: muthk, muthkm1
+
+!  set loop limits -- verbatim from advance_w
+
+      i_start = its
+      i_end   = min(ite,ide-1)
+      j_start = jts
+      j_end   = min(jte,jde-1)
+      k_start = kts
+      k_end   = kte-1
+      IF ( .NOT. config_flags%periodic_x )THEN
+         IF ( config_flags%specified .or. config_flags%nested ) then
+           i_start = max(its,ids+1)
+           i_end   = min(ite,ide-2)
+         ENDIF
+      ENDIF
+      IF ( config_flags%specified .or. config_flags%nested ) then
+         j_start = max(jts,jds+1)
+         j_end   = min(jte,jde-2)
+      ENDIF
+
+   pi = 4.*atan(1.)
+   dampmag = dts*config_flags%dampcoef
+   hdepth=config_flags%zdamp
+   damp_enabled = config_flags%damp_opt .eq. 3
+
+   CALL smallstep_fast_ensure_buffers( its, ite, jts, jte, kts, kte )
+
+!$acc parallel loop collapse(2) present(fast_rhs3)
+    DO j = j_start, j_end
+    DO i=i_start, i_end
+      fast_rhs3(i,1,j) = 0.
+    ENDDO
+    ENDDO
+
+!$acc parallel loop collapse(2) present(msfty,fast_msft_inv2)
+    DO j = j_start, j_end
+    DO i=i_start, i_end
+       fast_msft_inv2(i,j) = 1./msfty(i,j)
+    ENDDO
+    ENDDO
+
+!$acc parallel loop collapse(3) present(t_2ave,t_2,muave,muts,t_1,ww,rdnw,ph_1,phb,ph_tend,fast_wdwn3,fast_rhs3)
+    DO j = j_start, j_end
+    DO k=1, k_end
+    DO i=i_start, i_end
+      t_2ave(i,k,j)=.5*((1.+epssm)*t_2(i,k,j)       &
+                    +(1.-epssm)*t_2ave(i,k,j))
+      t_2ave(i,k,j)=(t_2ave(i,k,j) + Muave(i,j)*t0) &
+                    /(Muts(i,j)*(t0+t_1(i,k,j)))
+      fast_wdwn3(i,k+1,j)=.5*(ww(i,k+1,j)+ww(i,k,j))*rdnw(k)    &
+           *(ph_1(i,k+1,j)-ph_1(i,k,j)+phb(i,k+1,j)-phb(i,k,j))
+      fast_rhs3(i,k+1,j) = dts*(ph_tend(i,k+1,j) + .5*g*(1.-epssm)*w(i,k+1,j))
+    ENDDO
+    ENDDO
+    ENDDO
+
+!$acc parallel loop collapse(3) present(fnm,fnp,fast_wdwn3,fast_rhs3)
+    DO j = j_start, j_end
+    DO k=2,k_end
+    DO i=i_start, i_end
+       fast_rhs3(i,k,j) = fast_rhs3(i,k,j)-dts*( fnm(k)*fast_wdwn3(i,k+1,j)  &
+                                +fnp(k)*fast_wdwn3(i,k  ,j) )
+    ENDDO
+    ENDDO
+    ENDDO
+
+!$acc parallel loop collapse(3) present(ph,msfty,mut,fast_rhs3)
+    DO j = j_start, j_end
+    DO k=2,k_end+1
+    DO i=i_start, i_end
+      fast_rhs3(i,k,j) = ph(i,k,j) + msfty(i,j)*fast_rhs3(i,k,j)/mut(i,j)
+      if(top_lid .and. k.eq.k_end+1) fast_rhs3(i,k,j)=0.
+    ENDDO
+    ENDDO
+    ENDDO
+
+!  lower boundary condition on w
+
+!$acc parallel loop collapse(2) present(w,msfty,msftx,ht,v,u)
+    DO j = j_start, j_end
+    DO i=i_start, i_end
+       w(i,1,j)=                                           &
+
+                msfty(i,j)*.5*rdy*(                        &
+                         (ht(i,j+1)-ht(i,j  ))             &
+        *(cf1*v(i,1,j+1)+cf2*v(i,2,j+1)+cf3*v(i,3,j+1))    &
+                        +(ht(i,j  )-ht(i,j-1))             &
+        *(cf1*v(i,1,j  )+cf2*v(i,2,j  )+cf3*v(i,3,j  ))  ) &
+
+               +msftx(i,j)*.5*rdx*(                        &
+                         (ht(i+1,j)-ht(i,j  ))             &
+        *(cf1*u(i+1,1,j)+cf2*u(i+1,2,j)+cf3*u(i+1,3,j))    &
+                        +(ht(i,j  )-ht(i-1,j))             &
+        *(cf1*u(i  ,1,j)+cf2*u(i  ,2,j)+cf3*u(i  ,3,j))  )
+
+    ENDDO
+    ENDDO
+
+!   above surface, begin by adding delta t * previous (coupled) w tendency
+
+!$acc parallel loop collapse(3) private(muthk,muthkm1) &
+!$acc& present(w,rw_tend,fast_msft_inv2,cqw,rdn,c2a,rdnw,fast_rhs3,ph,alt,t_2ave,muave,mut)
+    DO j = j_start, j_end
+    DO k=2,k_end
+      DO i=i_start, i_end
+#if ! ( HYBRID_COORD==1 )
+        MUTHK   = mut(i,j)
+        MUTHKM1 = mut(i,j)
+#endif
+
+        w(i,k,j)=w(i,k,j)+dts*rw_tend(i,k,j)                       &
+                 + fast_msft_inv2(i,j)*cqw(i,k,j)*(                        &
+            +.5*dts*g*rdn(k)*                                      &
+             (c2a(i,k  ,j)*rdnw(k  )/MUTHK                         &
+        *((1.+epssm)*(fast_rhs3(i,k+1,j)-fast_rhs3(i,k    ,j))                   &
+         +(1.-epssm)*(ph(i,k+1,j)-ph(i,k  ,j)))                    &
+             -c2a(i,k-1,j)*rdnw(k-1)/MUTHKM1                       &
+        *((1.+epssm)*(fast_rhs3(i,k,j)-fast_rhs3(i,k-1,j))                   &
+         +(1.-epssm)*(ph(i,k  ,j)-ph(i,k-1,j)))))                    &
+
+                +dts*g*fast_msft_inv2(i,j)*(rdn(k)*                        &
+             (c2a(i,k  ,j)*alt(i,k  ,j)*t_2ave(i,k  ,j)            &
+             -c2a(i,k-1,j)*alt(i,k-1,j)*t_2ave(i,k-1,j))           &
+              - muave(i,j))
+      ENDDO
+    ENDDO
+    ENDDO
+
+!$acc parallel loop collapse(2) private(muthkm1) &
+!$acc& present(w,rw_tend,fast_msft_inv2,rdnw,c2a,fast_rhs3,ph,alt,t_2ave,muave,mut)
+    DO j = j_start, j_end
+    DO i=i_start, i_end
+#if ! ( HYBRID_COORD==1 )
+       MUTHKM1 = mut(i,j)
+#endif
+       w(i,k_end+1,j)=w(i,k_end+1,j)+dts*rw_tend(i,k_end+1,j)                         &
+           +fast_msft_inv2(i,j)*(                                        &
+         -.5*dts*g/MUTHKM1*rdnw(k_end)**2*2.*c2a(i,k_end,j)            &
+             *((1.+epssm)*(fast_rhs3(i,k_end+1,j)-fast_rhs3(i,k_end  ,j))                 &
+              +(1.-epssm)*(ph(i,k_end+1,j)-ph(i,k_end,j)))                  &
+         -dts*g*(2.*rdnw(k_end)*                                      &
+                   c2a(i,k_end,j)*alt(i,k_end,j)*t_2ave(i,k_end,j)        &
+              + muave(i,j)) )
+       if(top_lid) w(i,k_end+1,j) = 0.
+    ENDDO
+    ENDDO
+
+!  forward sweep of the implicit vertical solve -- genuine k-recurrence
+
+!$acc parallel loop gang present(w,a,alpha)
+    DO j = j_start, j_end
+      DO k=2,k_end+1
+!$acc loop vector
+      DO i=i_start, i_end
+        w(i,k,j)=(w(i,k,j)-a(i,k,j)*w(i,k-1,j))*alpha(i,k,j)
+      ENDDO
+      ENDDO
+    ENDDO
+
+!  backward sweep of the implicit vertical solve -- genuine k-recurrence
+
+!$acc parallel loop gang present(w,gamma)
+    DO j = j_start, j_end
+      DO k=k_end,2,-1
+!$acc loop vector
+      DO i=i_start, i_end
+        w (i,k,j)=w (i,k,j)-gamma(i,k,j)*w(i,k+1,j)
+      ENDDO
+      ENDDO
+    ENDDO
+
+    IF (damp_enabled) THEN
+!$acc parallel loop collapse(3) private(htop,hk,hbot,dampwt) present(ph_1,phb,w,mut,w_save)
+      DO j = j_start, j_end
+      DO k=2,k_end+1
+      DO i=i_start, i_end
+          htop=(ph_1(i,k_end+1,j)+phb(i,k_end+1,j))/g
+          hk=(ph_1(i,k,j)+phb(i,k,j))/g
+          hbot=htop-hdepth
+          dampwt = 0.
+          if(hk .ge. hbot)then
+            dampwt = dampmag*sin(0.5*pi*(hk-hbot)/hdepth)*sin(0.5*pi*(hk-hbot)/hdepth)
+          endif
+          w(i,k,j) = (w(i,k,j) - dampwt*mut(i,j)*w_save(i,k,j))/(1.+dampwt)
+      ENDDO
+      ENDDO
+      ENDDO
+    ENDIF
+
+!$acc parallel loop collapse(3) present(ph,fast_rhs3,msfty,w,muts)
+    DO j = j_start, j_end
+    DO k=2,k_end+1
+    DO i=i_start, i_end
+       ph(i,k,j) = fast_rhs3(i,k,j)+msfty(i,j)*.5*dts*g*(1.+epssm) &
+                      *w(i,k,j)/muts(i,j)
+    ENDDO
+    ENDDO
+    ENDDO
+
+END SUBROUTINE advance_w_fast
+#endif
 
 !---------------------------------------------------------------------
 
