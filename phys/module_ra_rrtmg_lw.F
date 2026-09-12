@@ -4445,6 +4445,110 @@ contains
       END MODULE rrtmg_lw_rtrnmc_gpu
 #endif
 
+#ifdef WRF_GPU_RAD
+!------------------------------------------------------------------
+! Pushes every read-only LW lookup table (k-distribution coefficients,
+! Planck/cloud/reference/wavenumber tables, rtrnmc's a0/a1/a2 fit
+! coefficients) to the device once. These are populated by
+! rrtmg_lwlookuptable's lw_kgbNN calls + rrtmg_lw_ini and never change again
+! for the life of the run, so a single push from rrtmg_lwinit (guarded by a
+! SAVEd once-only flag, since rrtmg_lwinit can run more than once e.g. for
+! multiple domains) is all that's needed. Forgetting this push doesn't fail
+! to compile or link -- every device kernel that reads one of these tables
+! aborts at run time with "FATAL ERROR: data in PRESENT clause was not
+! found on device", the same failure mode documented in CLAUDE.md for the
+! standalone test harnesses (which called this same logic, duplicated in
+! /tmp/rrtmg_integrate/gpu_tables.f90, by hand).
+      MODULE rrtmg_lw_gpu_tables
+      CONTAINS
+      SUBROUTINE gpu_tables_lw_todevice()
+      use rrlw_con, only: oneminus
+      use rrlw_ref, only: chi_mls, preflog, tref
+      use rrlw_wvn, only: nspa, nspb, totplnk, totplk16, delwave, ngb
+      use rrlw_tbl, only: bpade, tau_tbl, exp_tbl, tfn_tbl
+      use rrlw_cld, only: absliq0, absliq1, absice0, absice1, absice2, absice3
+      use rrtmg_lw_rtrnmc_gpu, only: a0_gpu, a1_gpu, a2_gpu
+      use rrlw_kg01, only: fracrefa_b1=>fracrefa, fracrefb_b1=>fracrefb, &
+                            absa_b1=>absa, absb_b1=>absb, &
+                            ka_mn2_b1=>ka_mn2, kb_mn2_b1=>kb_mn2, &
+                            selfref_b1=>selfref, forref_b1=>forref
+      use rrlw_kg02, only: fracrefa_b2=>fracrefa, fracrefb_b2=>fracrefb, &
+                            absa_b2=>absa, absb_b2=>absb, &
+                            selfref_b2=>selfref, forref_b2=>forref
+      use rrlw_kg03, only: fracrefa_b3=>fracrefa, fracrefb_b3=>fracrefb, &
+                            absa_b3=>absa, absb_b3=>absb, &
+                            ka_mn2o_b3=>ka_mn2o, kb_mn2o_b3=>kb_mn2o, &
+                            selfref_b3=>selfref, forref_b3=>forref
+      use rrlw_kg04, only: fracrefa_b4=>fracrefa, fracrefb_b4=>fracrefb, &
+                            absa_b4=>absa, absb_b4=>absb, &
+                            selfref_b4=>selfref, forref_b4=>forref
+      use rrlw_kg05, only: fracrefa_b5=>fracrefa, fracrefb_b5=>fracrefb, &
+                            absa_b5=>absa, absb_b5=>absb, ka_mo3_b5=>ka_mo3, &
+                            selfref_b5=>selfref, forref_b5=>forref, ccl4_b5=>ccl4
+      use rrlw_kg06, only: fracrefa_b6=>fracrefa, absa_b6=>absa, ka_mco2_b6=>ka_mco2, &
+                            selfref_b6=>selfref, forref_b6=>forref, &
+                            cfc11adj_b6=>cfc11adj, cfc12_b6=>cfc12
+      use rrlw_kg07, only: fracrefa_b7=>fracrefa, fracrefb_b7=>fracrefb, &
+                            absa_b7=>absa, absb_b7=>absb, &
+                            ka_mco2_b7=>ka_mco2, kb_mco2_b7=>kb_mco2, &
+                            selfref_b7=>selfref, forref_b7=>forref
+      use rrlw_kg08, only: fracrefa_b8=>fracrefa, fracrefb_b8=>fracrefb, &
+                            absa_b8=>absa, absb_b8=>absb, &
+                            ka_mco2_b8=>ka_mco2, ka_mn2o_b8=>ka_mn2o, ka_mo3_b8=>ka_mo3, &
+                            kb_mco2_b8=>kb_mco2, kb_mn2o_b8=>kb_mn2o, &
+                            selfref_b8=>selfref, forref_b8=>forref, &
+                            cfc12_b8=>cfc12, cfc22adj_b8=>cfc22adj
+      use rrlw_kg09, only: fracrefa_b9=>fracrefa, fracrefb_b9=>fracrefb, &
+                            absa_b9=>absa, absb_b9=>absb, &
+                            ka_mn2o_b9=>ka_mn2o, kb_mn2o_b9=>kb_mn2o, &
+                            selfref_b9=>selfref, forref_b9=>forref
+      use rrlw_kg10, only: fracrefa_b10=>fracrefa, fracrefb_b10=>fracrefb, &
+                            absa_b10=>absa, absb_b10=>absb, &
+                            selfref_b10=>selfref, forref_b10=>forref
+      use rrlw_kg11, only: fracrefa_b11=>fracrefa, fracrefb_b11=>fracrefb, &
+                            absa_b11=>absa, absb_b11=>absb, &
+                            ka_mo2_b11=>ka_mo2, kb_mo2_b11=>kb_mo2, &
+                            selfref_b11=>selfref, forref_b11=>forref
+      use rrlw_kg12, only: fracrefa_b12=>fracrefa, absa_b12=>absa, &
+                            selfref_b12=>selfref, forref_b12=>forref
+      use rrlw_kg13, only: fracrefa_b13=>fracrefa, fracrefb_b13=>fracrefb, absa_b13=>absa, &
+                            ka_mco2_b13=>ka_mco2, ka_mco_b13=>ka_mco, kb_mo3_b13=>kb_mo3, &
+                            selfref_b13=>selfref, forref_b13=>forref
+      use rrlw_kg14, only: fracrefa_b14=>fracrefa, fracrefb_b14=>fracrefb, &
+                            absa_b14=>absa, absb_b14=>absb, &
+                            selfref_b14=>selfref, forref_b14=>forref
+      use rrlw_kg15, only: fracrefa_b15=>fracrefa, absa_b15=>absa, ka_mn2_b15=>ka_mn2, &
+                            selfref_b15=>selfref, forref_b15=>forref
+      use rrlw_kg16, only: fracrefa_b16=>fracrefa, fracrefb_b16=>fracrefb, &
+                            absa_b16=>absa, absb_b16=>absb, &
+                            selfref_b16=>selfref, forref_b16=>forref
+      IMPLICIT NONE
+
+!$acc enter data copyin(oneminus, chi_mls, nspa, nspb, preflog, tref, totplnk, totplk16)
+!$acc enter data copyin(delwave, ngb, bpade, tau_tbl, exp_tbl, tfn_tbl)
+!$acc enter data copyin(absliq0, absliq1, absice0, absice1, absice2, absice3)
+!$acc enter data copyin(a0_gpu, a1_gpu, a2_gpu)
+!$acc enter data copyin(fracrefa_b1, fracrefb_b1, absa_b1, absb_b1, ka_mn2_b1, kb_mn2_b1, selfref_b1, forref_b1)
+!$acc enter data copyin(fracrefa_b2, fracrefb_b2, absa_b2, absb_b2, selfref_b2, forref_b2)
+!$acc enter data copyin(fracrefa_b3, fracrefb_b3, absa_b3, absb_b3, ka_mn2o_b3, kb_mn2o_b3, selfref_b3, forref_b3)
+!$acc enter data copyin(fracrefa_b4, fracrefb_b4, absa_b4, absb_b4, selfref_b4, forref_b4)
+!$acc enter data copyin(fracrefa_b5, fracrefb_b5, absa_b5, absb_b5, ka_mo3_b5, selfref_b5, forref_b5, ccl4_b5)
+!$acc enter data copyin(fracrefa_b6, absa_b6, ka_mco2_b6, selfref_b6, forref_b6, cfc11adj_b6, cfc12_b6)
+!$acc enter data copyin(fracrefa_b7, fracrefb_b7, absa_b7, absb_b7, ka_mco2_b7, kb_mco2_b7, selfref_b7, forref_b7)
+!$acc enter data copyin(fracrefa_b8, fracrefb_b8, absa_b8, absb_b8, ka_mco2_b8, ka_mn2o_b8, ka_mo3_b8, kb_mco2_b8, kb_mn2o_b8, selfref_b8, forref_b8, cfc12_b8, cfc22adj_b8)
+!$acc enter data copyin(fracrefa_b9, fracrefb_b9, absa_b9, absb_b9, ka_mn2o_b9, kb_mn2o_b9, selfref_b9, forref_b9)
+!$acc enter data copyin(fracrefa_b10, fracrefb_b10, absa_b10, absb_b10, selfref_b10, forref_b10)
+!$acc enter data copyin(fracrefa_b11, fracrefb_b11, absa_b11, absb_b11, ka_mo2_b11, kb_mo2_b11, selfref_b11, forref_b11)
+!$acc enter data copyin(fracrefa_b12, absa_b12, selfref_b12, forref_b12)
+!$acc enter data copyin(fracrefa_b13, fracrefb_b13, absa_b13, ka_mco2_b13, ka_mco_b13, kb_mo3_b13, selfref_b13, forref_b13)
+!$acc enter data copyin(fracrefa_b14, fracrefb_b14, absa_b14, absb_b14, selfref_b14, forref_b14)
+!$acc enter data copyin(fracrefa_b15, absa_b15, ka_mn2_b15, selfref_b15, forref_b15)
+!$acc enter data copyin(fracrefa_b16, fracrefb_b16, absa_b16, absb_b16, selfref_b16, forref_b16)
+
+      END SUBROUTINE gpu_tables_lw_todevice
+      END MODULE rrtmg_lw_gpu_tables
+#endif
+
 !     path:      $Source: /cvsroot/NWP/WRFV3/phys/module_ra_rrtmg_lw.F,v $
 !     author:    $Author: trn $
 !     revision:  $Revision: 1.3 $
@@ -16957,6 +17061,11 @@ use parrrtm, only : nbndlw, ngptlw
 use rrtmg_lw_init, only: rrtmg_lw_ini
 use rrtmg_lw_rad, only: rrtmg_lw
 use mcica_subcol_gen_lw, only: mcica_subcol_lw
+#ifdef WRF_GPU_RAD
+use rrtmg_lw_gpu_chunk, only: rrtmg_lw_gpu_chunksize
+use rrtmg_lw_gpu_chain, only: rrtmg_lw_gpu_chain_driver
+use rrtmg_lw_gpu_tables, only: gpu_tables_lw_todevice
+#endif
 
     real retab(95)
     data retab /                                                &
@@ -17349,7 +17458,30 @@ CONTAINS
                   247.35,250.33,253.32,256.30,259.22,262.12,      &
                   264.80,266.50,267.59,268.44,268.69,267.76,      &
                   266.13,263.96,261.54,258.93,256.15,253.23,      &
-                  249.89,246.67,243.48,240.25,236.66,233.86/    
+                  249.89,246.67,243.48,240.25,236.66,233.86/
+#ifdef WRF_GPU_RAD
+! --- GPU column-batching state (WRF_GPU_RAD driver-integration path) ---
+! Every column visited by this tile's i_loop/j_loop shares icld=2 (set just
+! above), iaer=10 (hardcoded inside the original rrtmg_lw), irng=0 and
+! permuteseed=150 (set right before the original per-column mcica_subcol_lw
+! call below) -- so the whole tile can be processed in device-sized chunks
+! via rrtmg_lw_gpu_chain_driver instead of one ncol=1 call per column.
+! inflglw/iceflglw/liqflglw are likewise tile-constant (they depend only on
+! the has_reqc/has_reqi/has_reqs/ICLOUD arguments, not on i,j). See
+! CLAUDE.md's "LW driver integration" section.
+    INTEGER :: gpu_chunksize, gpu_nfill, gpu_ic, gpu_ncol_tile, gpu_iaer
+    LOGICAL :: gpu_have_lwupt, gpu_have_lwupflx
+    INTEGER, ALLOCATABLE :: gpu_i_idx(:), gpu_j_idx(:)
+    REAL, ALLOCATABLE :: gpu_play(:,:), gpu_plev(:,:), gpu_tlay(:,:), gpu_tlev(:,:), gpu_tsfc(:)
+    REAL, ALLOCATABLE :: gpu_h2ovmr(:,:), gpu_o3vmr(:,:), gpu_co2vmr(:,:), gpu_ch4vmr(:,:)
+    REAL, ALLOCATABLE :: gpu_n2ovmr(:,:), gpu_o2vmr(:,:), gpu_cfc11vmr(:,:), gpu_cfc12vmr(:,:)
+    REAL, ALLOCATABLE :: gpu_cfc22vmr(:,:), gpu_ccl4vmr(:,:), gpu_emis(:,:)
+    REAL, ALLOCATABLE :: gpu_cldfrac(:,:), gpu_ciwp(:,:), gpu_clwp(:,:), gpu_cswp(:,:)
+    REAL, ALLOCATABLE :: gpu_rei(:,:), gpu_rel(:,:), gpu_res(:,:), gpu_tauaer(:,:,:), gpu_tauc(:,:,:)
+    REAL, ALLOCATABLE :: gpu_totuflux(:,:), gpu_totdflux(:,:), gpu_fnet(:,:), gpu_htr(:,:)
+    REAL, ALLOCATABLE :: gpu_totuclfl(:,:), gpu_totdclfl(:,:), gpu_fnetc(:,:), gpu_htrc(:,:)
+    INTEGER :: gpu_inflglw, gpu_iceflglw, gpu_liqflglw
+#endif
 !------------------------------------------------------------------
 #if ( WRF_CHEM == 1 )
       IF ( aer_ra_feedback == 1) then
@@ -17397,6 +17529,33 @@ CONTAINS
 
 #endif
 !ccc
+
+#ifdef WRF_GPU_RAD
+    gpu_ncol_tile = (ite-its+1) * (jte-jts+1)
+    gpu_chunksize = MAX(1, MIN(rrtmg_lw_gpu_chunksize(nlayers, gpu_ncol_tile), gpu_ncol_tile))
+    gpu_nfill = 0
+    gpu_iaer = 10
+    gpu_have_lwupt = PRESENT(lwupt)
+    gpu_have_lwupflx = PRESENT(lwupflx)
+    ALLOCATE(gpu_i_idx(gpu_chunksize), gpu_j_idx(gpu_chunksize))
+    ALLOCATE(gpu_play(gpu_chunksize,nlayers), gpu_plev(gpu_chunksize,nlayers+1))
+    ALLOCATE(gpu_tlay(gpu_chunksize,nlayers), gpu_tlev(gpu_chunksize,nlayers+1), gpu_tsfc(gpu_chunksize))
+    ALLOCATE(gpu_h2ovmr(gpu_chunksize,nlayers), gpu_o3vmr(gpu_chunksize,nlayers), gpu_co2vmr(gpu_chunksize,nlayers))
+    ALLOCATE(gpu_ch4vmr(gpu_chunksize,nlayers), gpu_n2ovmr(gpu_chunksize,nlayers), gpu_o2vmr(gpu_chunksize,nlayers))
+    ALLOCATE(gpu_cfc11vmr(gpu_chunksize,nlayers), gpu_cfc12vmr(gpu_chunksize,nlayers))
+    ALLOCATE(gpu_cfc22vmr(gpu_chunksize,nlayers), gpu_ccl4vmr(gpu_chunksize,nlayers))
+    ALLOCATE(gpu_emis(gpu_chunksize,nbndlw))
+    ALLOCATE(gpu_cldfrac(gpu_chunksize,nlayers), gpu_ciwp(gpu_chunksize,nlayers))
+    ALLOCATE(gpu_clwp(gpu_chunksize,nlayers), gpu_cswp(gpu_chunksize,nlayers))
+    ALLOCATE(gpu_rei(gpu_chunksize,nlayers), gpu_rel(gpu_chunksize,nlayers), gpu_res(gpu_chunksize,nlayers))
+    ALLOCATE(gpu_tauaer(gpu_chunksize,nlayers,nbndlw))
+    ALLOCATE(gpu_tauc(nbndlw,gpu_chunksize,nlayers))
+    gpu_tauc = 0.0
+    ALLOCATE(gpu_totuflux(gpu_chunksize,0:nlayers), gpu_totdflux(gpu_chunksize,0:nlayers))
+    ALLOCATE(gpu_fnet(gpu_chunksize,0:nlayers), gpu_htr(gpu_chunksize,0:nlayers))
+    ALLOCATE(gpu_totuclfl(gpu_chunksize,0:nlayers), gpu_totdclfl(gpu_chunksize,0:nlayers))
+    ALLOCATE(gpu_fnetc(gpu_chunksize,0:nlayers), gpu_htrc(gpu_chunksize,0:nlayers))
+#endif
 
 ! latitude loop
   j_loop: do j = jts,jte
@@ -18080,9 +18239,11 @@ CONTAINS
          permuteseed = 150
 
 ! Sub-column generator for McICA
+#ifndef WRF_GPU_RAD
          call mcica_subcol_lw(iplon, ncol, nlay, icld, permuteseed, irng, play, &
                        cldfrac, ciwpth, clwpth, cswpth, rei, rel, res, taucld, cldfmcl, &
                        ciwpmcl, clwpmcl, cswpmcl, reicmcl, relqmcl, resnmcl, taucmcl)
+#endif
 
 !--------------------------------------------------------------------------
 ! Aerosol optical depth, single scattering albedo and asymmetry parameter -czhao 03/2010
@@ -18155,9 +18316,10 @@ CONTAINS
 #endif
 
 ! Call RRTMG longwave radiation model
+#ifndef WRF_GPU_RAD
          call rrtmg_lw &
             (ncol    ,nlay    ,icld    , &
-             play    ,plev    ,tlay    ,tlev    ,tsfc    , & 
+             play    ,plev    ,tlay    ,tlev    ,tsfc    , &
              h2ovmr  ,o3vmr   ,co2vmr  ,ch4vmr  ,n2ovmr  ,o2vmr , &
              cfc11vmr,cfc12vmr,cfc22vmr,ccl4vmr ,emis    , &
              inflglw ,iceflglw,liqflglw,cldfmcl , &
@@ -18165,17 +18327,17 @@ CONTAINS
              tauaer  , &
              uflx    ,dflx    ,hr      ,uflxc   ,dflxc,  hrc)
 
-! Output downard surface flux, and outgoing longwave flux and cloud forcing 
+! Output downard surface flux, and outgoing longwave flux and cloud forcing
 ! at the top of atmosphere (W/m2)
          glw(i,j) = dflx(1,1)
 !         olr(i,j) = uflx(1,kte+2)
 !         lwcf(i,j) = uflxc(1,kte+2) - uflx(1,kte+2)
-! Steven Cavallo: Changed OLR to be valid at the top of atmosphere instead 
+! Steven Cavallo: Changed OLR to be valid at the top of atmosphere instead
 ! of top of model.  Dec 2010.
          olr(i,j) = uflx(1,nlayers+1)
          lwcf(i,j) = uflxc(1,nlayers+1) - uflx(1,nlayers+1)
 
-         if (present(lwupt)) then 
+         if (present(lwupt)) then
 ! Output up and down toa fluxes for total and clear sky
 ! nlayers+1 represents value at 0 mb
             lwupt(i,j)     = uflx(1,nlayers+1)
@@ -18190,7 +18352,7 @@ CONTAINS
          endif
 
 ! Output up and down layer fluxes for total and clear sky.
-! Vertical ordering is from bottom to top in units of W m-2. 
+! Vertical ordering is from bottom to top in units of W m-2.
          if ( present (lwupflx) ) then
          do k=kts,kte+2
             lwupflx(i,k,j)  = uflx(1,k)
@@ -18201,17 +18363,223 @@ CONTAINS
          endif
 
 ! Output heating rate tendency; convert heating rate from K/d to K/s
-! Heating rate arrays are ordered vertically from bottom to top here. 
+! Heating rate arrays are ordered vertically from bottom to top here.
          do k=kts,kte
             tten1d(k) = hr(ncol,k)/86400.
             rthratenlw(i,k,j) = tten1d(k)/pi3d(i,k,j)
          enddo
+#else
+! --- GPU path: stash this column's pre-mcica inputs into the current
+! chunk instead of calling mcica_subcol_lw+rrtmg_lw per column, then flush
+! (run rrtmg_lw_gpu_chain_driver + unpack outputs) once the chunk fills or
+! the tile ends. taucld is always host-zeroed above for the inflglw>0 path
+! this driver always runs (inflglw is set to >=2 unconditionally before the
+! ICLOUD check and never reset to 0), matching gpu_tauc's permanent zero.
+         gpu_ic = gpu_nfill + 1
+         gpu_i_idx(gpu_ic) = i
+         gpu_j_idx(gpu_ic) = j
+         gpu_play(gpu_ic,:)     = play(1,:)
+         gpu_plev(gpu_ic,:)     = plev(1,:)
+         gpu_tlay(gpu_ic,:)     = tlay(1,:)
+         gpu_tlev(gpu_ic,:)     = tlev(1,:)
+         gpu_tsfc(gpu_ic)       = tsfc(1)
+         gpu_h2ovmr(gpu_ic,:)   = h2ovmr(1,:)
+         gpu_o3vmr(gpu_ic,:)    = o3vmr(1,:)
+         gpu_co2vmr(gpu_ic,:)   = co2vmr(1,:)
+         gpu_ch4vmr(gpu_ic,:)   = ch4vmr(1,:)
+         gpu_n2ovmr(gpu_ic,:)   = n2ovmr(1,:)
+         gpu_o2vmr(gpu_ic,:)    = o2vmr(1,:)
+         gpu_cfc11vmr(gpu_ic,:) = cfc11vmr(1,:)
+         gpu_cfc12vmr(gpu_ic,:) = cfc12vmr(1,:)
+         gpu_cfc22vmr(gpu_ic,:) = cfc22vmr(1,:)
+         gpu_ccl4vmr(gpu_ic,:)  = ccl4vmr(1,:)
+         gpu_emis(gpu_ic,:)     = emis(1,:)
+         gpu_cldfrac(gpu_ic,:)  = cldfrac(1,:)
+         gpu_ciwp(gpu_ic,:)     = ciwpth(1,:)
+         gpu_clwp(gpu_ic,:)     = clwpth(1,:)
+         gpu_cswp(gpu_ic,:)     = cswpth(1,:)
+         gpu_rei(gpu_ic,:)      = rei(1,:)
+         gpu_rel(gpu_ic,:)      = rel(1,:)
+         gpu_res(gpu_ic,:)      = res(1,:)
+         gpu_tauaer(gpu_ic,:,:) = tauaer(1,:,:)
+         gpu_inflglw  = inflglw
+         gpu_iceflglw = iceflglw
+         gpu_liqflglw = liqflglw
+         gpu_nfill = gpu_ic
+
+         IF (gpu_nfill .eq. gpu_chunksize .or. (i .eq. ite .and. j .eq. jte)) THEN
+            CALL gpu_flush_lw_chunk()
+         ENDIF
+#endif
 
 !
       end do i_loop
-   end do j_loop                                           
+   end do j_loop
 
 !-------------------------------------------------------------------
+
+#ifdef WRF_GPU_RAD
+    DEALLOCATE(gpu_i_idx, gpu_j_idx)
+    DEALLOCATE(gpu_play, gpu_plev, gpu_tlay, gpu_tlev, gpu_tsfc)
+    DEALLOCATE(gpu_h2ovmr, gpu_o3vmr, gpu_co2vmr, gpu_ch4vmr, gpu_n2ovmr, gpu_o2vmr)
+    DEALLOCATE(gpu_cfc11vmr, gpu_cfc12vmr, gpu_cfc22vmr, gpu_ccl4vmr, gpu_emis)
+    DEALLOCATE(gpu_cldfrac, gpu_ciwp, gpu_clwp, gpu_cswp, gpu_rei, gpu_rel, gpu_res)
+    DEALLOCATE(gpu_tauaer, gpu_tauc)
+    DEALLOCATE(gpu_totuflux, gpu_totdflux, gpu_fnet, gpu_htr)
+    DEALLOCATE(gpu_totuclfl, gpu_totdclfl, gpu_fnetc, gpu_htrc)
+#endif
+
+   RETURN
+
+#ifdef WRF_GPU_RAD
+   CONTAINS
+
+   SUBROUTINE gpu_flush_lw_chunk()
+! Runs the currently-filled GPU chunk (gpu_nfill columns, host association
+! into RRTMG_LWRAD's batch/output arrays and dummy arguments) through
+! rrtmg_lw_gpu_chain_driver and unpacks the results back into this tile's
+! (i,j)-indexed output arrays, then resets the chunk counter. Host-only
+! orchestration -- never called from a device kernel, so the usual
+! internal-procedure/device restriction doesn't apply here.
+   IMPLICIT NONE
+   INTEGER :: gk, gi, gj
+
+! A slice like gpu_play(1:gpu_nfill,:) is non-contiguous whenever gpu_nfill
+! < gpu_chunksize (the last, partial chunk of a tile): Fortran argument
+! association to the chain driver's explicit-shape dummies then makes a
+! compiler-generated HOST-side copy-in/copy-out temporary for that call,
+! which is a different address than whatever "!$acc enter data copyin" was
+! told about -- so present() inside the device kernels fails to find it
+! ("data in PRESENT clause was not found on device"). Fix: always operate on
+! freshly allocated, exactly (gpu_nfill,...)-shaped, contiguous arrays.
+   REAL, ALLOCATABLE :: fl_play(:,:), fl_plev(:,:), fl_tlay(:,:), fl_tlev(:,:), fl_tsfc(:)
+   REAL, ALLOCATABLE :: fl_h2ovmr(:,:), fl_o3vmr(:,:), fl_co2vmr(:,:), fl_ch4vmr(:,:)
+   REAL, ALLOCATABLE :: fl_n2ovmr(:,:), fl_o2vmr(:,:), fl_cfc11vmr(:,:), fl_cfc12vmr(:,:)
+   REAL, ALLOCATABLE :: fl_cfc22vmr(:,:), fl_ccl4vmr(:,:), fl_emis(:,:)
+   REAL, ALLOCATABLE :: fl_cldfrac(:,:), fl_ciwp(:,:), fl_clwp(:,:), fl_cswp(:,:)
+   REAL, ALLOCATABLE :: fl_rei(:,:), fl_rel(:,:), fl_res(:,:), fl_tauaer(:,:,:), fl_tauc(:,:,:)
+   REAL, ALLOCATABLE :: fl_totuflux(:,:), fl_totdflux(:,:), fl_fnet(:,:), fl_htr(:,:)
+   REAL, ALLOCATABLE :: fl_totuclfl(:,:), fl_totdclfl(:,:), fl_fnetc(:,:), fl_htrc(:,:)
+
+   ALLOCATE(fl_play(gpu_nfill,nlayers), fl_plev(gpu_nfill,nlayers+1))
+   ALLOCATE(fl_tlay(gpu_nfill,nlayers), fl_tlev(gpu_nfill,nlayers+1), fl_tsfc(gpu_nfill))
+   ALLOCATE(fl_h2ovmr(gpu_nfill,nlayers), fl_o3vmr(gpu_nfill,nlayers), fl_co2vmr(gpu_nfill,nlayers))
+   ALLOCATE(fl_ch4vmr(gpu_nfill,nlayers), fl_n2ovmr(gpu_nfill,nlayers), fl_o2vmr(gpu_nfill,nlayers))
+   ALLOCATE(fl_cfc11vmr(gpu_nfill,nlayers), fl_cfc12vmr(gpu_nfill,nlayers))
+   ALLOCATE(fl_cfc22vmr(gpu_nfill,nlayers), fl_ccl4vmr(gpu_nfill,nlayers))
+   ALLOCATE(fl_emis(gpu_nfill,nbndlw))
+   ALLOCATE(fl_cldfrac(gpu_nfill,nlayers), fl_ciwp(gpu_nfill,nlayers))
+   ALLOCATE(fl_clwp(gpu_nfill,nlayers), fl_cswp(gpu_nfill,nlayers))
+   ALLOCATE(fl_rei(gpu_nfill,nlayers), fl_rel(gpu_nfill,nlayers), fl_res(gpu_nfill,nlayers))
+   ALLOCATE(fl_tauaer(gpu_nfill,nlayers,nbndlw), fl_tauc(nbndlw,gpu_nfill,nlayers))
+   ALLOCATE(fl_totuflux(gpu_nfill,0:nlayers), fl_totdflux(gpu_nfill,0:nlayers))
+   ALLOCATE(fl_fnet(gpu_nfill,0:nlayers), fl_htr(gpu_nfill,0:nlayers))
+   ALLOCATE(fl_totuclfl(gpu_nfill,0:nlayers), fl_totdclfl(gpu_nfill,0:nlayers))
+   ALLOCATE(fl_fnetc(gpu_nfill,0:nlayers), fl_htrc(gpu_nfill,0:nlayers))
+
+   fl_play     = gpu_play(1:gpu_nfill,:)
+   fl_plev     = gpu_plev(1:gpu_nfill,:)
+   fl_tlay     = gpu_tlay(1:gpu_nfill,:)
+   fl_tlev     = gpu_tlev(1:gpu_nfill,:)
+   fl_tsfc     = gpu_tsfc(1:gpu_nfill)
+   fl_h2ovmr   = gpu_h2ovmr(1:gpu_nfill,:)
+   fl_o3vmr    = gpu_o3vmr(1:gpu_nfill,:)
+   fl_co2vmr   = gpu_co2vmr(1:gpu_nfill,:)
+   fl_ch4vmr   = gpu_ch4vmr(1:gpu_nfill,:)
+   fl_n2ovmr   = gpu_n2ovmr(1:gpu_nfill,:)
+   fl_o2vmr    = gpu_o2vmr(1:gpu_nfill,:)
+   fl_cfc11vmr = gpu_cfc11vmr(1:gpu_nfill,:)
+   fl_cfc12vmr = gpu_cfc12vmr(1:gpu_nfill,:)
+   fl_cfc22vmr = gpu_cfc22vmr(1:gpu_nfill,:)
+   fl_ccl4vmr  = gpu_ccl4vmr(1:gpu_nfill,:)
+   fl_emis     = gpu_emis(1:gpu_nfill,:)
+   fl_cldfrac  = gpu_cldfrac(1:gpu_nfill,:)
+   fl_ciwp     = gpu_ciwp(1:gpu_nfill,:)
+   fl_clwp     = gpu_clwp(1:gpu_nfill,:)
+   fl_cswp     = gpu_cswp(1:gpu_nfill,:)
+   fl_rei      = gpu_rei(1:gpu_nfill,:)
+   fl_rel      = gpu_rel(1:gpu_nfill,:)
+   fl_res      = gpu_res(1:gpu_nfill,:)
+   fl_tauaer   = gpu_tauaer(1:gpu_nfill,:,:)
+   fl_tauc     = gpu_tauc(:,1:gpu_nfill,:)
+
+!$acc enter data copyin(fl_play, fl_plev, fl_tlay, fl_tlev, fl_tsfc) &
+!$acc   copyin(fl_h2ovmr, fl_o3vmr, fl_co2vmr, fl_ch4vmr, fl_n2ovmr, fl_o2vmr) &
+!$acc   copyin(fl_cfc11vmr, fl_cfc12vmr, fl_cfc22vmr, fl_ccl4vmr, fl_emis) &
+!$acc   copyin(fl_cldfrac, fl_ciwp, fl_clwp, fl_cswp, fl_tauc) &
+!$acc   copyin(fl_rei, fl_rel, fl_res, fl_tauaer) &
+!$acc   create(fl_totuflux, fl_totdflux, fl_fnet, fl_htr) &
+!$acc   create(fl_totuclfl, fl_totdclfl, fl_fnetc, fl_htrc)
+
+   CALL rrtmg_lw_gpu_chain_driver(gpu_nfill, nlayers, icld, gpu_iaer, irng, permuteseed, &
+             fl_play, fl_plev, fl_tlay, fl_tlev, fl_tsfc, &
+             fl_h2ovmr, fl_o3vmr, fl_co2vmr, fl_ch4vmr, fl_n2ovmr, fl_o2vmr, &
+             fl_ccl4vmr, fl_cfc11vmr, fl_cfc12vmr, fl_cfc22vmr, fl_emis, &
+             gpu_inflglw, gpu_iceflglw, gpu_liqflglw, &
+             fl_cldfrac, fl_ciwp, fl_clwp, fl_cswp, fl_tauc, &
+             fl_rei, fl_rel, fl_res, fl_tauaer, &
+             fl_totuflux, fl_totdflux, fl_fnet, fl_htr, &
+             fl_totuclfl, fl_totdclfl, fl_fnetc, fl_htrc)
+
+!$acc exit data copyout(fl_totuflux, fl_totdflux, fl_totuclfl, fl_totdclfl, fl_htr) &
+!$acc   delete(fl_play, fl_plev, fl_tlay, fl_tlev, fl_tsfc) &
+!$acc   delete(fl_h2ovmr, fl_o3vmr, fl_co2vmr, fl_ch4vmr, fl_n2ovmr, fl_o2vmr) &
+!$acc   delete(fl_cfc11vmr, fl_cfc12vmr, fl_cfc22vmr, fl_ccl4vmr, fl_emis) &
+!$acc   delete(fl_cldfrac, fl_ciwp, fl_clwp, fl_cswp, fl_tauc) &
+!$acc   delete(fl_rei, fl_rel, fl_res, fl_tauaer) &
+!$acc   delete(fl_fnet, fl_fnetc, fl_htrc)
+
+   gpu_totuflux(1:gpu_nfill,:) = fl_totuflux
+   gpu_totdflux(1:gpu_nfill,:) = fl_totdflux
+   gpu_totuclfl(1:gpu_nfill,:) = fl_totuclfl
+   gpu_totdclfl(1:gpu_nfill,:) = fl_totdclfl
+   gpu_htr(1:gpu_nfill,:)      = fl_htr
+
+   DEALLOCATE(fl_play, fl_plev, fl_tlay, fl_tlev, fl_tsfc)
+   DEALLOCATE(fl_h2ovmr, fl_o3vmr, fl_co2vmr, fl_ch4vmr, fl_n2ovmr, fl_o2vmr)
+   DEALLOCATE(fl_cfc11vmr, fl_cfc12vmr, fl_cfc22vmr, fl_ccl4vmr, fl_emis)
+   DEALLOCATE(fl_cldfrac, fl_ciwp, fl_clwp, fl_cswp, fl_rei, fl_rel, fl_res)
+   DEALLOCATE(fl_tauaer, fl_tauc)
+   DEALLOCATE(fl_totuflux, fl_totdflux, fl_fnet, fl_htr)
+   DEALLOCATE(fl_totuclfl, fl_totdclfl, fl_fnetc, fl_htrc)
+
+   DO gk = 1, gpu_nfill
+      gi = gpu_i_idx(gk)
+      gj = gpu_j_idx(gk)
+
+      glw(gi,gj) = gpu_totdflux(gk,0)
+      olr(gi,gj) = gpu_totuflux(gk,nlayers)
+      lwcf(gi,gj) = gpu_totuclfl(gk,nlayers) - gpu_totuflux(gk,nlayers)
+
+      IF (gpu_have_lwupt) THEN
+         lwupt(gi,gj)  = gpu_totuflux(gk,nlayers)
+         lwuptc(gi,gj) = gpu_totuclfl(gk,nlayers)
+         lwdnt(gi,gj)  = gpu_totdflux(gk,nlayers)
+         lwdntc(gi,gj) = gpu_totdclfl(gk,nlayers)
+         lwupb(gi,gj)  = gpu_totuflux(gk,0)
+         lwupbc(gi,gj) = gpu_totuclfl(gk,0)
+         lwdnb(gi,gj)  = gpu_totdflux(gk,0)
+         lwdnbc(gi,gj) = gpu_totdclfl(gk,0)
+      ENDIF
+
+      IF (gpu_have_lwupflx) THEN
+         DO k = kts, kte+2
+            lwupflx(gi,k,gj)  = gpu_totuflux(gk,k-1)
+            lwupflxc(gi,k,gj) = gpu_totuclfl(gk,k-1)
+            lwdnflx(gi,k,gj)  = gpu_totdflux(gk,k-1)
+            lwdnflxc(gi,k,gj) = gpu_totdclfl(gk,k-1)
+         ENDDO
+      ENDIF
+
+      DO k = kts, kte
+         rthratenlw(gi,k,gj) = (gpu_htr(gk,k-1)/86400.) / pi3d(gi,k,gj)
+      ENDDO
+   ENDDO
+
+   gpu_nfill = 0
+
+   END SUBROUTINE gpu_flush_lw_chunk
+#endif
 
    END SUBROUTINE RRTMG_LWRAD
 
@@ -18371,7 +18739,11 @@ CONTAINS
    INTEGER , INTENT(IN)           :: ids, ide, jds, jde, kds, kde,  &
                                      ims, ime, jms, jme, kms, kme,  &
                                      its, ite, jts, jte, kts, kte
-   REAL, INTENT(IN)               :: p_top 
+   REAL, INTENT(IN)               :: p_top
+
+#ifdef WRF_GPU_RAD
+   LOGICAL, SAVE :: gpu_tables_lw_pushed = .FALSE.
+#endif
 
 ! Steven Cavallo.  Added for buffer layer adjustment.   December 2010.
    NLAYERS = kme + nint(p_top*0.01/deltap)- 1 ! Model levels plus new levels.
@@ -18386,6 +18758,18 @@ CONTAINS
 ! Perform g-point reduction and other initializations
 ! Specific heat of dry air (cp) used in flux to heating rate conversion factor.
    call rrtmg_lw_ini(cp)
+
+#ifdef WRF_GPU_RAD
+! Push every read-only LW lookup table to the device once. rrtmg_lwinit can
+! run more than once (e.g. one call per domain), but the tables never
+! change, so only the first call needs to push them.
+   IF ( allowed_to_read ) THEN
+      IF ( .NOT. gpu_tables_lw_pushed ) THEN
+         CALL gpu_tables_lw_todevice()
+         gpu_tables_lw_pushed = .TRUE.
+      ENDIF
+   ENDIF
+#endif
 
    END SUBROUTINE rrtmg_lwinit
 
