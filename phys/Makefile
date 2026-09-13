@@ -222,8 +222,17 @@ include ../configure.wrf
 # every CPU configuration, so those builds continue to use the ordinary
 # implicit compilation rule unchanged (mirrors dyn_em/Makefile's GPU_DYN_FLAGS
 # stanza for the dynamics port).
+#
+# module_ra_rrtmg_sw.o is named explicitly even though a full build already
+# happened to compile it with these flags: target-specific variables
+# propagate to prerequisites, and module_radiation_driver.o depends on it
+# via main/depend.common, so it was inheriting -acc from that rule rather
+# than from one of its own. That inheritance disappears the moment the
+# object is rebuilt on its own ("make module_ra_rrtmg_sw.o"), which would
+# silently produce a build whose SW kernels are ordinary host loops --
+# no error, no warning, just no GPU.
 ifneq ($(GPU_RAD_FLAGS),)
-module_ra_rrtmg_lw.o module_radiation_driver.o: FCFLAGS += $(GPU_RAD_FLAGS)
+module_ra_rrtmg_lw.o module_ra_rrtmg_sw.o module_radiation_driver.o: FCFLAGS += $(GPU_RAD_FLAGS)
 endif
 
 # module_ra_rrtmg_lwf.o/module_ra_rrtmg_swf.o (the dormant CUDA Fortran fast-

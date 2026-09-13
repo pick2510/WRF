@@ -14166,6 +14166,185 @@
       END SUBROUTINE rrtmg_sw_gpu_chain_driver
 
       END MODULE rrtmg_sw_gpu_chain
+
+! Device residency for every read-only SW lookup table, pushed exactly
+! once for the life of the run from rrtmg_swinit. The standalone
+! verification harnesses in /tmp/rrtmg_integrate carry their own copy of
+! this logic (gpu_tables.f90); this is the production one.
+!
+! Only arrays belong here. Bare module scalars (rrsw_tbl's bpade, rrsw_con's
+! heatfac, a band's single rayl/strrat) are captured by value at each kernel
+! launch and must NOT be pushed or listed in any present() clause -- doing so
+! forces a residency lookup that fails with "data in PRESENT clause was not
+! found on device".
+      MODULE rrtmg_sw_gpu_tables
+
+      CONTAINS
+
+      SUBROUTINE gpu_tables_sw_todevice()
+
+      use rrsw_cld, only: extliq1, ssaliq1, asyliq1, &
+                           extice2, ssaice2, asyice2, &
+                           extice3, ssaice3, asyice3, fdlice3, &
+                           abari, bbari, cbari, dbari, ebari, fbari
+      use rrsw_wvn, only: wavenum1, wavenum2, delwave, ngb, nspa, nspb
+      use rrsw_ref, only: pref, preflog, tref
+      use rrsw_tbl, only: exp_tbl
+      use rrsw_aer, only: rsrtaua, rsrpiza, rsrasya
+      use rrsw_con, only: oneminus
+!  Renamed use-associations only to keep 14 bands' worth of identically
+!  named tables apart in one scope; "enter data copyin" still operates on
+!  the real underlying module variable, so the aliasing has no effect on
+!  which kernel later finds it present.
+      use rrsw_kg16, only: absa_s16=>absa, absb_s16=>absb, forref_s16=>forref, &
+                            selfref_s16=>selfref, sfluxref_s16=>sfluxref
+      use rrsw_kg17, only: absa_s17=>absa, absb_s17=>absb, forref_s17=>forref, &
+                            selfref_s17=>selfref, sfluxref_s17=>sfluxref
+      use rrsw_kg18, only: absa_s18=>absa, absb_s18=>absb, forref_s18=>forref, &
+                            selfref_s18=>selfref, sfluxref_s18=>sfluxref
+      use rrsw_kg19, only: absa_s19=>absa, absb_s19=>absb, forref_s19=>forref, &
+                            selfref_s19=>selfref, sfluxref_s19=>sfluxref
+      use rrsw_kg20, only: absa_s20=>absa, absb_s20=>absb, forref_s20=>forref, &
+                            selfref_s20=>selfref, sfluxref_s20=>sfluxref, absch4_s20=>absch4
+      use rrsw_kg21, only: absa_s21=>absa, absb_s21=>absb, forref_s21=>forref, &
+                            selfref_s21=>selfref, sfluxref_s21=>sfluxref
+      use rrsw_kg22, only: absa_s22=>absa, absb_s22=>absb, forref_s22=>forref, &
+                            selfref_s22=>selfref, sfluxref_s22=>sfluxref
+      use rrsw_kg23, only: absa_s23=>absa, forref_s23=>forref, &
+                            selfref_s23=>selfref, sfluxref_s23=>sfluxref, rayl_s23=>rayl
+      use rrsw_kg24, only: absa_s24=>absa, absb_s24=>absb, forref_s24=>forref, &
+                            selfref_s24=>selfref, sfluxref_s24=>sfluxref, &
+                            abso3a_s24=>abso3a, abso3b_s24=>abso3b, &
+                            rayla_s24=>rayla, raylb_s24=>raylb
+      use rrsw_kg25, only: absa_s25=>absa, sfluxref_s25=>sfluxref, &
+                            abso3a_s25=>abso3a, abso3b_s25=>abso3b, rayl_s25=>rayl
+      use rrsw_kg26, only: sfluxref_s26=>sfluxref, rayl_s26=>rayl
+      use rrsw_kg27, only: absa_s27=>absa, absb_s27=>absb, sfluxref_s27=>sfluxref, rayl_s27=>rayl
+      use rrsw_kg28, only: absa_s28=>absa, absb_s28=>absb, sfluxref_s28=>sfluxref
+      use rrsw_kg29, only: absa_s29=>absa, absb_s29=>absb, forref_s29=>forref, &
+                            selfref_s29=>selfref, sfluxref_s29=>sfluxref, &
+                            absh2o_s29=>absh2o, absco2_s29=>absco2
+
+      IMPLICIT NONE
+
+! Cloud optics (cldprmc_sw_gpu), spectral map, reference profile
+!$acc enter data copyin(extliq1, ssaliq1, asyliq1, extice2, ssaice2, asyice2)
+!$acc enter data copyin(extice3, ssaice3, asyice3, fdlice3)
+!$acc enter data copyin(abari, bbari, cbari, dbari, ebari, fbari)
+!$acc enter data copyin(wavenum1, wavenum2, delwave, ngb)
+!$acc enter data copyin(pref, preflog, tref)
+! Exponential lookup (reftra_sw_gpu, spcvmc_sw_prep_gpu, spcvmc_sw_combine_gpu)
+!$acc enter data copyin(exp_tbl)
+! ECMWF six-type aerosol ratios (sw_transfer_aerosol_gpu, iaer=6 only)
+!$acc enter data copyin(rsrtaua, rsrpiza, rsrasya)
+! k-distribution absorption coefficients (taumol_sw_driver_gpu)
+!$acc enter data copyin(oneminus, nspa, nspb)
+!$acc enter data copyin(absa_s16, absb_s16, forref_s16, selfref_s16, sfluxref_s16)
+!$acc enter data copyin(absa_s17, absb_s17, forref_s17, selfref_s17, sfluxref_s17)
+!$acc enter data copyin(absa_s18, absb_s18, forref_s18, selfref_s18, sfluxref_s18)
+!$acc enter data copyin(absa_s19, absb_s19, forref_s19, selfref_s19, sfluxref_s19)
+!$acc enter data copyin(absa_s20, absb_s20, forref_s20, selfref_s20, sfluxref_s20, absch4_s20)
+!$acc enter data copyin(absa_s21, absb_s21, forref_s21, selfref_s21, sfluxref_s21)
+!$acc enter data copyin(absa_s22, absb_s22, forref_s22, selfref_s22, sfluxref_s22)
+!$acc enter data copyin(absa_s23, forref_s23, selfref_s23, sfluxref_s23, rayl_s23)
+!$acc enter data copyin(absa_s24, absb_s24, forref_s24, selfref_s24, sfluxref_s24)
+!$acc enter data copyin(abso3a_s24, abso3b_s24, rayla_s24, raylb_s24)
+!$acc enter data copyin(absa_s25, sfluxref_s25, abso3a_s25, abso3b_s25, rayl_s25)
+!$acc enter data copyin(sfluxref_s26, rayl_s26)
+!$acc enter data copyin(absa_s27, absb_s27, sfluxref_s27, rayl_s27)
+!$acc enter data copyin(absa_s28, absb_s28, sfluxref_s28)
+!$acc enter data copyin(absa_s29, absb_s29, forref_s29, selfref_s29, sfluxref_s29)
+!$acc enter data copyin(absh2o_s29, absco2_s29)
+
+      END SUBROUTINE gpu_tables_sw_todevice
+
+      END MODULE rrtmg_sw_gpu_tables
+
+! Device-independent chunk sizing for the SW pipeline, mirroring
+! rrtmg_lw_gpu_chunk. The rank-sharing count is not duplicated here --
+! rrtmg_lw_gpu_ranks_per_device() is reused directly, since "how many
+! ranks share this rank's GPU" is a property of the process layout, not
+! of which band we are computing, and it caches a collective call that
+! must not be made twice per radiation step.
+      MODULE rrtmg_sw_gpu_chunk
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrsw, only : nbndsw, ngptsw, mxmol
+
+      IMPLICIT NONE
+
+      CONTAINS
+
+! Bytes of device memory one column costs for a full
+! rrtmg_sw_gpu_chain_driver call, counted off that routine's (and
+! spcvmc_sw_driver_gpu's) actual ALLOCATE lists rather than guessed.
+!
+! The ngptsw-wide arrays dominate at 112 g-points: 24 live at the chain
+! driver's own level (8 mcica outputs, 8 inatm cloud arrays, taormc, taug,
+! taur, and the 5 transposed spcvmc inputs) plus 32 inside
+! spcvmc_sw_driver_gpu (the clear/cloudy/combined reflectivity,
+! transmissivity, direct-beam and flux sets, and the two logical masks,
+! which are 4 bytes each here too). Getting this count wrong is not a
+! rounding error: undercounting it by ~1.75x is exactly what made the LW
+! port survive cuMemAlloc and then die in cuLaunchKernel at 4 ranks.
+!
+! SW costs roughly 5x LW per column, almost entirely because
+! spcvmc_sw's adding-doubling solver keeps far more ngptsw-wide state
+! resident than rtrnmc's up/down sweep does.
+      INTEGER(kind=8) FUNCTION rrtmg_sw_gpu_bytes_per_column(nlayers) RESULT(nbytes)
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: nlayers
+      INTEGER(kind=8) :: nlay8
+
+! The (nlayers+1)-deep arrays are counted at nlayers+1 for all of them,
+! which slightly over-counts the nlayers-deep ones. Over-counting is the
+! safe direction here.
+      nlay8 = INT(nlayers, 8) + 1_8
+
+      nbytes = 4_8 * nlay8 * (56_8*INT(ngptsw,8) + 13_8*INT(nbndsw,8) &
+                               + INT(mxmol,8) + 80_8)
+
+      END FUNCTION rrtmg_sw_gpu_bytes_per_column
+
+! Returns a safe ncol batch size for one SW GPU pipeline call, capped at
+! max_ncol, sized against a fraction of this device's currently-free
+! memory (queried at runtime via acc_get_property -- never a hardcoded
+! VRAM figure) divided by the number of ranks sharing the device.
+!
+! safety_fraction has to cover what the free-memory query cannot see,
+! because it is taken before any kernel of this chunk has launched: the
+! ~7MB of SW k-distribution tables, the CUDA context, whatever the LW port
+! and the dyn_em port have resident, and the local memory CUDA reserves
+! for vrtqdr_sw_gpu's per-thread private arrays (4 arrays of mxlay=203
+! reals, ~3.2KB per thread, reserved for every resident thread).
+      INTEGER(kind=im) FUNCTION rrtmg_sw_gpu_chunksize(nlayers, max_ncol) RESULT(ncol_chunk)
+
+      use openacc
+      use rrtmg_lw_gpu_chunk, only : rrtmg_lw_gpu_ranks_per_device
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: nlayers, max_ncol
+
+      INTEGER :: devnum
+      INTEGER(kind=im) :: nshare
+      INTEGER(kind=8) :: free_bytes, bytes_per_col
+      REAL(kind=rb), PARAMETER :: safety_fraction = 0.5_rb
+
+      devnum = acc_get_device_num(acc_device_nvidia)
+      free_bytes = acc_get_property(devnum, acc_device_nvidia, acc_property_free_memory)
+      bytes_per_col = rrtmg_sw_gpu_bytes_per_column(nlayers)
+      nshare = rrtmg_lw_gpu_ranks_per_device()
+
+      ncol_chunk = INT(REAL(free_bytes, rb) * safety_fraction &
+                       / REAL(nshare, rb) / REAL(bytes_per_col, rb), im)
+
+      IF (ncol_chunk .gt. max_ncol) ncol_chunk = max_ncol
+      IF (ncol_chunk .lt. 1) ncol_chunk = 1
+
+      END FUNCTION rrtmg_sw_gpu_chunksize
+
+      END MODULE rrtmg_sw_gpu_chunk
 #endif
 
 !------------------------------------------------------------------
@@ -14188,6 +14367,58 @@ use mcica_subcol_gen_sw, only: mcica_subcol_sw
 use module_ra_rrtmg_lw, only : inirad, o3data, relcalc, reicalc, retab
 !                               mcica_random_numbers, randomNumberSequence, &
 !                               new_RandomNumberSequence, getRandomReal
+#ifdef WRF_GPU_RAD
+use rrtmg_sw_gpu_chunk, only: rrtmg_sw_gpu_chunksize
+use rrtmg_sw_gpu_chain, only: rrtmg_sw_gpu_chain_driver
+use rrtmg_sw_gpu_tables, only: gpu_tables_sw_todevice
+#endif
+
+#ifdef WRF_GPU_RAD
+! --- GPU column-batching state, MODULE-LEVEL (not local to RRTMG_SWRAD) ---
+! Mirrors the LW port's arrangement: gpu_flush_sw_chunk is a CONTAINS-nested
+! internal procedure and could reach these by host association, but module
+! scope states the lifetime explicitly at no cost.
+!
+! One structural difference from LW, and it matters: SW skips every column
+! where the sun is below the horizon (dorrsw = .false.), so the accumulated
+! chunk is a subset of the tile, not all of it. That rules out LW's
+! "flush when i==ite .and. j==jte" trigger -- the tile's last column may
+! well be a dark one that never accumulates. The chunk is flushed when full
+! inside the loop, and once more after both loops if anything is left.
+    INTEGER :: gpu_sw_chunksize, gpu_sw_nfill, gpu_sw_ic, gpu_sw_ncol_tile
+    INTEGER :: gpu_sw_iaer, gpu_sw_nlay
+    LOGICAL :: gpu_sw_have_swupt, gpu_sw_have_swupflx
+    INTEGER, ALLOCATABLE :: gpu_sw_i_idx(:), gpu_sw_j_idx(:)
+    LOGICAL, ALLOCATABLE :: gpu_sw_bad(:)
+    REAL, ALLOCATABLE :: gpu_sw_coszrs(:)
+!  See gpu_flush_sw_chunk's skip-a-bad-column branch: the outputs are
+!  INTENT(INOUT) and a skipped column is meant to keep its previous value,
+!  which is only defined once something has written one.
+    LOGICAL, SAVE :: gpu_sw_first_call = .TRUE.
+    REAL, ALLOCATABLE :: gpu_sw_play(:,:), gpu_sw_plev(:,:)
+    REAL, ALLOCATABLE :: gpu_sw_tlay(:,:), gpu_sw_tlev(:,:), gpu_sw_tsfc(:)
+    REAL, ALLOCATABLE :: gpu_sw_h2ovmr(:,:), gpu_sw_o3vmr(:,:), gpu_sw_co2vmr(:,:)
+    REAL, ALLOCATABLE :: gpu_sw_ch4vmr(:,:), gpu_sw_n2ovmr(:,:), gpu_sw_o2vmr(:,:)
+    REAL, ALLOCATABLE :: gpu_sw_asdir(:), gpu_sw_asdif(:), gpu_sw_aldir(:), gpu_sw_aldif(:)
+    REAL, ALLOCATABLE :: gpu_sw_coszen(:)
+    REAL, ALLOCATABLE :: gpu_sw_cldfrac(:,:), gpu_sw_ciwp(:,:), gpu_sw_clwp(:,:), gpu_sw_cswp(:,:)
+    REAL, ALLOCATABLE :: gpu_sw_rei(:,:), gpu_sw_rel(:,:), gpu_sw_res(:,:)
+    REAL, ALLOCATABLE :: gpu_sw_tauc(:,:,:), gpu_sw_ssac(:,:,:)
+    REAL, ALLOCATABLE :: gpu_sw_asmc(:,:,:), gpu_sw_fsfc(:,:,:)
+    REAL, ALLOCATABLE :: gpu_sw_tauaer(:,:,:), gpu_sw_ssaaer(:,:,:), gpu_sw_asmaer(:,:,:)
+    REAL, ALLOCATABLE :: gpu_sw_ecaer(:,:,:)
+    REAL, ALLOCATABLE :: gpu_sw_swuflx(:,:), gpu_sw_swdflx(:,:)
+    REAL, ALLOCATABLE :: gpu_sw_swuflxc(:,:), gpu_sw_swdflxc(:,:)
+    REAL, ALLOCATABLE :: gpu_sw_swhr(:,:), gpu_sw_swhrc(:,:)
+    REAL, ALLOCATABLE :: gpu_sw_visdir(:,:), gpu_sw_visdif(:,:)
+    REAL, ALLOCATABLE :: gpu_sw_nirdir(:,:), gpu_sw_nirdif(:,:)
+    REAL, ALLOCATABLE :: gpu_sw_dkdir(:,:), gpu_sw_dkdif(:,:)
+    INTEGER :: gpu_sw_inflgsw, gpu_sw_iceflgsw, gpu_sw_liqflgsw, gpu_sw_icld
+    REAL :: gpu_sw_adjes, gpu_sw_scon
+    INTEGER :: gpu_sw_dyofyr
+!  rrtmg_swinit runs once per domain; the tables only need pushing once.
+    LOGICAL, SAVE :: gpu_tables_sw_pushed = .FALSE.
+#endif
 
 CONTAINS
 
@@ -14597,6 +14828,95 @@ CONTAINS
 !                                                              
 ! All fields are ordered vertically from bottom to top
 ! Pressures are in mb
+
+#ifdef WRF_GPU_RAD
+! nlay is assigned per column inside i_loop below (unchanged); the chunk
+! arrays need it before the loops, and it is a pure function of the tile
+! bounds, so it is recomputed here rather than reordered.
+    gpu_sw_nlay = (kte - kts + 1) + 1
+    gpu_sw_ncol_tile = (ite-its+1) * (jte-jts+1)
+    gpu_sw_chunksize = MAX(1, MIN(rrtmg_sw_gpu_chunksize(gpu_sw_nlay, gpu_sw_ncol_tile), &
+                                  gpu_sw_ncol_tile))
+    gpu_sw_nfill = 0
+! rrtmg_sw's own aer_opt -> iaer mapping. aer_opt is OPTIONAL here and the
+! CPU path only ever dereferences it under PRESENT(aerod); absent, the
+! aerosol arrays are the host-zeroed defaults set below, which is exactly
+! what iaer=10 consumes.
+    gpu_sw_iaer = 10
+    IF (PRESENT(aer_opt)) THEN
+       IF (aer_opt .eq. 1) gpu_sw_iaer = 6
+    ENDIF
+    gpu_sw_have_swupt = PRESENT(swupt)
+    gpu_sw_have_swupflx = PRESENT(swupflx)
+
+    ALLOCATE(gpu_sw_i_idx(gpu_sw_chunksize), gpu_sw_j_idx(gpu_sw_chunksize))
+    ALLOCATE(gpu_sw_bad(gpu_sw_chunksize), gpu_sw_coszrs(gpu_sw_chunksize))
+    gpu_sw_bad = .FALSE.
+    ALLOCATE(gpu_sw_play(gpu_sw_chunksize,gpu_sw_nlay), gpu_sw_plev(gpu_sw_chunksize,gpu_sw_nlay+1))
+    ALLOCATE(gpu_sw_tlay(gpu_sw_chunksize,gpu_sw_nlay), gpu_sw_tlev(gpu_sw_chunksize,gpu_sw_nlay+1))
+    ALLOCATE(gpu_sw_tsfc(gpu_sw_chunksize))
+    ALLOCATE(gpu_sw_h2ovmr(gpu_sw_chunksize,gpu_sw_nlay), gpu_sw_o3vmr(gpu_sw_chunksize,gpu_sw_nlay))
+    ALLOCATE(gpu_sw_co2vmr(gpu_sw_chunksize,gpu_sw_nlay), gpu_sw_ch4vmr(gpu_sw_chunksize,gpu_sw_nlay))
+    ALLOCATE(gpu_sw_n2ovmr(gpu_sw_chunksize,gpu_sw_nlay), gpu_sw_o2vmr(gpu_sw_chunksize,gpu_sw_nlay))
+    ALLOCATE(gpu_sw_asdir(gpu_sw_chunksize), gpu_sw_asdif(gpu_sw_chunksize))
+    ALLOCATE(gpu_sw_aldir(gpu_sw_chunksize), gpu_sw_aldif(gpu_sw_chunksize))
+    ALLOCATE(gpu_sw_coszen(gpu_sw_chunksize))
+    ALLOCATE(gpu_sw_cldfrac(gpu_sw_chunksize,gpu_sw_nlay), gpu_sw_ciwp(gpu_sw_chunksize,gpu_sw_nlay))
+    ALLOCATE(gpu_sw_clwp(gpu_sw_chunksize,gpu_sw_nlay), gpu_sw_cswp(gpu_sw_chunksize,gpu_sw_nlay))
+    ALLOCATE(gpu_sw_rei(gpu_sw_chunksize,gpu_sw_nlay), gpu_sw_rel(gpu_sw_chunksize,gpu_sw_nlay))
+    ALLOCATE(gpu_sw_res(gpu_sw_chunksize,gpu_sw_nlay))
+    ALLOCATE(gpu_sw_tauc(nbndsw,gpu_sw_chunksize,gpu_sw_nlay))
+    ALLOCATE(gpu_sw_ssac(nbndsw,gpu_sw_chunksize,gpu_sw_nlay))
+    ALLOCATE(gpu_sw_asmc(nbndsw,gpu_sw_chunksize,gpu_sw_nlay))
+    ALLOCATE(gpu_sw_fsfc(nbndsw,gpu_sw_chunksize,gpu_sw_nlay))
+    ALLOCATE(gpu_sw_tauaer(gpu_sw_chunksize,gpu_sw_nlay,nbndsw))
+    ALLOCATE(gpu_sw_ssaaer(gpu_sw_chunksize,gpu_sw_nlay,nbndsw))
+    ALLOCATE(gpu_sw_asmaer(gpu_sw_chunksize,gpu_sw_nlay,nbndsw))
+    ALLOCATE(gpu_sw_ecaer(gpu_sw_chunksize,gpu_sw_nlay,naerec))
+    ALLOCATE(gpu_sw_swuflx(gpu_sw_chunksize,gpu_sw_nlay+1), gpu_sw_swdflx(gpu_sw_chunksize,gpu_sw_nlay+1))
+    ALLOCATE(gpu_sw_swuflxc(gpu_sw_chunksize,gpu_sw_nlay+1), gpu_sw_swdflxc(gpu_sw_chunksize,gpu_sw_nlay+1))
+    ALLOCATE(gpu_sw_swhr(gpu_sw_chunksize,gpu_sw_nlay), gpu_sw_swhrc(gpu_sw_chunksize,gpu_sw_nlay))
+    ALLOCATE(gpu_sw_visdir(gpu_sw_chunksize,gpu_sw_nlay+1), gpu_sw_visdif(gpu_sw_chunksize,gpu_sw_nlay+1))
+    ALLOCATE(gpu_sw_nirdir(gpu_sw_chunksize,gpu_sw_nlay+1), gpu_sw_nirdif(gpu_sw_chunksize,gpu_sw_nlay+1))
+    ALLOCATE(gpu_sw_dkdir(gpu_sw_chunksize,gpu_sw_nlay+1), gpu_sw_dkdif(gpu_sw_chunksize,gpu_sw_nlay+1))
+
+! Zero every input staging array once, so a chunk's unused tail slots (the
+! last, partial chunk of a tile) never carry uninitialized garbage into the
+! device kernels -- the chain driver always runs on the full chunksize, and
+! those columns are simply not unpacked. Defaults, not zeros, where the
+! science wants one: ssac/ssaaer are single-scattering albedos, and a clear
+! layer is non-absorbing (1), not non-existent (0). rei/rel/res get
+! in-range particle sizes for the same reason: cldprmc_sw's host
+! pre-validation checks radii wherever a band's tauc is non-trivial, and a
+! zero radius is out of bounds for every iceflag path.
+    gpu_sw_play = 0.0; gpu_sw_plev = 0.0; gpu_sw_tlay = 0.0; gpu_sw_tlev = 0.0
+    gpu_sw_tsfc = 0.0
+    gpu_sw_h2ovmr = 0.0; gpu_sw_o3vmr = 0.0; gpu_sw_co2vmr = 0.0
+    gpu_sw_ch4vmr = 0.0; gpu_sw_n2ovmr = 0.0; gpu_sw_o2vmr = 0.0
+    gpu_sw_asdir = 0.0; gpu_sw_asdif = 0.0; gpu_sw_aldir = 0.0; gpu_sw_aldif = 0.0
+    gpu_sw_coszen = 0.0
+    gpu_sw_cldfrac = 0.0; gpu_sw_ciwp = 0.0; gpu_sw_clwp = 0.0; gpu_sw_cswp = 0.0
+    gpu_sw_rei = 24.0; gpu_sw_rel = 10.0; gpu_sw_res = 50.0
+    gpu_sw_tauc = 0.0; gpu_sw_ssac = 1.0; gpu_sw_asmc = 0.0; gpu_sw_fsfc = 0.0
+    gpu_sw_tauaer = 0.0; gpu_sw_ssaaer = 1.0; gpu_sw_asmaer = 0.0
+    gpu_sw_ecaer = 0.0
+
+! Push every batch array to the device ONCE per RRTMG_SWRAD call and keep
+! it resident for every flush in this call; a flush only "update device"s
+! the just-filled inputs and "update host"s the results. Same design (and
+! same reason) as gpu_flush_lw_chunk -- see the redesign note there.
+!$acc enter data copyin(gpu_sw_play, gpu_sw_plev, gpu_sw_tlay, gpu_sw_tlev, gpu_sw_tsfc) &
+!$acc   copyin(gpu_sw_h2ovmr, gpu_sw_o3vmr, gpu_sw_co2vmr, gpu_sw_ch4vmr, gpu_sw_n2ovmr, gpu_sw_o2vmr) &
+!$acc   copyin(gpu_sw_asdir, gpu_sw_asdif, gpu_sw_aldir, gpu_sw_aldif, gpu_sw_coszen) &
+!$acc   copyin(gpu_sw_cldfrac, gpu_sw_ciwp, gpu_sw_clwp, gpu_sw_cswp) &
+!$acc   copyin(gpu_sw_rei, gpu_sw_rel, gpu_sw_res) &
+!$acc   copyin(gpu_sw_tauc, gpu_sw_ssac, gpu_sw_asmc, gpu_sw_fsfc) &
+!$acc   copyin(gpu_sw_tauaer, gpu_sw_ssaaer, gpu_sw_asmaer, gpu_sw_ecaer) &
+!$acc   create(gpu_sw_swuflx, gpu_sw_swdflx, gpu_sw_swuflxc, gpu_sw_swdflxc) &
+!$acc   create(gpu_sw_swhr, gpu_sw_swhrc) &
+!$acc   create(gpu_sw_visdir, gpu_sw_visdif, gpu_sw_nirdir, gpu_sw_nirdif) &
+!$acc   create(gpu_sw_dkdir, gpu_sw_dkdif)
+#endif
 
 ! latitude loop
   j_loop: do j = jts,jte
@@ -15232,10 +15552,18 @@ CONTAINS
 
 ! Sub-column generator for McICA
 
+#ifndef WRF_GPU_RAD
          call mcica_subcol_sw(iplon, ncol, nlay, icld, permuteseed, irng, play, &
                        cldfrac, ciwpth, clwpth, cswpth, rei, rel, res, taucld, ssacld, asmcld, fsfcld, &
                        cldfmcl, ciwpmcl, clwpmcl, cswpmcl, reicmcl, relqmcl, resnmcl, &
                        taucmcl, ssacmcl, asmcmcl, fsfcmcl)
+#else
+! GPU path: mcica runs on the device inside rrtmg_sw_gpu_chain_driver, from
+! the same pre-mcica inputs this call would have consumed. They are all
+! still live at the accumulate block further down (after the aerosol setup,
+! which sits between these two calls in the original), so nothing has to be
+! stashed here.
+#endif
 
 
 !--------------------------------------------------------------------------
@@ -15383,6 +15711,7 @@ CONTAINS
 
 ! Call RRTMG shortwave radiation model
 
+#ifndef WRF_GPU_RAD
          call rrtmg_sw &
             (ncol    ,nlay    ,icld    , &
              play    ,plev    ,tlay    ,tlev    ,tsfc   , &
@@ -15445,6 +15774,103 @@ CONTAINS
             tten1d(k) = swhr(ncol,k)/86400.
             rthratensw(i,k,j) = tten1d(k)/pi3d(i,k,j)
          enddo
+#else
+! --- GPU path: stash this daylit column's pre-mcica inputs into the
+! current chunk instead of calling mcica_subcol_sw + rrtmg_sw per column,
+! then flush (run rrtmg_sw_gpu_chain_driver and unpack) once the chunk
+! fills. The tile's remainder is flushed after both loops, not here: a dark
+! column never reaches this branch, so "is this the tile's last column" is
+! not a usable trigger for SW the way it is for LW.
+         gpu_sw_ic = gpu_sw_nfill + 1
+         gpu_sw_i_idx(gpu_sw_ic) = i
+         gpu_sw_j_idx(gpu_sw_ic) = j
+         gpu_sw_bad(gpu_sw_ic) = .FALSE.
+         gpu_sw_coszrs(gpu_sw_ic) = coszrs
+         gpu_sw_play(gpu_sw_ic,:) = play(1,:)
+         gpu_sw_plev(gpu_sw_ic,:) = plev(1,:)
+         gpu_sw_tlay(gpu_sw_ic,:) = tlay(1,:)
+         gpu_sw_tlev(gpu_sw_ic,:) = tlev(1,:)
+         gpu_sw_tsfc(gpu_sw_ic)   = tsfc(1)
+! Defensive sanitization, the LW port's guard applied to the SW inputs and
+! for the same reason: a non-finite pressure reaching setcoef_sw_gpu's
+! REAL->INTEGER table-index arithmetic is an invalid device address, not a
+! NaN. (x86 converts NaN to INT_MIN, which the existing "IF (jp.lt.1)"
+! clamps happen to catch; NVHPC's GPU codegen makes no such promise.) A
+! cheap host screen is far better than CUDA_ERROR_ILLEGAL_ADDRESS.
+!
+! With both LW kernel bugs fixed this check fires zero times over a full
+! 10-minute real run; it is kept as a permanent guard, with the warning
+! left visible so a genuine upstream data problem cannot hide.
+         BLOCK
+         INTEGER :: san_k
+         LOGICAL :: san_bad
+         san_bad = .FALSE.
+         DO san_k = kts, gpu_sw_nlay
+            IF (.NOT. (play(1,san_k) .GE. 1.0e-3 .AND. play(1,san_k) .LE. 1100.0)) san_bad = .TRUE.
+            IF (.NOT. (plev(1,san_k) .GE. 1.0e-3 .AND. plev(1,san_k) .LE. 1100.0)) san_bad = .TRUE.
+            IF (.NOT. (tlay(1,san_k) .GE. 100.0 .AND. tlay(1,san_k) .LE. 400.0)) san_bad = .TRUE.
+            IF (.NOT. (tlev(1,san_k) .GE. 100.0 .AND. tlev(1,san_k) .LE. 400.0)) san_bad = .TRUE.
+         ENDDO
+! The top interface is RRTMG's own model top, which the shared host setup
+! above sets to a literal 1.0e-5 mb for every column, every call, by design
+! -- so its lower bound must be .GE. 0.0, not the 1.0e-3 used for the
+! interior. (LW sets its equivalent to literal 0.0; same situation, same
+! reason the bound has to differ from the interior one.)
+         IF (.NOT. (plev(1,gpu_sw_nlay+1) .GE. 0.0   .AND. plev(1,gpu_sw_nlay+1) .LE. 1100.0)) san_bad = .TRUE.
+         IF (.NOT. (tlev(1,gpu_sw_nlay+1) .GE. 100.0 .AND. tlev(1,gpu_sw_nlay+1) .LE. 400.0)) san_bad = .TRUE.
+         IF (.NOT. (tsfc(1) .GE. 100.0 .AND. tsfc(1) .LE. 400.0)) san_bad = .TRUE.
+         IF (san_bad) THEN
+            gpu_sw_bad(gpu_sw_ic) = .TRUE.
+            gpu_sw_play(gpu_sw_ic,:) = 1013.25
+            gpu_sw_plev(gpu_sw_ic,:) = 1013.25
+            gpu_sw_tlay(gpu_sw_ic,:) = 288.0
+            gpu_sw_tlev(gpu_sw_ic,:) = 288.0
+            gpu_sw_tsfc(gpu_sw_ic)   = 288.0
+            WRITE(msg,'(A,I5,A,I5,A)') &
+               'WRF_GPU_RAD WARNING: non-physical p/T at i=', i, ' j=', j, &
+               ' -- skipping SW update this step'
+            call wrf_message(msg)
+         ENDIF
+         END BLOCK
+         gpu_sw_h2ovmr(gpu_sw_ic,:) = h2ovmr(1,:)
+         gpu_sw_o3vmr(gpu_sw_ic,:)  = o3vmr(1,:)
+         gpu_sw_co2vmr(gpu_sw_ic,:) = co2vmr(1,:)
+         gpu_sw_ch4vmr(gpu_sw_ic,:) = ch4vmr(1,:)
+         gpu_sw_n2ovmr(gpu_sw_ic,:) = n2ovmr(1,:)
+         gpu_sw_o2vmr(gpu_sw_ic,:)  = o2vmr(1,:)
+         gpu_sw_asdir(gpu_sw_ic)    = asdir(1)
+         gpu_sw_asdif(gpu_sw_ic)    = asdif(1)
+         gpu_sw_aldir(gpu_sw_ic)    = aldir(1)
+         gpu_sw_aldif(gpu_sw_ic)    = aldif(1)
+         gpu_sw_coszen(gpu_sw_ic)   = coszen(1)
+         gpu_sw_cldfrac(gpu_sw_ic,:) = cldfrac(1,:)
+         gpu_sw_ciwp(gpu_sw_ic,:)    = ciwpth(1,:)
+         gpu_sw_clwp(gpu_sw_ic,:)    = clwpth(1,:)
+         gpu_sw_cswp(gpu_sw_ic,:)    = cswpth(1,:)
+         gpu_sw_rei(gpu_sw_ic,:)     = rei(1,:)
+         gpu_sw_rel(gpu_sw_ic,:)     = rel(1,:)
+         gpu_sw_res(gpu_sw_ic,:)     = res(1,:)
+         gpu_sw_tauc(:,gpu_sw_ic,:)  = taucld(:,1,:)
+         gpu_sw_ssac(:,gpu_sw_ic,:)  = ssacld(:,1,:)
+         gpu_sw_asmc(:,gpu_sw_ic,:)  = asmcld(:,1,:)
+         gpu_sw_fsfc(:,gpu_sw_ic,:)  = fsfcld(:,1,:)
+         gpu_sw_tauaer(gpu_sw_ic,:,:) = tauaer(1,:,:)
+         gpu_sw_ssaaer(gpu_sw_ic,:,:) = ssaaer(1,:,:)
+         gpu_sw_asmaer(gpu_sw_ic,:,:) = asmaer(1,:,:)
+         gpu_sw_ecaer(gpu_sw_ic,:,:)  = ecaer(1,:,:)
+         gpu_sw_icld      = icld
+         gpu_sw_inflgsw   = inflgsw
+         gpu_sw_iceflgsw  = iceflgsw
+         gpu_sw_liqflgsw  = liqflgsw
+         gpu_sw_adjes     = adjes
+         gpu_sw_dyofyr    = dyofyr
+         gpu_sw_scon      = scon
+         gpu_sw_nfill = gpu_sw_ic
+
+         IF (gpu_sw_nfill .eq. gpu_sw_chunksize) THEN
+            CALL gpu_flush_sw_chunk()
+         ENDIF
+#endif
       else
          if (present(swupt)) then 
 ! Output up and down toa fluxes for total and clear sky
@@ -15472,8 +15898,197 @@ CONTAINS
       end do i_loop
    end do j_loop                                           
 
+#ifdef WRF_GPU_RAD
+! Flush the tile's remainder. Unlike LW this cannot be folded into the
+! in-loop trigger: the last column of the tile may be below the horizon
+! and never accumulate, so there is no (i,j) at which "this is the last
+! one" is reliably reached. It is also legitimately zero here -- an
+! entirely dark tile accumulates nothing at all.
+   IF (gpu_sw_nfill .gt. 0) THEN
+      CALL gpu_flush_sw_chunk()
+   ENDIF
+
+!$acc exit data delete(gpu_sw_play, gpu_sw_plev, gpu_sw_tlay, gpu_sw_tlev, gpu_sw_tsfc) &
+!$acc   delete(gpu_sw_h2ovmr, gpu_sw_o3vmr, gpu_sw_co2vmr, gpu_sw_ch4vmr, gpu_sw_n2ovmr, gpu_sw_o2vmr) &
+!$acc   delete(gpu_sw_asdir, gpu_sw_asdif, gpu_sw_aldir, gpu_sw_aldif, gpu_sw_coszen) &
+!$acc   delete(gpu_sw_cldfrac, gpu_sw_ciwp, gpu_sw_clwp, gpu_sw_cswp) &
+!$acc   delete(gpu_sw_rei, gpu_sw_rel, gpu_sw_res) &
+!$acc   delete(gpu_sw_tauc, gpu_sw_ssac, gpu_sw_asmc, gpu_sw_fsfc) &
+!$acc   delete(gpu_sw_tauaer, gpu_sw_ssaaer, gpu_sw_asmaer, gpu_sw_ecaer) &
+!$acc   delete(gpu_sw_swuflx, gpu_sw_swdflx, gpu_sw_swuflxc, gpu_sw_swdflxc) &
+!$acc   delete(gpu_sw_swhr, gpu_sw_swhrc) &
+!$acc   delete(gpu_sw_visdir, gpu_sw_visdif, gpu_sw_nirdir, gpu_sw_nirdif) &
+!$acc   delete(gpu_sw_dkdir, gpu_sw_dkdif)
+
+   DEALLOCATE(gpu_sw_i_idx, gpu_sw_j_idx, gpu_sw_bad, gpu_sw_coszrs)
+   DEALLOCATE(gpu_sw_play, gpu_sw_plev, gpu_sw_tlay, gpu_sw_tlev, gpu_sw_tsfc)
+   DEALLOCATE(gpu_sw_h2ovmr, gpu_sw_o3vmr, gpu_sw_co2vmr, gpu_sw_ch4vmr, gpu_sw_n2ovmr, gpu_sw_o2vmr)
+   DEALLOCATE(gpu_sw_asdir, gpu_sw_asdif, gpu_sw_aldir, gpu_sw_aldif, gpu_sw_coszen)
+   DEALLOCATE(gpu_sw_cldfrac, gpu_sw_ciwp, gpu_sw_clwp, gpu_sw_cswp)
+   DEALLOCATE(gpu_sw_rei, gpu_sw_rel, gpu_sw_res)
+   DEALLOCATE(gpu_sw_tauc, gpu_sw_ssac, gpu_sw_asmc, gpu_sw_fsfc)
+   DEALLOCATE(gpu_sw_tauaer, gpu_sw_ssaaer, gpu_sw_asmaer, gpu_sw_ecaer)
+   DEALLOCATE(gpu_sw_swuflx, gpu_sw_swdflx, gpu_sw_swuflxc, gpu_sw_swdflxc)
+   DEALLOCATE(gpu_sw_swhr, gpu_sw_swhrc)
+   DEALLOCATE(gpu_sw_visdir, gpu_sw_visdif, gpu_sw_nirdir, gpu_sw_nirdif)
+   DEALLOCATE(gpu_sw_dkdir, gpu_sw_dkdif)
+! Cleared once the whole tile has been flushed, not inside
+! gpu_flush_sw_chunk: a tile takes several chunks, and a bad column in the
+! second or later chunk of the very first radiation call still needs the
+! seed (the outputs it would otherwise "hold" have never been written).
+   gpu_sw_first_call = .FALSE.
+#endif
 
 !-------------------------------------------------------------------
+
+#ifdef WRF_GPU_RAD
+   CONTAINS
+
+   SUBROUTINE gpu_flush_sw_chunk()
+! Runs the currently-filled GPU chunk (gpu_sw_nfill columns, host
+! association into RRTMG_SWRAD's batch/output arrays and dummy arguments)
+! through rrtmg_sw_gpu_chain_driver and unpacks the results into this
+! tile's (i,j)-indexed output arrays, then resets the chunk counter.
+! Host-only orchestration -- never called from a device kernel, so the
+! usual internal-procedure/device restriction does not apply.
+!
+! The batch arrays are device-resident for the whole RRTMG_SWRAD call
+! (pushed once before j_loop), so a flush only "update device"s the
+! just-filled inputs and "update host"s the results: no enter/exit data,
+! no ALLOCATE/DEALLOCATE, nothing that can leave a dangling mapping
+! behind. That design was arrived at the hard way on the LW side -- see
+! the redesign note in gpu_flush_lw_chunk.
+!
+! The chain driver always runs on the full gpu_sw_chunksize, never a
+! gpu_sw_nfill slice: slicing only the leading dimension of a persistent
+! array is non-contiguous, which makes the compiler materialise a hidden
+! host temporary at a different address than the one enter data knows
+! about, and every kernel inside then fails "data in PRESENT clause was
+! not found on device". Unused tail columns recompute on the zeroed (or
+! stale-but-valid) staging defaults and are simply not unpacked below.
+   IMPLICIT NONE
+   INTEGER :: gk, gi, gj, gkk
+
+!$acc update device(gpu_sw_play, gpu_sw_plev, gpu_sw_tlay, gpu_sw_tlev, gpu_sw_tsfc) &
+!$acc   device(gpu_sw_h2ovmr, gpu_sw_o3vmr, gpu_sw_co2vmr, gpu_sw_ch4vmr, gpu_sw_n2ovmr, gpu_sw_o2vmr) &
+!$acc   device(gpu_sw_asdir, gpu_sw_asdif, gpu_sw_aldir, gpu_sw_aldif, gpu_sw_coszen) &
+!$acc   device(gpu_sw_cldfrac, gpu_sw_ciwp, gpu_sw_clwp, gpu_sw_cswp) &
+!$acc   device(gpu_sw_rei, gpu_sw_rel, gpu_sw_res) &
+!$acc   device(gpu_sw_tauc, gpu_sw_ssac, gpu_sw_asmc, gpu_sw_fsfc) &
+!$acc   device(gpu_sw_tauaer, gpu_sw_ssaaer, gpu_sw_asmaer, gpu_sw_ecaer)
+
+   CALL rrtmg_sw_gpu_chain_driver(gpu_sw_chunksize, gpu_sw_nlay, gpu_sw_icld, gpu_sw_iaer, &
+             irng, permuteseed, &
+             gpu_sw_play, gpu_sw_plev, gpu_sw_tlay, gpu_sw_tlev, gpu_sw_tsfc, &
+             gpu_sw_h2ovmr, gpu_sw_o3vmr, gpu_sw_co2vmr, gpu_sw_ch4vmr, gpu_sw_n2ovmr, gpu_sw_o2vmr, &
+             gpu_sw_asdir, gpu_sw_asdif, gpu_sw_aldir, gpu_sw_aldif, gpu_sw_coszen, &
+             gpu_sw_adjes, gpu_sw_dyofyr, gpu_sw_scon, &
+             gpu_sw_inflgsw, gpu_sw_iceflgsw, gpu_sw_liqflgsw, &
+             gpu_sw_cldfrac, gpu_sw_ciwp, gpu_sw_clwp, gpu_sw_cswp, &
+             gpu_sw_tauc, gpu_sw_ssac, gpu_sw_asmc, gpu_sw_fsfc, &
+             gpu_sw_rei, gpu_sw_rel, gpu_sw_res, &
+             gpu_sw_tauaer, gpu_sw_ssaaer, gpu_sw_asmaer, gpu_sw_ecaer, &
+             gpu_sw_swuflx, gpu_sw_swdflx, gpu_sw_swhr, &
+             gpu_sw_swuflxc, gpu_sw_swdflxc, gpu_sw_swhrc, &
+             gpu_sw_visdir, gpu_sw_visdif, gpu_sw_nirdir, gpu_sw_nirdif, &
+             gpu_sw_dkdir, gpu_sw_dkdif)
+
+!$acc update host(gpu_sw_swuflx, gpu_sw_swdflx, gpu_sw_swuflxc, gpu_sw_swdflxc) &
+!$acc   host(gpu_sw_swhr, gpu_sw_swhrc) &
+!$acc   host(gpu_sw_visdir, gpu_sw_visdif, gpu_sw_nirdir, gpu_sw_nirdif) &
+!$acc   host(gpu_sw_dkdir, gpu_sw_dkdif)
+
+   DO gk = 1, gpu_sw_nfill
+      gi = gpu_sw_i_idx(gk)
+      gj = gpu_sw_j_idx(gk)
+
+! A column flagged bad had its pressure/temperature force-clamped to one
+! nominal value for every layer, purely to keep the device kernels from
+! choking on a NaN. That clamp is physically wrong for any layer not near
+! the surface, and writing the resulting finite-but-absurd heating rate
+! into RTHRATENSW is exactly what destabilised the dynamics when the LW
+! port tried it (a runaway loop caused by the "fix", not by the original
+! bad input). So a bad column's SW outputs are skipped entirely this step,
+! holding whatever value they already had.
+!
+! "Hold the previous value" only means something once a previous value
+! exists, so on the very first radiation call of a run seed a defined,
+! physically harmless value (no shortwave) instead of whatever the
+! allocation left behind.
+      IF (gpu_sw_bad(gk)) THEN
+         IF (gpu_sw_first_call) THEN
+            gsw(gi,gj)  = 0.
+            swcf(gi,gj) = 0.
+            IF (gpu_sw_have_swupt) THEN
+               swupt(gi,gj)    = 0. ; swuptc(gi,gj)   = 0.
+               swdnt(gi,gj)    = 0. ; swdntc(gi,gj)   = 0.
+               swupb(gi,gj)    = 0. ; swupbc(gi,gj)   = 0.
+               swdnb(gi,gj)    = 0. ; swdnbc(gi,gj)   = 0.
+               swvisdir(gi,gj) = 0. ; swvisdif(gi,gj) = 0.
+               swnirdir(gi,gj) = 0. ; swnirdif(gi,gj) = 0.
+            ENDIF
+            swddir(gi,gj) = 0. ; swddni(gi,gj) = 0. ; swddif(gi,gj) = 0.
+            IF (gpu_sw_have_swupflx) THEN
+               DO gkk = kts, kte+2
+                  swupflx(gi,gkk,gj)  = 0. ; swupflxc(gi,gkk,gj) = 0.
+                  swdnflx(gi,gkk,gj)  = 0. ; swdnflxc(gi,gkk,gj) = 0.
+               ENDDO
+            ENDIF
+            DO gkk = kts, kte
+               rthratensw(gi,gkk,gj) = 0.
+            ENDDO
+         ENDIF
+         CYCLE
+      ENDIF
+
+! Net absorbed shortwave surface flux, and shortwave cloud forcing at the
+! top of atmosphere (W/m2). Level index kte+2 is the chain driver's
+! gpu_sw_nlay+1.
+      gsw(gi,gj)  = gpu_sw_swdflx(gk,1) - gpu_sw_swuflx(gk,1)
+      swcf(gi,gj) = (gpu_sw_swdflx(gk,gpu_sw_nlay+1) - gpu_sw_swuflx(gk,gpu_sw_nlay+1)) &
+                  - (gpu_sw_swdflxc(gk,gpu_sw_nlay+1) - gpu_sw_swuflxc(gk,gpu_sw_nlay+1))
+
+      IF (gpu_sw_have_swupt) THEN
+         swupt(gi,gj)    = gpu_sw_swuflx(gk,gpu_sw_nlay+1)
+         swuptc(gi,gj)   = gpu_sw_swuflxc(gk,gpu_sw_nlay+1)
+         swdnt(gi,gj)    = gpu_sw_swdflx(gk,gpu_sw_nlay+1)
+         swdntc(gi,gj)   = gpu_sw_swdflxc(gk,gpu_sw_nlay+1)
+         swupb(gi,gj)    = gpu_sw_swuflx(gk,1)
+         swupbc(gi,gj)   = gpu_sw_swuflxc(gk,1)
+         swdnb(gi,gj)    = gpu_sw_swdflx(gk,1)
+         swdnbc(gi,gj)   = gpu_sw_swdflxc(gk,1)
+         swvisdir(gi,gj) = gpu_sw_visdir(gk,1)
+         swvisdif(gi,gj) = gpu_sw_visdif(gk,1)
+         swnirdir(gi,gj) = gpu_sw_nirdir(gk,1)
+         swnirdif(gi,gj) = gpu_sw_nirdif(gk,1)
+      ENDIF
+
+      swddir(gi,gj) = gpu_sw_dkdir(gk,1)
+! Divided by this column's own cosine solar zenith angle, stashed at
+! accumulate time -- coszrs is a scalar that the i_loop overwrites every
+! column, so by flush time it holds some later column's value.
+      swddni(gi,gj) = swddir(gi,gj) / gpu_sw_coszrs(gk)
+      swddif(gi,gj) = gpu_sw_dkdif(gk,1)
+
+      IF (gpu_sw_have_swupflx) THEN
+         DO gkk = kts, kte+2
+            swupflx(gi,gkk,gj)  = gpu_sw_swuflx(gk,gkk)
+            swupflxc(gi,gkk,gj) = gpu_sw_swuflxc(gk,gkk)
+            swdnflx(gi,gkk,gj)  = gpu_sw_swdflx(gk,gkk)
+            swdnflxc(gi,gkk,gj) = gpu_sw_swdflxc(gk,gkk)
+         ENDDO
+      ENDIF
+
+! Heating rate tendency, K/d -> K/s, vertically bottom to top.
+      DO gkk = kts, kte
+         rthratensw(gi,gkk,gj) = (gpu_sw_swhr(gk,gkk)/86400.) / pi3d(gi,gkk,gj)
+      ENDDO
+   ENDDO
+
+   gpu_sw_nfill = 0
+
+   END SUBROUTINE gpu_flush_sw_chunk
+#endif
 
    END SUBROUTINE RRTMG_SWRAD
 
@@ -15501,6 +16116,21 @@ CONTAINS
 ! Perform g-point reduction and other initializations
 ! Specific heat of dry air (cp) used in flux to heating rate conversion factor.
    call rrtmg_sw_ini(cp)
+
+#ifdef WRF_GPU_RAD
+! Push every read-only SW lookup table to the device, once for the life of
+! the run. This must come AFTER rrtmg_sw_ini, which is what actually fills
+! them (the g-point reduction rewrites absa/absb/sfluxref/etc. in place),
+! and it is guarded because rrtmg_swinit runs once per domain.
+!
+! Forgetting this does not fail to compile or link: every kernel that
+! reads one of these tables aborts at run time with "FATAL ERROR: data in
+! PRESENT clause was not found on device", naming the missing array.
+   IF ( .NOT. gpu_tables_sw_pushed ) THEN
+      CALL gpu_tables_sw_todevice()
+      gpu_tables_sw_pushed = .TRUE.
+   ENDIF
+#endif
 
    END SUBROUTINE rrtmg_swinit
 
