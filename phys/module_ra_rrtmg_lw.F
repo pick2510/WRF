@@ -2858,13 +2858,26 @@ contains
       CONTAINS
 
 ! Per-column device memory footprint (bytes) of the batched LW pipeline,
-! single-precision (4-byte, per this build's -r4). This is a first-cut
-! estimate from the arrays known to be threaded end-to-end through the
-! pipeline (inatm's per-g-point cloud/gas outputs, taumol's per-g-point
-! optical depths, rtrnmc's per-g-point scratch) -- it should be revisited
-! once the actual batched driver's array list is finalized, since it is
-! currently derived from the individual _gpu stages' known signatures
-! rather than from a single, already-written end-to-end driver.
+! single-precision (4-byte, per this build's -r4).
+!
+! Counted directly off rrtmg_lw_gpu_chain_driver's ALLOCATE list plus
+! rtrnmc_driver_gpu's own internal scratch, which is what actually gets
+! allocated per chunk. (It used to be a pre-driver guess derived from the
+! individual _gpu stages' signatures, and it undercounted by ~1.75x --
+! mostly by assuming 9 ngptlw-wide arrays where the assembled chain really
+! carries 16, and by writing off the per-layer scalars as negligible.)
+!
+! ngptlw-wide, 16 arrays: cldfmcl/ciwpmcl/clwpmcl/cswpmcl/taucmcl (mcica
+!   output, 5), cldfmc/taucmc/ciwpmc/cswpmc/clwpmc (inatm output, 5),
+!   fracs/taug/taut (taumol + combine, 3), odcld/abscld/efclfrac
+!   (rtrnmc_driver_gpu's internal cloud scratch, 3).
+! nbndlw-wide, 3 arrays: taua, planklay, planklev.
+! mxmol/maxxsec-wide: wkl, wx.
+! Per-layer scalars, ~95 words: pavel, tavel, pz, tz, coldry, wbrodl,
+!   reicmc(l)/relqmc(l)/resnmc(l), laytrop, jp, jt, jt1, colh2o..colbrd (8),
+!   indself/indfor/indminor, selffac/selffrac/forfac/forfrac,
+!   minorfrac/scaleminor/scaleminorn2, fac00/01/10/11, the 12 rat_* arrays,
+!   and icldlyr. No longer negligible now that they are counted honestly.
       INTEGER(kind=8) FUNCTION rrtmg_lw_gpu_bytes_per_column(nlayers) RESULT(nbytes)
 
       use parrrtm, only : nbndlw, ngptlw, mxmol, maxxsec
@@ -2875,26 +2888,93 @@ contains
 
       nlay8 = INT(nlayers, 8)
 
-! Per layer: wkl(mxmol) + wx(maxxsec) [inatm], cldfmc/taucmc/ciwpmc/
-! clwpmc/cswpmc(ngptlw) [inatm->cldprmc, 5 arrays], fracs/taut/taur-style
-! g-point arrays carried through taumol/rtrnmc (~4 more ngptlw-wide
-! arrays), planklay/planklev/secdiff-style band arrays (~3 nbndlw-wide),
-! plus roughly 20 scalar-per-layer arrays (pavel, tavel, coldry, jp, jt,
-! jt1, fac00/01/10/11, selffac, selffrac, indself, forfac, forfrac,
-! indfor, ...) that are negligible next to the ngptlw=140-wide arrays.
-      nbytes = 4_8 * nlay8 * (INT(mxmol,8) + INT(maxxsec,8) + 9_8*INT(ngptlw,8) &
-                               + 3_8*INT(nbndlw,8) + 20_8)
+      nbytes = 4_8 * nlay8 * (INT(mxmol,8) + INT(maxxsec,8) + 16_8*INT(ngptlw,8) &
+                               + 3_8*INT(nbndlw,8) + 95_8)
 
       END FUNCTION rrtmg_lw_gpu_bytes_per_column
+
+! How many MPI ranks share the GPU this rank is using.
+!
+! acc_get_property(..., acc_property_free_memory) reports the whole
+! device's free memory, and every rank believes it is alone on it. With
+! more than one rank per GPU each therefore sized a chunk to its own
+! "half" (or more) of the card and the run died before the first timestep
+! with "Out of memory allocating ... bytes of device memory /
+! total/free CUDA memory: 8177909760/50921472" on the 8GB RTX 5060 at
+! -np 4. Dividing the free-memory figure by this count is what makes the
+! GPU radiation path usable at more than one rank.
+!
+! Counted exactly rather than assumed: split the domain's communicator
+! into node-local groups (MPI_COMM_TYPE_SHARED, so this is per physical
+! node, not per job), gather every node-local rank's OpenACC device
+! number, and count how many match this rank's. That is correct whether
+! the node has one GPU shared by everyone, several GPUs with ranks spread
+! over them, or one rank per GPU -- no assumption about how ranks map to
+! devices, and no hardcoded device count.
+!
+! The result is cached: MPI_Comm_split_type is collective, and this is
+! reached once per RRTMG_LWRAD call. Every rank in local_communicator
+! calls radiation on the same timesteps, so they all execute the
+! uncached path together on the first radiation call and never again.
+      INTEGER(kind=im) FUNCTION rrtmg_lw_gpu_ranks_per_device() RESULT(nshare)
+
+#ifdef DM_PARALLEL
+      use module_dm, only : local_communicator
+#endif
+      use openacc
+
+      IMPLICIT NONE
+#ifdef DM_PARALLEL
+      INCLUDE 'mpif.h'
+      INTEGER :: node_comm, node_size, mydev, ierr
+      INTEGER, ALLOCATABLE :: node_devs(:)
+#endif
+      INTEGER(kind=im), SAVE :: nshare_cached = -1
+
+      IF (nshare_cached .gt. 0) THEN
+         nshare = nshare_cached
+         RETURN
+      ENDIF
+
+      nshare = 1
+#ifdef DM_PARALLEL
+      IF (local_communicator .ne. MPI_UNDEFINED) THEN
+         CALL MPI_Comm_split_type(local_communicator, MPI_COMM_TYPE_SHARED, 0, &
+                                  MPI_INFO_NULL, node_comm, ierr)
+         IF (ierr .eq. MPI_SUCCESS) THEN
+            CALL MPI_Comm_size(node_comm, node_size, ierr)
+            IF (ierr .eq. MPI_SUCCESS .and. node_size .gt. 0) THEN
+               mydev = acc_get_device_num(acc_device_nvidia)
+               ALLOCATE(node_devs(node_size))
+               CALL MPI_Allgather(mydev, 1, MPI_INTEGER, node_devs, 1, MPI_INTEGER, &
+                                  node_comm, ierr)
+               IF (ierr .eq. MPI_SUCCESS) THEN
+                  nshare = COUNT(node_devs .eq. mydev)
+               ELSE
+!  Could not find out; assume every node-local rank is on this device,
+!  which is the smallest (safest) chunk this node could need.
+                  nshare = node_size
+               ENDIF
+               DEALLOCATE(node_devs)
+            ENDIF
+            CALL MPI_Comm_free(node_comm, ierr)
+         ENDIF
+      ENDIF
+#endif
+      IF (nshare .lt. 1) nshare = 1
+      nshare_cached = nshare
+
+      END FUNCTION rrtmg_lw_gpu_ranks_per_device
 
 ! Returns a safe ncol batch size for one LW GPU pipeline call, capped at
 ! max_ncol (the actual number of columns remaining to process) and sized
 ! against a fraction of this device's currently-free memory -- queried at
-! runtime, never assumed. The safety_fraction leaves headroom for the
-! ~4MB of k-distribution lookup tables (fixed, independent of chunk size)
-! and anything else already resident on the device (e.g. the dyn_em
-! OpenACC port's own working arrays, if running in the same process) that
-! this query cannot separately account for.
+! runtime, never assumed -- divided by the number of ranks sharing that
+! device. The safety_fraction leaves headroom for the ~4MB of
+! k-distribution lookup tables (fixed, independent of chunk size) and
+! anything else already resident on the device (e.g. the dyn_em OpenACC
+! port's own working arrays, if running in the same process) that this
+! query cannot separately account for.
       INTEGER(kind=im) FUNCTION rrtmg_lw_gpu_chunksize(nlayers, max_ncol) RESULT(ncol_chunk)
 
       use openacc
@@ -2903,14 +2983,31 @@ contains
       INTEGER(kind=im), INTENT(IN) :: nlayers, max_ncol
 
       INTEGER :: devnum
+      INTEGER(kind=im) :: nshare
       INTEGER(kind=8) :: free_bytes, bytes_per_col
+! What the safety_fraction has to cover, none of which the free-memory
+! query can see, because it is taken before any kernel of this chunk has
+! launched: the ~4MB of k-distribution lookup tables, the CUDA context
+! itself (a few hundred MB per rank), and -- the big one -- the local
+! memory CUDA reserves at launch for rtrnmc_gpu's per-thread private
+! arrays (8 arrays of mxlay=203 reals, ~6.5KB per thread, reserved for
+! every resident thread the device can hold). At 4 ranks on the 8GB card
+! the last of those is what turned a successful cuMemAlloc into a failing
+! cuLaunchKernel.
       REAL(kind=rb), PARAMETER :: safety_fraction = 0.5_rb
 
       devnum = acc_get_device_num(acc_device_nvidia)
       free_bytes = acc_get_property(devnum, acc_device_nvidia, acc_property_free_memory)
       bytes_per_col = rrtmg_lw_gpu_bytes_per_column(nlayers)
+      nshare = rrtmg_lw_gpu_ranks_per_device()
 
-      ncol_chunk = INT(REAL(free_bytes, rb) * safety_fraction / REAL(bytes_per_col, rb), im)
+! Note this is deliberately conservative twice over when ranks reach here
+! at different times: free_bytes already reflects whatever earlier ranks
+! have allocated, and it is then divided again by nshare. That costs a few
+! extra chunks per tile at worst; the pipeline is correct for any chunk
+! size down to 1, so under-sizing is always the safe direction.
+      ncol_chunk = INT(REAL(free_bytes, rb) * safety_fraction &
+                       / REAL(nshare, rb) / REAL(bytes_per_col, rb), im)
 
       IF (ncol_chunk .gt. max_ncol) ncol_chunk = max_ncol
       IF (ncol_chunk .lt. 1) ncol_chunk = 1
