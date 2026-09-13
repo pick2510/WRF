@@ -367,19 +367,47 @@ addition, original CPU per-column path untouched) that:
        `RTHRATENSW = RTHRATEN - RTHRATENLW`, so a `NaN` from LW shows up in
        both. SW was never involved.
   9. **Verified end-to-end** (this is the real verification the port needed,
-     and the pattern to reuse for SW): full 10-minute real 1-rank Hong Kong
-     run reaches `SUCCESS COMPLETE WRF`, with **zero** "non-physical p/T"
-     warnings (was 15,620) and every chain intermediate — `coldry`,
-     `pwvcm`, `planklay`, `fac00`, `selffac`, `taug`, `taut`, `htr` —
-     finite for all 15,625 columns. The **isolating** comparison is the
-     one that counts: the *same* binary rebuilt with `WRF_GPU_RAD`
-     undefined (CPU radiation, GPU dynamics) gives `dpsdt`/`dmudt` agreeing
-     to 5 significant figures at every step (e.g. `109.377/99.961` vs
-     `109.377/99.962`), so the GPU chain now reproduces the CPU radiation
-     path. Do **not** compare against the pure-CPU baseline
-     (`/mnt/nvme/wrf_hk_cpu_d01`) to judge the radiation port: that build
-     differs by ~5% in `dmudt` because of `WRF_GPU_DYN`, equally in both
-     GPU builds — a separate, pre-existing question.
+     and the pattern to reuse for SW): full 10-minute real Hong Kong runs
+     at 1, 2 and 4 ranks all reach `SUCCESS COMPLETE WRF` with **zero**
+     "non-physical p/T" warnings (was 15,620), and every chain intermediate
+     — `coldry`, `pwvcm`, `planklay`, `fac00`, `selffac`, `taug`, `taut`,
+     `htr` — is finite for all 15,625 columns. Final-step domain-average
+     `dpsdt`/`dmudt` against the CPU-only build:
+
+     | build | ranks | dpsdt / dmudt |
+     |---|---|---|
+     | CPU-only | 1 | 103.6147 / 94.7676 |
+     | GPU (dyn + LW rad) | 1 | 103.7536 / 94.7677 |
+     | GPU (dyn + LW rad) | 2 | 103.6916 / 94.7661 |
+     | GPU (dyn + LW rad) | 4 | 103.6548 / 94.7673 |
+
+     `dmudt` agrees to 5 significant figures at every rank count, `dpsdt`
+     to within 0.13%. An earlier, narrower check also holds: the *same*
+     binary rebuilt with `WRF_GPU_RAD` undefined (CPU radiation, GPU
+     dynamics) tracks the `WRF_GPU_RAD` build to 5 significant figures,
+     which isolates radiation specifically.
+
+     **Retraction, worth keeping because it nearly became doctrine**: for
+     part of this session the GPU build showed a ~5% `dmudt` offset against
+     the CPU baseline, and that was written up here as "caused by
+     `WRF_GPU_DYN`, pre-existing, not the radiation port's problem". That
+     was wrong. It was caused by a `solve_em.F` change made the same day
+     (commit `030f4aa3a`, reverted in `dcca4e8e1`) that added an
+     `!$acc update device` of `ph_2/al/p/mu_2/muts/mudf` after the
+     small-step `set_physical_bc*` calls. The staleness runs the other
+     way: during the acoustic loop the **device** holds the authoritative
+     copies and the **host** ones are stale, except where a halo exchange
+     has already forced an `update self` — which is exactly the
+     `ntasks>1 .or. periodic` case the pre-existing push is conditioned on.
+     At 1 rank there is no halo exchange, so that added push overwrote good
+     device data with stale host data every substep. It was invisible at 4
+     ranks because the pre-existing push fires there and made the new block
+     redundant — **which is why it got misattributed to a build-level
+     difference.** Two lessons: when a discrepancy appears, suspect what
+     changed today before blaming a subsystem that has been stable for
+     weeks; and a bug that disappears at higher rank counts is a hint about
+     *which code path is conditional on rank count*, not evidence that the
+     bug is environmental.
   10. **Wall clock**, real Hong Kong case, 10 minutes simulated, same
      machine (40-core box + RTX 5060), `nvfortran -O3` throughout:
 
@@ -387,20 +415,20 @@ addition, original CPU per-column path untouched) that:
      |---|---|---|
      | CPU-only (`WRF_cpu`) | 1 | 312.0s |
      | `WRF_GPU_DYN` only (CPU radiation) | 1 | 304.6s |
-     | `WRF_GPU_DYN` + `WRF_GPU_RAD` | 1 | **242.2s** |
+     | `WRF_GPU_DYN` + `WRF_GPU_RAD` | 1 | 245.1s |
+     | `WRF_GPU_DYN` + `WRF_GPU_RAD` | 2 | 144.9s |
+     | `WRF_GPU_DYN` + `WRF_GPU_RAD` | 4 | **85.4s** |
      | CPU-only | 4 | 100.6s |
      | CPU-only | 8 | 57.3s |
 
-     So at equal rank count the LW port is worth **1.29x** end-to-end
-     (essentially all of it from radiation — the dyn port is at parity, as
-     documented), but **the GPU build is not yet competitive with simply
-     using the CPU cores this box has**: 4-rank CPU is 2.4x faster than the
-     1-rank GPU build and 8-rank is 4.2x faster. Two things have to change
-     before the GPU path wins in practice: SW radiation must be ported (it
-     is still entirely on the CPU and is now the dominant remaining
-     radiation cost), and the multi-rank chunk-sizing limitation above must
-     be fixed so the GPU build can use more than one rank at all. Quote the
-     1.29x as "LW-only, 1 rank", never as a headline GPU-vs-CPU number.
+     At 1 rank the LW port is worth **1.27x** end-to-end, essentially all
+     of it from radiation (the dyn port is at parity, as documented). The
+     GPU build now scales across ranks sharing the one card (2.9x from 1 to
+     4 ranks) and at 4 ranks it beats the 4-rank CPU build (85.4s vs
+     100.6s) — but 8-rank CPU is still faster than anything the GPU build
+     currently reaches, so **do not quote a headline GPU-vs-CPU number**.
+     The remaining lever is SW radiation: it is still entirely on the CPU
+     and is now the dominant radiation cost.
 
 - **Chunk sizing is solved, device-independently**:
   `rrtmg_lw_gpu_chunksize(nlayers, max_ncol)` (module `rrtmg_lw_gpu_chunk`,
@@ -421,17 +449,32 @@ addition, original CPU per-column path untouched) that:
   wasn't, when the estimate was first written) — the sizing *mechanism* is
   solid, the number it multiplies is worth double-checking against the
   chain driver's actual `ALLOCATE` list.
-  **Known limitation — the sizing is per-process, so multi-rank runs on a
-  single GPU fail.** `acc_get_property(..., acc_property_free_memory)`
-  reports the whole device's free memory, and every rank believes it is
-  alone: at `-np 4` on the 8GB RTX 5060 the first ranks each size a chunk
-  to ~half the card and a later one dies with
-  `Out of memory allocating 171143280 bytes of device memory /
-  total/free CUDA memory: 8177909760/50921472` before the first timestep.
-  1 rank is fine. Fixing this means dividing the free-memory figure by the
-  number of ranks sharing the device (e.g. from the node-local MPI
-  communicator size, or `MPI_COMM_TYPE_SHARED`), not hardcoding anything —
-  needed before the 2-/4-rank verification below can even be attempted.
+  **Made rank-aware** (commit `6004292d8`).
+  `acc_get_property(..., acc_property_free_memory)` reports the whole
+  device, so every rank believed it was alone and `-np 4` on the 8GB card
+  died with `CUDA_ERROR_OUT_OF_MEMORY` before the first timestep.
+  `rrtmg_lw_gpu_ranks_per_device()` now divides by the number of ranks
+  actually sharing this rank's GPU, measured rather than assumed: split the
+  domain communicator with `MPI_COMM_TYPE_SHARED` (per physical node),
+  allgather each node-local rank's `acc_get_device_num`, count the matches.
+  Correct for one GPU shared by all ranks, several GPUs with ranks spread
+  over them, or one rank per GPU — no hardcoded device count. Cached, since
+  `MPI_Comm_split_type` is collective and this is reached once per
+  `RRTMG_LWRAD` call; every rank in `local_communicator` calls radiation on
+  the same timesteps, so they execute the uncached path together once.
+
+  **And the byte estimate was ~1.75x too low** — the TODO above is now
+  done. Dividing by rank count alone got 2 ranks working but left 4 ranks
+  failing at `cuLaunchKernel` rather than `cuMemAlloc`: the chunk allocation
+  succeeded and the device then ran out reserving local memory for
+  `rtrnmc_gpu`'s per-thread private arrays (8 arrays of `mxlay=203` reals,
+  ~6.5KB per thread, reserved for every resident thread). Counting
+  `rrtmg_lw_gpu_bytes_per_column` off the chain driver's real `ALLOCATE`
+  list — 16 `ngptlw`-wide arrays, not 9, plus ~95 per-layer scalars that
+  are not negligible once the g-point arrays are right — shrank the chunk
+  enough that 4 ranks fits. **`safety_fraction` has to cover the CUDA
+  context and that kernel local-memory reservation too**, neither of which
+  a free-memory query taken before the first launch can see.
 - **Build wiring done, but differently than originally planned**: rather
   than dispatching between a CPU and a GPU version of `RRTMG_LWRAD` from
   `module_radiation_driver.F:1521` (the `dyn_em`-style `IF`/`ELSE` shape),
@@ -441,12 +484,12 @@ addition, original CPU per-column path untouched) that:
   calls `RRTMG_LWRAD` exactly as before. Simpler than planned, and it means
   the CPU code path inside `RRTMG_LWRAD` truly never executes when
   `WRF_GPU_RAD` is defined, rather than living on as dead code.
-- End-to-end verification: done at 1 rank (see points 8–10 above —
-  identical `dpsdt`/`dmudt` to the `WRF_GPU_RAD`-undefined build of the
-  same binary, to 5 significant figures over a full 10-minute run).
-  **Still outstanding**: a 2-/4-rank run, and a direct field-level
-  comparison of `RTHRATENLW`/`GLW`/`OLR`/`LWCF` and the `LWUPT`/`LWDNB`
-  flux diagnostics. The Hong Kong namelist's `history_interval = 30`
+- End-to-end verification: done at 1, 2 and 4 ranks (see points 8–10
+  above — `dmudt` matches the CPU-only build to 5 significant figures at
+  every rank count over a full 10-minute run).
+  Done at 2 and 4 ranks too (see point 9's table). **Still outstanding**: a
+  direct field-level comparison of `RTHRATENLW`/`GLW`/`OLR`/`LWCF` and the
+  `LWUPT`/`LWDNB` flux diagnostics. The Hong Kong namelist's `history_interval = 30`
   means a 10-minute run only ever writes the t=0 frame, which predates
   any radiation call — so raise `run_minutes` past 30, or drop
   `history_interval`, before attempting that comparison.
