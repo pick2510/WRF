@@ -2253,6 +2253,80 @@ RLFLAGS         =
 CC_TOOLS        =      $(SCC)
 
 ###########################################################
+#ARCH    Linux x86_64, NVHPC compiler with nvc, OpenACC GPU (dyn_em + RRTMG radiation) # serial smpar dmpar dm+sm
+#
+DESCRIPTION     =       NVHPC ($SFC/$SCC): OpenACC GPU
+DMPARALLEL      =       # 1
+OMPCPP          =       # -D_OPENMP
+OMP             =       # -mp -Mrecursive
+OMPCC           =       # -mp
+SFC             =       nvfortran
+SCC             =       nvc
+CCOMP           =       nvc
+DM_FC           =       mpif90
+DM_CC           =       mpicc
+FC              =       CONFIGURE_FC
+CC              =       CONFIGURE_CC
+LD              =       $(FC)
+RWORDSIZE       =       CONFIGURE_RWORDSIZE
+PROMOTION       =       -r$(RWORDSIZE) -i4
+# WRF_GPU_DYN / WRF_GPU_RAD gate the OpenACC source; both are pure additions
+# guarded by #ifdef, so removing them here restores an ordinary CPU build.
+#
+# BUILD REQUIREMENT: run "ulimit -s unlimited" before ./compile. With the
+# default 8 MB stack, nvfortran's fort2 optimizer overflows its own stack and
+# dies with "TERMINATED by signal 11" at -O2 and above on every file that
+# carries WRF's full grid argument list (frame/module_cpl.F, frame/module_dm.F,
+# share/{dfi,mediation_integrate,module_optional_input,wrf_timeseries}.F,
+# dyn_em/{start_em,nest_init_utils,module_initialize_real}.F,
+# main/{module_wrf_top,real_em,tc_em}.F). The failure is silent in the sense
+# that make ignores it; you only see it as "cannot find <obj>.o" at link time.
+#
+# BUILD REQUIREMENT 2: with NETCDF=/usr on Debian, ./configure copies
+# nc-config's "-L/usr/lib/x86_64-linux-gnu" into NETCDF4_DEP_LIB in the
+# generated configure.wrf. Delete it. It precedes the -L that the NVHPC mpif90
+# wrapper appends, so the final -lmpi picks up Debian's OpenMPI rather than
+# HPC-X's and every executable fails to link with
+# "libmpi.so: undefined reference to opal_common_ofi_*".
+ARCH_LOCAL      =       -DNONSTANDARD_SYSTEM_SUBR -DWRF_GPU_DYN -DWRF_GPU_RAD -DWRF_USE_CLM
+CFLAGS_LOCAL    =       -w -O3
+LDFLAGS_LOCAL   =       $(GPU_DYN_FLAGS) $(GPU_RAD_FLAGS)
+CPLUSPLUSLIB    =
+ESMF_LDFLAG     =       $(CPLUSPLUSLIB)
+# -gpu=ccall builds device code for every compute capability this NVHPC
+# release supports, so one binary runs on any of them. Do NOT pin this to a
+# single ccXX: the runtime chunk sizing already queries whatever device it
+# finds (see rrtmg_lw_gpu_chunksize), and pinning is the only thing that
+# would tie the build to one GPU.
+# -Kieee is required: without it the GPU and CPU paths disagree well above
+# the single-precision noise floor and every verification tolerance here
+# becomes meaningless.
+GPU_DYN_FLAGS   =       -acc -gpu=ccall -Kieee
+GPU_RAD_FLAGS   =       -acc -gpu=ccall -Kieee
+# Deliberately plain -O3, not the aarch64 entry's "-fast -Mvect=noaltcode
+# -Mprefetch": -fast implies -Mfprelaxed-style reassociation that fights
+# -Kieee, and the GPU path is not helped by host vectorisation flags.
+FCOPTIM         =       -O3
+FCREDUCEDOPT    =       $(FCOPTIM)
+FCNOOPT         =       -O0
+FCDEBUG         =       # -g $(FCNOOPT) -Kieee
+FORMAT_FIXED    =       -Mfixed
+FORMAT_FREE     =       -Mfree
+FCSUFFIX        =
+BYTESWAPIO      =       -byteswapio
+FCBASEOPTS_NO_G =       -w $(FORMAT_FREE) $(BYTESWAPIO) $(OMP)
+FCBASEOPTS      =       $(FCBASEOPTS_NO_G) $(FCDEBUG)
+MODULE_SRCH_FLAG =     -module $(WRF_SRC_ROOT_DIR)/main
+TRADFLAG        =      CONFIGURE_TRADFLAG
+CPP             =      /lib/cpp CONFIGURE_CPPFLAGS
+AR              =      ar
+ARFLAGS         =      ru
+M4              =      m4 -B 14000
+RANLIB          =      ranlib
+RLFLAGS         =
+CC_TOOLS        =      $(SCC)
+
+###########################################################
 #ARCH    Linux aarch64, NVHPC compiler with nvc # serial smpar dmpar dm+sm
 #
 DESCRIPTION     =       NVHPC ($SFC/$SCC)

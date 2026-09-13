@@ -258,6 +258,30 @@ $(LIBTARGET) :
 
 include ../configure.wrf
 
+# Keep the OpenACC radiation port limited to RRTMG. GPU_RAD_FLAGS is empty in
+# every CPU configuration, so those builds continue to use the ordinary
+# implicit compilation rule unchanged (mirrors dyn_em/Makefile's GPU_DYN_FLAGS
+# stanza for the dynamics port).
+#
+# module_ra_rrtmg_sw.o is named explicitly even though a full build would
+# compile it with these flags anyway: target-specific variables propagate to
+# prerequisites, and module_radiation_driver.o depends on it via
+# main/depend.common, so it would inherit -acc from that rule rather than from
+# one of its own. That inheritance disappears the moment the object is rebuilt
+# on its own ("make module_ra_rrtmg_sw.o"), which silently produces a build
+# whose SW kernels are ordinary host loops -- no error, no warning, no GPU.
+ifneq ($(GPU_RAD_FLAGS),)
+module_ra_rrtmg_lw.o module_ra_rrtmg_sw.o module_radiation_driver.o: FCFLAGS += $(GPU_RAD_FLAGS)
+endif
+
+# module_ra_rrtmg_lwf.o/module_ra_rrtmg_swf.o (the dormant CUDA Fortran fast-
+# physics variants, ra_lw/sw_physics=24, not used by this project's namelist)
+# fail to compile under NVHPC with "-acc": their old !$acc kernels-era
+# directives trip a compiler parser bug ("Unmatched directive END - KERNELS")
+# that only surfaces on a from-scratch build. Since -acc buys nothing for a
+# file compiled as ordinary CPU code, drop back to the plain flags.
+module_ra_rrtmg_lwf.o module_ra_rrtmg_swf.o: FCFLAGS := $(FCOPTIM) $(FCBASEOPTS)
+
 non_nmm : $(MODULES) $(FIRE_MODULES) $(OBJS) $(DIAGNOSTIC_MODULES_EM)
 
 submodules :

@@ -2097,7 +2097,10 @@ CONTAINS
                   ITS=its,ITE=ite, JTS=jts,JTE=jte, KTS=kts,KTE=kte,&
                   LWUPFLX=LWUPFLX,LWUPFLXC=LWUPFLXC,                &
                   LWDNFLX=LWDNFLX,LWDNFLXC=LWDNFLXC,                &
-                  mp_physics=mp_physics                             )
+                  mp_physics=mp_physics                             &
+!  Domain id, for the WRF_GPU_RAD path's per-domain first-call flag.
+!  OPTIONAL in RRTMG_LWRAD, so this is additive.
+                 ,gpu_domain_id=id                                  )
 
 
 #if( BUILD_RRTMK == 1)
@@ -2675,6 +2678,9 @@ CONTAINS
                      sw_zbbcddir=sw_zbbcddir,                           & ! WRF-CMAQ coupled model
                      sw_dirdflux=sw_dirdflux,                           & ! WRF-CMAQ coupled model
                      sw_difdflux=sw_difdflux                            & ! WRF-CMAQ coupled model
+!  Domain id, for the WRF_GPU_RAD path's per-domain first-call flag.
+!  OPTIONAL in RRTMG_SWRAD, so this is additive.
+                    ,gpu_domain_id=id                                   &
                                                                         )
 
              ! = WRF-CMAQ twoway coupled model
