@@ -494,11 +494,39 @@ addition, original CPU per-column path untouched) that:
   any radiation call — so raise `run_minutes` past 30, or drop
   `history_interval`, before attempting that comparison.
 
-SW driver integration (`RRTMG_SWRAD`) has not been started at all yet and
-will need the same treatment once LW's is working — including its own
-cloud-optics gap (SW's cloud optical depth/single-scattering-albedo/
-asymmetry-parameter calculation, `RRTMG_SWRAD`'s own inline code, has not
-even been located yet, let alone ported).
+SW driver integration (`RRTMG_SWRAD`) has not been started and is now the
+whole remaining lever — LW is done and SW is the dominant radiation cost.
+What is and is not left, checked against the source rather than assumed:
+
+- **Ported and individually verified already**: `cldprmc_sw_gpu`,
+  `setcoef_sw_gpu`, `taumol_sw_gpu`, `reftra_sw_gpu`, `vrtqdr_sw_gpu`,
+  `spcvmc_sw_gpu` (6 `_gpu` modules in `module_ra_rrtmg_sw.F`).
+- **Not ported, and needed before a chain driver can exist**:
+  `mcica_subcol_sw` and SW's `inatm`. There is no
+  `mcica_subcol_sw_gpu`, no `inatm_sw_gpu`, no `rrtmg_sw_gpu_chain*`, and
+  no `#ifdef WRF_GPU_RAD` branch anywhere in `RRTMG_SWRAD`.
+- **The "cloud-optics gap" is not a gap** — same resolution as LW's, and
+  for the same reason. `RRTMG_SWRAD` sets `inflgsw = 2` unconditionally
+  (bumped to 3/4/5 by `has_reqc`/`has_reqi`/`has_reqs`, never back to 0),
+  and its inline cloud optical depth / single-scattering-albedo /
+  asymmetry-parameter code is guarded by `if (inflgsw .eq. 0)` — dead for
+  every call this project makes. The real cloud optics live in
+  `cldprmc_sw`, already ported and verified. **No SW cloud-optics kernel
+  needs writing.** (Earlier text here said this had "not even been
+  located"; it has, and it costs nothing.)
+- **Highest-risk piece to write is SW's `inatm`**, because that is exactly
+  where LW's cross-thread `pz(iplon,l-1)` race lived. Write it reading
+  `plev` directly, not a neighbour cell of an array the same kernel writes.
+  The existing SW kernels were audited for both of today's bug classes and
+  are clean: `vrtqdr_sw_gpu` writes every index of its private
+  `prup/prupd/ztdn/prdnd` before reading it (its `klev+1` boundary was
+  already fixed in an earlier session), `spcvmc_sw_cumprod_gpu`'s
+  recurrence is entirely within one thread's own `(iplon,:,ig)` slice, and
+  every other SW `private()` clause holds scalars only.
+- **Reuse, do not re-derive**: `RRTMG_LWRAD`'s chunk accumulate/flush
+  shape, and `rrtmg_lw_gpu_ranks_per_device()` — SW's chunk sizing needs
+  the same rank-awareness, so factor that helper out rather than copying
+  it.
 
 ### Prior work (done, stable, not part of current focus)
 `dyn_em` advection (`advect_u/v/w/scalar_o5v3`) and the acoustic loop
