@@ -660,6 +660,134 @@ before reading anything into it. WRF's dynamics are bit-reproducible
 across decompositions in this configuration, which is exactly why that
 control was inert and the GPU-vs-GPU one was not.
 
+### Nests, OpenMP, memory limits and device portability (commit `881318096`)
+
+**Nests work, and this is measured, not reasoned.** Domains are integrated
+sequentially (`frame/module_integrate.F`'s `RECURSIVE integrate`), so two
+domains never call radiation concurrently within a rank; all batch state is
+allocated and freed inside one `RRTMG_*RAD` call; chunk sizing is
+recomputed per call from that domain's own tile, so a nest gets its own
+chunking (including under vertical nesting, since `nlayers`/`gpu_sw_nlay`
+are re-derived per call); the table push is guarded by a `SAVE`d flag and
+so happens once across all domains.
+
+One real bug was found and fixed: `gpu_lw_first_call`/`gpu_sw_first_call`
+were `SAVE`d **scalars** shared by every domain, so domain 1's first call
+consumed the flag and a nest's genuine first call was treated as "not
+first" — holding an output value nothing had ever written. They are now
+arrays keyed by a new `OPTIONAL` `gpu_domain_id` argument, forwarded from
+`module_radiation_driver` (the only change that file has ever needed).
+`OPTIONAL` so no other caller is affected.
+
+Verified on the real two-domain case (d01 126×126 @6.25km, d02 126×126
+@1.25km, `parent_grid_ratio=5`), 2 simulated minutes, 4 ranks, 5 radiation
+calls on d01 and 25 on d02, zero warnings. Against the CPU-only build,
+**`dmudt` agrees to 6 significant figures on both domains** (d01 167.4833
+vs 167.4818; d02 359.9202 vs 359.9213). GPU 60.2s vs CPU 77.8s — nests are
+1.29x faster, less than the single-domain 1.8x because d02 runs 5x more
+steps and the dynamics are at parity there.
+
+**Setting up that nested case from `/mnt/DC550/HONGKONG/domain_16` needs
+four namelist fixes**, because that case was built for a newer WRF. Each
+one fails in a way that does not name the cause, so they are recorded here:
+- `dzbot` is not in this version's Registry. Its presence makes
+  `READ(NML=domains)` fail *silently* in `external/RSL_LITE/module_dm.F`'s
+  sneak-peek, leaving `parent_id` unset — the symptom is
+  "invalid parent id for domain 2", which looks like a nesting error and
+  is not. Same class: `use_wudapt_lcz` (`&physics`) and
+  `solar_diagnostics` (`&diags`).
+- `specified`/`nested` need one entry per domain
+  (`.true.,.false.` / `.false.,.true.`); a single entry leaves nests on
+  Registry defaults and fails boundary-condition validation.
+- `parent_time_step_ratio` likewise needs `1,5,5`.
+- The `wrfinput_d0*` files carry `SF_URBAN_PHYSICS = 2`, which this version
+  only allows with MYJ or BouLac PBL while the case uses YSU — and PBL must
+  match across domains. For a radiation test, patch the attribute on local
+  copies (`ncatted -a SF_URBAN_PHYSICS,global,o,l,0`) rather than changing
+  the PBL scheme. d03 was left out for the same reason.
+Scratch dirs used: `/mnt/nvme/wrf_hk_nest_gpu`, `/mnt/nvme/wrf_hk_nest_cpu`
+(inputs symlinked from `/mnt/DC550`, outputs on nvme).
+
+**Benchmarking trap, nearly reported as a regression**: the first nested
+comparison showed GPU 137.5s vs CPU 77.9s and looked like a serious GPU
+slowdown on nests. It was an artifact — the GPU run went first with a cold
+page cache (9.5GB `wrffdda_d01` on spinning disk) and a cold CUDA code
+cache, and the CPU run then benefited from both being warm. Re-run warm and
+alternating, it is GPU 60.2/60.3s vs CPU 77.8/78.4s, stable. **Never
+compare two builds on their first run over cold input; alternate the order
+and discard the first pair.**
+
+**OpenMP tiling is NOT safe, and is now guarded rather than fixed.**
+`module_radiation_driver` calls both `RRTMG_LWRAD` and `RRTMG_SWRAD` from
+inside an `!$OMP PARALLEL DO` over tiles (the region spans lines 968–2272),
+and this port's batch state (`gpu_nfill`, `gpu_play`, `gpu_sw_*`, ~40
+arrays per band) is **module-level and therefore shared between threads**.
+It is safe today only because `configure.wrf` has `OMP = # -mp -Mrecursive`,
+which forces `num_tiles=1`; serial multi-tile (`numtiles>1`, OpenMP off) is
+fine since each call completes before the next. An `#ifdef _OPENMP` runtime
+check now aborts with an explanatory message instead of silently racing.
+Two things to know before fixing it properly: the LW state was originally
+**local** to `RRTMG_LWRAD` (reached by host association from the nested
+flush routine, which is thread-safe) and was moved to module scope during a
+debugging session that did not need it — so the fix is largely a revert;
+and per-thread state alone is not enough, because N threads each sizing a
+chunk from the same whole-device free-memory query would over-commit the
+GPU, so the chunk must be divided by thread count as well as rank count.
+(Note upstream WRF already has `integer, save :: nlayers` in this module
+from the Cavallo boundary-condition commit, so the file was not strictly
+tile-safe before either — but that is one scalar with the same value on
+every tile, which is benign; this is not.)
+
+**Memory: a too-big domain is not a failure mode.** The chunk is capped at
+the tile and floored at 1, so a larger domain simply means more chunks.
+Measured (`/tmp/rrtmg_integrate/check_chunksize_sw.f90`, which prints this
+for the running device and for a range of hypothetical ones):
+
+| device | SW cols/chunk, 1 rank | 4 ranks | 8 ranks |
+|---|---|---|---|
+| 2GB | 526 (31 chunks) | 131 | 65 |
+| 8GB (this card) | 2104 (8) | 526 | 263 |
+| 24GB | 6312 (3) | 1578 | 789 |
+| 80GB | 15876 (**1**) | 5260 | 2630 |
+
+Two gaps were closed:
+- **Host memory scales with the chunk too, and nothing accounted for it.**
+  The chain drivers `ALLOCATE` a host mirror of every device intermediate,
+  because `!$acc enter data create(x)` needs `x` to exist on the host. A
+  2318-column SW chunk is **~4GB of host RAM per rank**; a large-VRAM card
+  would otherwise pick a chunk the node cannot allocate. Chunk sizing now
+  also reads `/proc/meminfo` `MemAvailable` and bounds by it, divided by
+  ranks **per node** (`rrtmg_lw_gpu_ranks_per_node`, filled by the existing
+  communicator split) rather than ranks per GPU — host memory is shared by
+  every rank on the box however the GPUs are divided between them.
+- Warn instead of silently degrading when the free-memory query returns 0
+  or the chunk clamps to 1 column. Neither is incorrect (the pipeline works
+  at any chunk size) but both mean the run will be very slow.
+
+Still absent, deliberately: there is no `stat=` on the ~174 GPU-path
+`ALLOCATE`s, and **device** OOM from `!$acc enter data` is not catchable in
+OpenACC at all. The mitigation is the sizing above, not error handling.
+
+**Device portability.** Runtime sizing was already device-independent
+(`acc_get_property` + a measured ranks-per-device count; verified from 2GB
+to 80GB). The *build* was not: `-gpu=cc120` meant the executable only
+loaded on Blackwell. Now **`-gpu=ccall`** in both `configure.wrf` and the
+tracked `arch/configure_new.defaults`, so one binary carries device code
+for **sm_75 through sm_121** — 12 architectures, Turing through Blackwell
+(`cuobjdump --list-elf main/wrf.exe` to check). Costs binary size (114MB)
+and compile time; measured runtime cost is nil (single domain, 4 ranks:
+57.6s → 55.6s, inside run-to-run noise).
+
+Two device assumptions remain, documented rather than removed:
+- `acc_device_nvidia` is hardcoded in 5 places — NVIDIA-only.
+- `safety_fraction = 0.5` must cover the CUDA context, the tables, and the
+  kernel local-memory reservation. That last term scales with **max
+  resident threads (≈ SM count)**, which is *not* proportional to VRAM — so
+  this is the one number implicitly tuned to a class of device. On a
+  many-SM/modest-VRAM part it may be too generous; on an 80GB card it
+  strands memory. OpenACC exposes no SM count, so raising this properly
+  needs either a CUDA-driver query or an env-var override.
+
 ### Prior work (done, stable, not part of current focus)
 `dyn_em` advection (`advect_u/v/w/scalar_o5v3`) and the acoustic loop
 (`advance_uv/mu_t/w_fast`) are fully ported to OpenACC for the
@@ -711,6 +839,13 @@ CUDA Fortran port" and go directly to a real OpenACC port of the reference
   stage). Check that before concluding anything from a verification run,
   and check `grep -- -acc` on the file's compile line in the build log
   whenever a rebuild was targeted rather than full.
+- **Never benchmark two builds on their first run over cold input.** The
+  first nested-case comparison showed the GPU build at 137.5s against the
+  CPU build's 77.9s and looked like a real slowdown; it was entirely the
+  GPU run going first with a cold page cache (a 9.5GB `wrffdda_d01` on
+  spinning disk) and a cold CUDA code cache, with the CPU run then getting
+  both warm. Warm and alternating, it is 60.2s vs 77.8s. Alternate the
+  order, run each at least twice, and discard the first pair.
 - **Known-harmless build noise**: the `diffwrf` external tool (in
   `external/io_netcdf` and `external/io_int`) fails to link with
   `undefined reference to nf_strerror_` (and similar `nf_*` symbols) on
@@ -750,10 +885,16 @@ For each new `_gpu` subroutine ported:
    original CPU module it mirrors, in the same `.F` file. Never touch the
    original CPU code.
 2. **Compile-check**: `rm` stale `.o`/`.f90`/`.G`/`.H`/`.bb` for the file,
-   then `export J="-j 1"; ./compile em_real` in the background (with a
+   then `export J="-j 12"; ./compile em_real` in the background (with a
    Monitor loop watching `/proc/meminfo` and grepping the log for
-   `Executables successfully built` — builds take 2-3 min). Fix any syntax
-   errors before proceeding.
+   `Executables successfully built`). Fix any syntax errors before
+   proceeding.
+   **Always build in parallel** — this is a 40-core box with 62GB RAM, and
+   `-j 1` wastes most of it. `-j 12` is a good default: WRF's own build is
+   partly serialised by module dependencies, so higher `-j` buys little,
+   and it leaves headroom against the memory-exhaustion failure described
+   under "Memory" below (nvfortran with `-acc -gpu=ccall` is heavier per
+   process than a plain CPU compile).
 3. **Add a temporary dump macro**: pick a unique name like
    `WRF_GPU_RAD_DUMP_<STAGE>`, add it to `configure.wrf`'s `ARCH_LOCAL` line
    (alongside the existing `-DWRF_GPU_DYN -DWRF_GPU_RAD -DWRF_USE_CLM`).

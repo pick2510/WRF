@@ -14288,9 +14288,11 @@
 ! rounding error: undercounting it by ~1.75x is exactly what made the LW
 ! port survive cuMemAlloc and then die in cuLaunchKernel at 4 ranks.
 !
-! SW costs roughly 5x LW per column, almost entirely because
-! spcvmc_sw's adding-doubling solver keeps far more ngptsw-wide state
-! resident than rtrnmc's up/down sweep does.
+! SW costs 2.75x LW per column -- 0.601 vs 1.655 MB/col at nlay=65, as
+! this function and its LW twin actually compute -- because spcvmc_sw's
+! adding-doubling solver keeps far more ngptsw-wide state resident than
+! rtrnmc's up/down sweep does. (This comment previously said "roughly 5x",
+! which was a bad arithmetic shortcut and never what the code computed.)
       INTEGER(kind=8) FUNCTION rrtmg_sw_gpu_bytes_per_column(nlayers) RESULT(nbytes)
 
       IMPLICIT NONE
