@@ -226,6 +226,15 @@ ifneq ($(GPU_RAD_FLAGS),)
 module_ra_rrtmg_lw.o module_radiation_driver.o: FCFLAGS += $(GPU_RAD_FLAGS)
 endif
 
+# module_ra_rrtmg_lwf.o/module_ra_rrtmg_swf.o (the dormant CUDA Fortran fast-
+# physics variants, ra_lw/sw_physics=24, not used by this project's namelist)
+# fail to compile under NVHPC 26.5 with "-acc": their old !$acc kernels-era
+# directives (from the never-revived _ACCEL branch) trip a compiler parser
+# bug ("Unmatched directive END - KERNELS") that only surfaces on a from-
+# scratch build (a cached .o previously masked it). Since -acc buys nothing
+# for a file compiled as ordinary CPU code, drop back to the plain flags.
+module_ra_rrtmg_lwf.o module_ra_rrtmg_swf.o: FCFLAGS := $(FCOPTIM) $(FCBASEOPTS)
+
 nmm_contrib : $(NMM_OBJS) $(NMM_MODULES) $(MODULES) $(OBJS) $(DIAGNOSTIC_MODULES_NMM)
 
 non_nmm : $(MODULES) $(FIRE_MODULES) $(WIND_MODULES) $(OBJS) $(DIAGNOSTIC_MODULES_EM)
