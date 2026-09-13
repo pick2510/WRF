@@ -8,9 +8,19 @@ before resuming GPU-port work in this repo.
 
 Profiling the real Hong Kong case (`/mnt/nvme/wrf_hk_gpu_d01`, `radt=1`,
 `ra_lw_physics=4`, `ra_sw_physics=4` = RRTMG) showed **radiation is ~76% of
-total wall-clock time**. Porting RRTMG-LW and RRTMG-SW to GPU is the current
-top priority, superseding the earlier `dyn_em` OpenACC port (which is done
-and stable — see "Prior work" below).
+total wall-clock time**. Porting RRTMG-LW and RRTMG-SW to GPU was the top
+priority, superseding the earlier `dyn_em` OpenACC port (which is done and
+stable — see "Prior work" below).
+
+**That work is now complete.** Both RRTMG-LW and RRTMG-SW are fully ported,
+chained, integrated into their WRF drivers, and verified against the
+CPU-only build at the field level. 10-minute real case: **312.0s CPU 1-rank
+→ 103.7s GPU 1-rank (3.0x)**, and the 4-rank GPU build (57.6s) matches the
+8-rank CPU build (57.3s). With radiation off the critical path, the next
+lever is whatever now dominates — profile before choosing; the scoped-but-
+never-started `dyn_em` diffusion port (`module_diffusion_em.F`,
+`diff_opt=2`/`km_opt=4`) is the obvious candidate but is no longer
+obviously the right one without fresh numbers.
 
 Full architectural analysis, phase plan, and rationale live in `plan.md` at
 the repo root — read that for the "why" behind the sequencing. This file is
@@ -72,8 +82,14 @@ Kernel-level benchmark (15,876 columns, real Hong Kong domain):
 CPU 4.04s vs GPU 0.161s = **25.1x speedup** on the full LW compute chain
 (setcoef+taumol+cldprmc+rtrnmc).
 
-### RRTMG-SW — fully ported and verified (module_ra_rrtmg_sw.F)
-All behind `#ifdef WRF_GPU_RAD`, all additive:
+### RRTMG-SW — fully ported, integrated and verified (module_ra_rrtmg_sw.F)
+All behind `#ifdef WRF_GPU_RAD`, all additive. The chain driver, the
+`RRTMG_SWRAD` integration and the field-level verification are written up
+further down (search "SW is now complete too"); the per-routine list is:
+- `mcica_subcol_sw_gpu` (commit `44bc6d712`) — verified bit-exact
+- `rrtmg_sw_inatm_gpu` (commit `166d8723c`) — verified bit-exact
+- `rrtmg_sw_gpu_chain_driver` (commit `94b77c533`) — verified to ≤4.7e-6 relative
+- `RRTMG_SWRAD` accumulate/flush + `rrtmg_sw_gpu_tables` + `rrtmg_sw_gpu_chunk` (commit `89e4eb501`)
 - `cldprmc_sw_gpu` + `cldprmc_sw_prep_gpu` (commit `b5b7e3f7e`) — verified bit-exact
 - `setcoef_sw_gpu` + `laytrop_sw_gpu` + `setcoef_sw_driver_gpu` (commit `f04c91e05`) — verified to ~1e-6 relative (FP noise)
 - `taugb16_gpu`..`taugb29_gpu` (all 14 bands) + `laysolfr_upper_gpu` + `laysolfr_lower_gpu` + `taumol_sw_driver_gpu` (commit `ba497fb4c`) — verified to 2.3e-7 relative (FP noise)
@@ -487,24 +503,95 @@ addition, original CPU per-column path untouched) that:
 - End-to-end verification: done at 1, 2 and 4 ranks (see points 8–10
   above — `dmudt` matches the CPU-only build to 5 significant figures at
   every rank count over a full 10-minute run).
-  Done at 2 and 4 ranks too (see point 9's table). **Still outstanding**: a
-  direct field-level comparison of `RTHRATENLW`/`GLW`/`OLR`/`LWCF` and the
-  `LWUPT`/`LWDNB` flux diagnostics. The Hong Kong namelist's `history_interval = 30`
-  means a 10-minute run only ever writes the t=0 frame, which predates
-  any radiation call — so raise `run_minutes` past 30, or drop
-  `history_interval`, before attempting that comparison.
+  Done at 2 and 4 ranks too (see point 9's table). The direct field-level
+  comparison of `GLW`/`OLR`/`LWUPB` (and the SW diagnostics) that used to
+  be listed here as outstanding is **done** — see "Field-level
+  verification" below. The trick was `history_interval = 5`: the standing
+  namelist's 30-minute interval means a 10-minute run only ever writes the
+  t=0 frame, which predates the first radiation call, so nothing
+  radiation-related was ever in the output being compared. Restore
+  `history_interval = 30` and `run_minutes = 10` in both
+  `/mnt/nvme/wrf_hk_gpu_d01` and `/mnt/nvme/wrf_hk_cpu_d01` afterwards.
 
-SW driver integration (`RRTMG_SWRAD`) has not been started and is now the
-whole remaining lever — LW is done and SW is the dominant radiation cost.
-What is and is not left, checked against the source rather than assumed:
+**SW is now complete too — ported, chained, integrated into `RRTMG_SWRAD`,
+and verified against the CPU build at the field level.** The remaining
+pieces landed as:
 
-- **Ported and individually verified already**: `cldprmc_sw_gpu`,
-  `setcoef_sw_gpu`, `taumol_sw_gpu`, `reftra_sw_gpu`, `vrtqdr_sw_gpu`,
-  `spcvmc_sw_gpu` (6 `_gpu` modules in `module_ra_rrtmg_sw.F`).
-- **Not ported, and needed before a chain driver can exist**:
-  `mcica_subcol_sw` and SW's `inatm`. There is no
-  `mcica_subcol_sw_gpu`, no `inatm_sw_gpu`, no `rrtmg_sw_gpu_chain*`, and
-  no `#ifdef WRF_GPU_RAD` branch anywhere in `RRTMG_SWRAD`.
+- `mcica_subcol_sw_gpu` + `mcica_subcol_sw_prep_gpu` +
+  `mcica_subcol_sw_driver_gpu` (module `mcica_subcol_gen_sw_gpu`, commit
+  `44bc6d712`) — verified **bit-exact** on all 11 outputs across all three
+  overlap modes, 3 columns × 45 layers. Bit-exactness is the right bar
+  (kissvec is bitwise integer arithmetic), same as the LW twin. Documented
+  differences from LW: `ngptsw=112`/`nbndsw=14`, the extra
+  `ssac`/`asmc`/`fsfc`, the `ngbm = ngb(1) - 1` band remap (SW's `ngb`
+  runs 16..29, not 1..14), and **clear-subcolumn `ssacmcl` defaults to
+  `1._rb`, not `0._rb`** — flagged in-code as deliberate, since it reads
+  exactly like copy-paste drift from LW and is not.
+- `inatm_sw_adjflux` (host) + `inatm_sw_zero_gpu` + `inatm_sw_layers_gpu`
+  + `inatm_sw_aerosol_gpu` + `inatm_sw_cloud_gpu` + `inatm_sw_driver_gpu`
+  (module `rrtmg_sw_inatm_gpu`, commit `166d8723c`) — verified
+  **bit-exact** on all 22 outputs, three cases. Written specifically to
+  avoid both LW bugs: `pdp` and `coldry` come from `plev` directly rather
+  than from `pz(l-1)` while the same kernel writes `pz(l)`, and
+  `inatm_sw_zero_gpu` establishes the original's opening defaults over the
+  full index range (not optional: `wkl(5,:)` is never assigned by
+  anything, the `iceflag/=5` path never assigns `cswpmc`/`resnmc`, and
+  `ssacmc`/`ssaa` default to 1).
+  One **deliberate divergence**, documented at the assignment: the
+  original sets `inflag`/`iceflag`/`liqflag` only inside `if (icld .ge. 1)`
+  yet `rrtmg_sw` passes them to `cldprmc_sw` unconditionally, so the CPU
+  reads unassigned `intent(out)` scalars when `icld=0`. Harmless there
+  (`icld=0` ⇒ `cldfmc` all zero ⇒ no g-point is acted on), but the port
+  assigns them unconditionally. The harness skips the flag comparison when
+  `icld < 1` for exactly this reason — a MISMATCH there is the *CPU's*
+  undefined value, not the port's.
+- `rrtmg_sw_gpu_chain_driver` (module `rrtmg_sw_gpu_chain`, commit
+  `94b77c533`) — chains `mcica_subcol_sw_driver_gpu` →
+  `inatm_sw_driver_gpu` → `cldprmc_sw_gpu` → `setcoef_sw_driver_gpu` →
+  `taumol_sw_driver_gpu` → `spcvmc_sw_driver_gpu`, then reproduces
+  `rrtmg_sw`'s own output loop. **Four pieces had to be written that live
+  in `rrtmg_sw`'s host code rather than in any named subroutine, and are
+  easy to miss when reading the call chain as a list of subroutine calls**:
+  `sw_prep_albedo_gpu` (solar-zenith clamp plus the per-band albedo
+  expansion — near-IR bands 1-9 and 14 from `aldir`/`aldif`, UV/visible
+  10-13 from `asdir`/`asdif`), `sw_transfer_cloud_gpu` (the
+  (g-point,layer)→(layer,g-point) transpose; its `icld=0` branch sets
+  `zomgcmc` to **1**, not 0), `sw_transfer_aerosol_gpu` (the iaer 0/6/10
+  selection, ECMWF six-type sum included so `aer_opt=1` is not silently
+  dropped), and `sw_fluxes_gpu` (flux transfer, direct/diffuse split for
+  total/UV/near-IR, heating rate from `pdp`). Plus
+  `cldprmc_sw_prep_batch_gpu`, the pre-mcica reformulation of the host
+  validation — same exactness argument as LW's.
+  **There is no SW analogue of `lw_combine_taua_gpu`**: SW never folds
+  aerosol into `taug`, it carries `ztaua`/`zasya`/`zomga` into `spcvmc_sw`
+  separately, because it needs the scattering properties and not just an
+  extinction sum. Also note `taumol_sw` is called from *inside* `spcvmc_sw`
+  in the CPU code (unlike `taumol`/`rtrnmc`, which are siblings); the port
+  hoisted it out, so in the chain they are two consecutive calls.
+  The mcica call is guarded by `icld >= 1`, reproducing the CPU
+  `mcica_subcol_sw`'s opening `if (icld.eq.0) return` — **skipping it is
+  what reproduces the original, not an optimisation**: running it anyway
+  burns the RNG and fabricates subcolumn cloud arrays for a call the CPU
+  leaves clear.
+  Verified against a CPU chain of the originals on four cases
+  (`icld`=1/2/0 and `iaer`=10/6, `iceflag`=3/5): all 12 output fields to
+  ≤4.7e-6 relative, primary fluxes at 3-10e-7 — the single-precision floor.
+- **`RRTMG_SWRAD` driver integration** (commit `89e4eb501`) — the
+  `#ifdef WRF_GPU_RAD` accumulate/flush path, `gpu_flush_sw_chunk`,
+  `rrtmg_sw_gpu_tables` (pushed once from `rrtmg_swinit`, *after*
+  `rrtmg_sw_ini`, which is what fills the tables — the g-point reduction
+  rewrites `absa`/`absb`/`sfluxref` in place), and `rrtmg_sw_gpu_chunk`.
+  `rrtmg_lw_gpu_ranks_per_device()` is reused rather than duplicated.
+  **One structural difference from LW that is not cosmetic**: SW skips
+  every column with the sun below the horizon, so the chunk is a subset of
+  the tile and LW's "flush when `i==ite .and. j==jte`" trigger is
+  unusable — the tile's last column may be dark and never accumulate.
+  Flush when full, plus once after both loops for the remainder (which is
+  legitimately zero for an entirely dark tile).
+- SW costs **~5x LW per column** (~1.7MB at nlay=65), almost entirely
+  because `spcvmc_sw`'s adding-doubling solver keeps far more
+  `ngptsw`-wide state resident (32 arrays inside `spcvmc_sw_driver_gpu`
+  alone) than `rtrnmc`'s up/down sweep does.
 - **The "cloud-optics gap" is not a gap** — same resolution as LW's, and
   for the same reason. `RRTMG_SWRAD` sets `inflgsw = 2` unconditionally
   (bumped to 3/4/5 by `has_reqc`/`has_reqi`/`has_reqs`, never back to 0),
@@ -512,21 +599,66 @@ What is and is not left, checked against the source rather than assumed:
   asymmetry-parameter code is guarded by `if (inflgsw .eq. 0)` — dead for
   every call this project makes. The real cloud optics live in
   `cldprmc_sw`, already ported and verified. **No SW cloud-optics kernel
-  needs writing.** (Earlier text here said this had "not even been
-  located"; it has, and it costs nothing.)
-- **Highest-risk piece to write is SW's `inatm`**, because that is exactly
-  where LW's cross-thread `pz(iplon,l-1)` race lived. Write it reading
-  `plev` directly, not a neighbour cell of an array the same kernel writes.
-  The existing SW kernels were audited for both of today's bug classes and
-  are clean: `vrtqdr_sw_gpu` writes every index of its private
-  `prup/prupd/ztdn/prdnd` before reading it (its `klev+1` boundary was
-  already fixed in an earlier session), `spcvmc_sw_cumprod_gpu`'s
-  recurrence is entirely within one thread's own `(iplon,:,ig)` slice, and
-  every other SW `private()` clause holds scalars only.
-- **Reuse, do not re-derive**: `RRTMG_LWRAD`'s chunk accumulate/flush
-  shape, and `rrtmg_lw_gpu_ranks_per_device()` — SW's chunk sizing needs
-  the same rank-awareness, so factor that helper out rather than copying
-  it.
+  needs writing.**
+
+**Wall clock with SW on the GPU too** (real Hong Kong case, 10 minutes
+simulated, same machine, `nvfortran -O3`), `SUCCESS COMPLETE WRF` and zero
+"non-physical p/T" warnings at every rank count:
+
+| build | ranks | wall |
+|---|---|---|
+| CPU-only | 1 | 312.0s |
+| GPU dyn + LW only | 1 | 245.1s |
+| GPU dyn + LW + **SW** | 1 | **103.7s** |
+| GPU dyn + LW + SW | 2 | 69.5s |
+| GPU dyn + LW + SW | 4 | **57.6s** |
+| CPU-only | 4 | 100.6s |
+| CPU-only | 8 | 57.3s |
+
+3.0x over the 1-rank CPU build, and the 4-rank GPU build now *matches the
+8-rank CPU build* — the first time this port has reached the best CPU
+number rather than merely beating a like-for-like rank count. `dmudt`
+agrees with the CPU-only baseline to 5 significant figures at 1, 2 and 4
+ranks (94.76674 / 94.76756 / 94.76801 vs 94.7676).
+
+### Field-level verification — done, and the McICA control is the point
+This closes the item that had been outstanding for LW as well. Run both
+builds with `history_interval = 5` (the standing 30-minute setting only
+ever writes t=0, which predates the first radiation call), then compare
+`SWDOWN`/`SWUPB`/`SWUPT`/`SWDNBC`/`GLW`/`OLR`/`LWUPB` directly.
+
+Cloud-free fields agree at the single-precision floor — clear-sky
+`SWDNBC` to 6e-3 W/m2 out of 404 pointwise, 2e-9 relative in the domain
+mean. **But cloud-affected fields show max pointwise gaps of tens of
+percent** (126.7 W/m2 on `SWDOWN`), and that needs explaining rather than
+excusing.
+
+It is McICA, and the control proves it rather than asserting it. McICA
+seeds its RNG from the *fractional part* of the column's own pressure
+(`seed1 = (pmid1 - int(pmid1)) * 1e9`), so a **single-ulp pressure change
+re-randomizes that column's subcolumn draw completely** — there is no
+"small perturbation" regime. Comparing the **GPU build at 1 rank against
+the GPU build at 2 ranks** — identical code, identical build, perturbed
+only by domain decomposition, which cannot be a porting bug — reproduces
+the *same* scatter:
+
+| | max &#124;ΔSWDOWN&#124; | cols >10 W/m2 | mean &#124;Δ&#124; | signed mean Δ |
+|---|---|---|---|---|
+| CPU 1-rank vs GPU 1-rank | 126.696 | 22 (0.14%) | 0.120 | +0.009 |
+| GPU 1-rank vs GPU 2-rank | 126.696 | 22 (0.14%) | 0.113 | −0.020 |
+
+Identical maxima (the same bimodal column flipping in both), the same
+count of affected columns, and a signed mean bias of opposite sign in the
+two cases — i.e. noise, with no systematic offset. Domain means agree to
+2.4e-5 relative or better on every field, LW included.
+
+**Methodological note worth keeping**: the *first* control tried was CPU
+1-rank vs CPU 2-rank, and it came back **bit-identical** — so it tested
+nothing at all. A control only works if it actually applies the
+perturbation whose effect you are trying to attribute; check that it does
+before reading anything into it. WRF's dynamics are bit-reproducible
+across decompositions in this configuration, which is exactly why that
+control was inert and the GPU-vs-GPU one was not.
 
 ### Prior work (done, stable, not part of current focus)
 `dyn_em` advection (`advect_u/v/w/scalar_o5v3`) and the acoustic loop
@@ -562,6 +694,23 @@ CUDA Fortran port" and go directly to a real OpenACC port of the reference
   (and `-Mfree`, `-byteswapio`, `-r4`, `-i4`, `-gpu=cc120`, `-Kieee`, `-module`)
   scattered through the compile log, and the build finishes suspiciously
   fast (~5-7s) with "Problems building executables" at the end.
+- **A file can silently lose `-acc` and still build, run, and produce
+  correct answers — just on the CPU.** `phys/Makefile`'s
+  `ifneq ($(GPU_RAD_FLAGS),)` stanza names specific objects. For a long
+  time `module_ra_rrtmg_sw.o` was *not* named, yet every full build
+  compiled it with `-acc` anyway: GNU make target-specific variables
+  propagate to **prerequisites**, and `module_radiation_driver.o` (which
+  *is* named) depends on it via `main/depend.common`, so it inherited the
+  flags from that rule. `make module_ra_rrtmg_sw.o` on its own dropped
+  them, with no error and no warning — the `!$acc` directives simply
+  become comments and the "GPU" kernels run as ordinary host loops. Fixed
+  by naming the object explicitly (commit `89e4eb501`). **Two lessons:**
+  a `_gpu` routine producing correct results is not evidence it ran on the
+  GPU, and if you want to know, `NVCOMPILER_ACC_NOTIFY=1` prints one line
+  per real kernel launch (`check_sw_chain` shows 237, covering every
+  stage). Check that before concluding anything from a verification run,
+  and check `grep -- -acc` on the file's compile line in the build log
+  whenever a rebuild was targeted rather than full.
 - **Known-harmless build noise**: the `diffwrf` external tool (in
   `external/io_netcdf` and `external/io_int`) fails to link with
   `undefined reference to nf_strerror_` (and similar `nf_*` symbols) on
@@ -690,6 +839,19 @@ For each new `_gpu` subroutine ported:
     kernel launch instead, which is correct since it is set once at
     `rrtmg_sw_ini` time and never changes. `tblint`/`od_lo` are real
     `parameter`s and need no device handling at all.
+  - `gpu_tables_sw_aer_todevice()` — `rrsw_aer`'s `rsrtaua`/`rsrpiza`/
+    `rsrasya`, the ECMWF six-type band ratios. Read only by
+    `sw_transfer_aerosol_gpu`'s `iaer=6` branch (WRF `aer_opt=1`), which
+    the Hong Kong case does not exercise — ported anyway so the GPU path
+    is not a silent capability regression against the CPU one.
+  - **The production copies now live in the source**, not only here:
+    `rrtmg_lw_gpu_tables::gpu_tables_lw_todevice` (called from
+    `rrtmg_lwinit`) and `rrtmg_sw_gpu_tables::gpu_tables_sw_todevice`
+    (called from `rrtmg_swinit`, and it must come **after**
+    `rrtmg_sw_ini` — that is what fills the tables, since the g-point
+    reduction rewrites `absa`/`absb`/`sfluxref` in place). The
+    `/tmp/rrtmg_integrate/gpu_tables.f90` versions remain for the
+    standalone harnesses; keep the two in sync when adding a table.
   - Each band's tables are pulled in via renamed `use` (`absa_s16=>absa`,
     etc.) purely to avoid name collisions across the 14 `use` statements in
     one subroutine — the `enter data copyin` still operates on the real
@@ -709,8 +871,27 @@ For each new `_gpu` subroutine ported:
   `check_mcica_lw.f90`, `check_inatm.f90`, `check_chunksize.f90`,
   `check_lw_chain.f90` (+ `check_lw_chain_manual.f90`, a debugging
   companion, see below); SW: `check_cldprmc_sw.f90`, `check_setcoef_sw.f90`,
-  `check_taumol_sw.f90`, `check_spcvmc_sw.f90`). Use these as templates for
+  `check_taumol_sw.f90`, `check_spcvmc_sw.f90`, `check_mcica_sw.f90`,
+  `check_inatm_sw.f90`, `check_sw_chain.f90`). Use these as templates for
   the next stage's harness.
+  **Harnesses must link with `mpifort`, not `nvfortran`**, since
+  `rrtmg_lw_gpu_ranks_per_device` calls MPI; `dm_stubs.f90` supplies a
+  one-line `wrf_get_dm_communicator` returning `MPI_UNDEFINED`. (The source
+  deliberately reaches the communicator through that accessor rather than
+  `USE module_dm`, precisely so a harness can stub it instead of dragging
+  in the whole RSL_LITE/DM layer.)
+  `check_sw_chain.f90` is worth reading for **how to verify a quantity that
+  is a finite difference of two nearly-equal large numbers**. SW's heating
+  rate is `(net flux above − net flux below) * heatfac/pdp`, so it
+  multiplies flux noise by `heatfac/pdp` — order 10-30 in thin upper
+  layers — and lands at ~1e-4 relative while the fluxes themselves sit at
+  1e-6. Rather than loosen the tolerance and hope, the harness recomputes
+  `swhr` on the host from **each side's own returned fluxes** and checks
+  each side against its own recomputation. Both come out bit-exact, which
+  separately pins "is this the same formula `rrtmg_sw` uses" and "does
+  `sw_fluxes_gpu` implement that formula", and leaves the residual fully
+  explained by the already-verified flux agreement. Reuse this whenever a
+  tolerance argument starts to feel like special pleading.
   `check_mcica_lw.f90`/`check_inatm.f90`/`check_lw_chain.f90` differ from
   the others in that they do **not** use a real dumped column — their
   inputs (a pressure profile, a cloud-fraction band, water paths, gas
