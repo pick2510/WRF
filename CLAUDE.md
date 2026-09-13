@@ -153,8 +153,8 @@ already fully GPU-ported and verified (`cldprmc_gpu`, commit `53bd32c2e`).
 So `rrtmg_lw_gpu_chain_driver`'s `tauc` input can simply stay a permanent
 host-zeroed array; there is no cloud-optics kernel left to write for LW.
 
-**Driver integration wiring — implemented, and it runs the real domain, but
-hit a genuine bug at production scale that is NOT YET fixed.** `RRTMG_LWRAD`
+**Driver integration wiring — implemented, working, and verified on the real
+domain.** `RRTMG_LWRAD`
 now has a `#ifdef WRF_GPU_RAD` alternate path (added this session, pure
 addition, original CPU per-column path untouched) that:
 - Accumulates each column's already-computed inputs (`play`, `plev`,
@@ -311,45 +311,80 @@ addition, original CPU per-column path untouched) that:
      result is now only used to keep that one flush's kernel launch
      numerically well-behaved, never written back to the real output
      arrays.
-  7. **Verified**: a full 10-minute real 1-rank run now reaches `SUCCESS
-     COMPLETE WRF`, with `dpsdt`/`dmudt` tracking the CPU baseline closely
-     throughout (e.g. final step 103.65/94.71 vs. baseline's 103.61/94.77)
-     — no instability, no crash. The warning still fires at the same scale
-     (125,000 lines / 15,625 columns over the run).
-  8. **The NaN-pressure condition itself is confirmed to be introduced by
-     `WRF_GPU_RAD`, not a pre-existing `dyn_em` artifact** — checked
-     directly rather than assumed. The same host-side finite/range check
-     was added temporarily to the CPU path (right before the `call
-     rrtmg_lw` this port's `#ifndef WRF_GPU_RAD` branch still contains) and
-     the identical `WRF_GPU_DYN`-only build (radiation on CPU, dynamics on
-     GPU, same 10-minute run) printed **zero** occurrences — `play`/`tlay`
-     were never non-physical there, at all. Since `play`/`tlay` are
-     computed by host-side setup code shared byte-for-byte between the CPU
-     and GPU radiation branches (only the final two calls differ), this
-     means enabling `WRF_GPU_RAD` is *itself* introducing the non-finite
-     pressure into shared state, not merely exposing a pre-existing one.
-     The most likely mechanism, not yet confirmed: `dyn_em`'s GPU-computed
-     pressure (`p8w`/`p3d`) is produced asynchronously on the device and
-     copied back to host before physics reads it; with `WRF_GPU_RAD` off,
-     RRTMG's radiation call is the *only* other thing that might contend
-     for the GPU, and it runs entirely on the host, so there's no
-     competing device work to expose a synchronization gap. With
-     `WRF_GPU_RAD` on, RRTMG's own kernels are now also active on the same
-     device, and if the host-side read of `p8w`/`p3d` isn't correctly
-     ordered after `dyn_em`'s copy-back completes (e.g. an implicit
-     ordering assumption that held when nothing else used the GPU, but
-     doesn't when a second, independently-developed GPU subsystem is also
-     issuing work), a stale/partial value could reach `RRTMG_LWRAD`. This
-     has **not been located or fixed** — it needs someone to look at the
-     actual data-dependency path from `dyn_em`'s device kernels through to
-     `p8w`/`p3d`'s host copy and confirm whether/where an `!$acc update
-     host`/`wait` is missing relative to the radiation call, in
-     `module_first_rk_step_part1.F`/`solve_em.F` or wherever that
-     boundary actually sits. Given the wrong-heating-rate feedback loop
-     this caused before the `gpu_bad` fix (see point 5 above), this is a
-     real correctness issue worth fixing properly, not just working around
-     — the current `gpu_bad` skip-on-bad-column behavior is a safety net
-     for *this port*, not a fix for the upstream synchronization bug.
+  7. **Superseded — see point 8.** Point 6's `gpu_bad` skip did let a
+     10-minute run reach `SUCCESS COMPLETE WRF` with `dpsdt`/`dmudt` near
+     the CPU baseline, but the warning was still firing for 15,620 of
+     15,625 columns every call, which should have been read as "the port is
+     still broken and the skip is hiding it" rather than "fixed".
+  8. **ROOT-CAUSED AND FIXED** (commit `0c1f32692`). Everything above about
+     the NaN originating upstream in `dyn_em`/`phy_prep` was **wrong**, and
+     the correction matters more than the bug:
+     - **The prior diagnosis and how it went wrong.** The claim was that
+       `grid%p_hyd`/`p_hyd_w` arrive `NaN` from `dyn_em` and radiation is a
+       victim. It came from comparing two one-shot `SAVE`d diagnostic flags
+       — an "entry" probe that fires on the very first call against a
+       "detect-NaN" probe that fires on whatever *later* call first sees
+       `NaN`. Comparing those two manufactures a "corrupted within one
+       call" story out of two different calls. **Treat any conclusion drawn
+       from two independently-`SAVE`d fired-once flags as unsound** unless
+       both are keyed to the same call.
+     - **How it was actually localized.** Probe the pipeline in *causal
+       order*, in one run, with counts rather than first-hit prints:
+       `RTHRATENLW` after radiation (`NaN`) → moisture/`p_hyd` before
+       `phy_prep` (clean) → per-column `htr` straight out of
+       `gpu_flush_lw_chunk` (943 of 9,534 columns `NaN`, **and a different
+       943 on the next identical run**) → `COUNT(.NOT. finite)` on every
+       intermediate of `rrtmg_lw_gpu_chain_driver` after each stage. That
+       last step named `selffac`/`forfac`/`scaleminorn2` in `setcoef`, which
+       pointed straight at `water = wkl/coldry` and at `coldry` itself.
+       The run-to-run variation was the decisive clue: identical inputs,
+       different results ⇒ a race or an uninitialized read, never data.
+     - **Bug 1: `rtrnmc_gpu` zeroed only index 0** of its per-thread
+       `urad`/`drad`/`clrurad`/`clrdrad(0:mxlay)` accumulators. The CPU
+       `rtrnmc` zeroes all of `0:nlayers` before its band loop; once the
+       g-point loop became one thread per `(column,g-point)` those arrays
+       became thread-private and the full zeroing had to be reproduced.
+       Every `drad(lev-1) = drad(lev-1) + radld` and
+       `urad(lev) = urad(lev) + radlu` therefore accumulated onto
+       uninitialized private memory, and `drad(nlayers)`/`clrdrad(nlayers)`
+       — written by neither sweep — were read purely out of garbage.
+       ~9% of columns.
+     - **Bug 2: an intra-kernel race in `inatm_layers_gpu`.** Its
+       `collapse(2)` kernel read `pz(iplon,l-1)` while writing
+       `pz(iplon,l)` — a value produced by a *different thread of the same
+       kernel*, with nothing ordering the two. ~0.3% of `(column,layer)`
+       cells read `pz(iplon,l-1)` before it was written, giving wildly
+       wrong `coldry` (usually negative, occasionally exactly zero), and
+       zero made `water = wkl/coldry` a `0/0` `NaN`. Fixed by reading
+       `plev(iplon,l)` instead, which is identical by construction and is a
+       read-only input.
+     - **The whole NaN cascade was a closed loop bootstrapped by
+       radiation**: `NaN` heating → `RTHRATEN` → `t_tendf` → `t_tend` →
+       `t_2` → the acoustic step → `mu`/`muts`, `al`/`alt` → `p_hyd` → back
+       into the pressure `RRTMG_LWRAD` sanitizes. Note also that
+       `RTHRATENSW` was `NaN` purely derivatively: `module_radiation_driver`
+       passes `RTHRATENLW=RTHRATEN` to `RRTMG_LWRAD` and later computes
+       `RTHRATENSW = RTHRATEN - RTHRATENLW`, so a `NaN` from LW shows up in
+       both. SW was never involved.
+  9. **Verified end-to-end** (this is the real verification the port needed,
+     and the pattern to reuse for SW): full 10-minute real 1-rank Hong Kong
+     run reaches `SUCCESS COMPLETE WRF`, with **zero** "non-physical p/T"
+     warnings (was 15,620) and every chain intermediate — `coldry`,
+     `pwvcm`, `planklay`, `fac00`, `selffac`, `taug`, `taut`, `htr` —
+     finite for all 15,625 columns. The **isolating** comparison is the
+     one that counts: the *same* binary rebuilt with `WRF_GPU_RAD`
+     undefined (CPU radiation, GPU dynamics) gives `dpsdt`/`dmudt` agreeing
+     to 5 significant figures at every step (e.g. `109.377/99.961` vs
+     `109.377/99.962`), so the GPU chain now reproduces the CPU radiation
+     path. Do **not** compare against the pure-CPU baseline
+     (`/mnt/nvme/wrf_hk_cpu_d01`) to judge the radiation port: that build
+     differs by ~5% in `dmudt` because of `WRF_GPU_DYN`, equally in both
+     GPU builds — a separate, pre-existing question.
+  10. **Wall clock**: 242s with GPU LW vs 305s with CPU LW for the same
+     10-minute run (1 rank), i.e. ~1.26x end-to-end with only LW ported.
+     SW is still entirely on the CPU and is now the dominant remaining
+     radiation cost.
+
 - **Chunk sizing is solved, device-independently**:
   `rrtmg_lw_gpu_chunksize(nlayers, max_ncol)` (module `rrtmg_lw_gpu_chunk`,
   commit `01df733b0`) queries the *actual running device's* free memory at
@@ -378,11 +413,15 @@ addition, original CPU per-column path untouched) that:
   calls `RRTMG_LWRAD` exactly as before. Simpler than planned, and it means
   the CPU code path inside `RRTMG_LWRAD` truly never executes when
   `WRF_GPU_RAD` is defined, rather than living on as dead code.
-- End-to-end verification against the *actual* RRTMG output fields
-  (`RTHRATENLW`, `GLW`, `OLR`, `LWCF`, the `LWUPT`/`LWDNB`/etc. flux
-  diagnostics) on a real multi-rank run is **blocked on the open bug
-  above** — the real 1-rank run got 2 radiation calls in before crashing,
-  not enough for a meaningful comparison against the CPU baseline yet.
+- End-to-end verification: done at 1 rank (see points 8–10 above —
+  identical `dpsdt`/`dmudt` to the `WRF_GPU_RAD`-undefined build of the
+  same binary, to 5 significant figures over a full 10-minute run).
+  **Still outstanding**: a 2-/4-rank run, and a direct field-level
+  comparison of `RTHRATENLW`/`GLW`/`OLR`/`LWCF` and the `LWUPT`/`LWDNB`
+  flux diagnostics. The Hong Kong namelist's `history_interval = 30`
+  means a 10-minute run only ever writes the t=0 frame, which predates
+  any radiation call — so raise `run_minutes` past 30, or drop
+  `history_interval`, before attempting that comparison.
 
 SW driver integration (`RRTMG_SWRAD`) has not been started at all yet and
 will need the same treatment once LW's is working — including its own
@@ -431,6 +470,22 @@ CUDA Fortran port" and go directly to a real OpenACC port of the reference
   `Error 1 (ignored)`. Don't chase this; check for
   `--->  Executables successfully built  <---` at the end of the log instead
   of grepping for "error".
+- **`-Mbounds` is silently disabled by NVFORTRAN whenever `-acc` is on.**
+  The compiler says so once, quietly:
+  `nvfortran-Warning-CUDA Fortran or OpenACC GPU targets disables -Mbounds`.
+  Every "bounds checking came back clean" result on this project before
+  this was noticed is worthless. To get real bounds checking on a file,
+  remove `-acc` from that file's flags (e.g. a per-file `FCFLAGS :=`
+  override in the relevant `Makefile`) and rebuild just it.
+- **Valgrind cannot run this build's `-O3` binaries** — its VEX JIT does not
+  support AVX-512 and the run dies with SIGILL. `-Mnovect` alone is *not*
+  enough (AVX-512 still appears in scalar NaN-safe `MAX` codegen, e.g.
+  `vcmpunordss` with `%k1` mask registers), and `-tp=skylake` is not enough
+  either (skylake-avx512 has AVX-512). `-tp=haswell` works. Also beware
+  stale objects in `external/io_netcdf` that a normal rebuild will not
+  refresh. And remember valgrind's own allocator masks address-reuse bugs
+  exactly the way `compute-sanitizer`'s does — same blind spot, documented
+  above.
 - **Memory**: the box has 62GB RAM. Builds normally use ~1-3GB and finish in
   2-3 minutes. If a build hangs and system memory drops toward zero with
   heavy swapping, something has gone wrong (e.g., a duplicate/stray build or
@@ -601,6 +656,44 @@ fail ("attempt to read past end of file").
 ## OpenACC conventions (hard constraints, established during `dyn_em` port,
 ## reconfirmed during RRTMG)
 
+- **When a sequential CPU loop becomes a parallel kernel, audit every array
+  read whose index is not the thread's own index.** Two separate real bugs
+  in the LW chain (commit `0c1f32692`) were the same mistake in two
+  disguises, and both were invisible to code review and to a small
+  standalone harness:
+  - *Cross-thread read inside one kernel.* `inatm_layers_gpu`'s
+    `collapse(2)` kernel wrote `pz(iplon,l)` and read `pz(iplon,l-1)` — a
+    value another thread of the same kernel produces. A sequential CPU loop
+    gives that ordering for free; a kernel gives no ordering at all. The
+    fix is almost always to re-derive the neighbour value from a read-only
+    input (here `pz(iplon,l-1) ≡ plev(iplon,l)`) rather than to add
+    synchronization. **Rule: inside one kernel, an array that the kernel
+    writes may only be read at the writing thread's own index.**
+  - *Incompletely initialized thread-private scratch.* `rtrnmc_gpu` zeroed
+    only index 0 of `urad`/`drad`/`clrurad`/`clrdrad(0:mxlay)` because the
+    CPU original zeroes the whole range *outside* the loop being ported.
+    **Rule: for every array moved into a `private()` clause, find where the
+    original initialized it and reproduce that initialization inside the
+    kernel, for the full index range the kernel reads** — including entries
+    the kernel itself never writes. Same family as `vrtqdr_sw_gpu`'s missing
+    `prup(klev+1)` and `inatm`'s `pz(iplon,0)`; this keeps recurring and is
+    worth a deliberate checklist pass per ported routine.
+- **Run-to-run variation in a GPU port's output, on identical inputs, is a
+  race or an uninitialized read — never data, never FP reassociation.** FP
+  noise is deterministic for a fixed kernel launch geometry. Counting
+  affected elements across two runs of the same case (943 bad columns, then
+  a *different* 943) is a cheaper and far more decisive test than any
+  sanitizer, and it immediately rules out the entire "bad input data" class
+  of hypothesis. Note the failing indices may also carry a structural
+  signature worth reading: here every surviving bad column after the first
+  fix was at a flattened index ≡ 5 (mod 32), i.e. one fixed warp lane.
+- **Localize a NaN by instrumenting the pipeline in causal order, in one
+  run, with `COUNT(.NOT. finite)` per stage — not with fired-once `SAVE`d
+  flags.** Two independently-`SAVE`d one-shot probes fire on *different
+  calls*, so comparing them fabricates conclusions; this produced a
+  completely wrong root-cause diagnosis that stood for several sessions
+  (see the LW status entry, point 8). Counts per stage, printed together at
+  one point in time, told the truth in a single run.
 - **REAL→INTEGER conversion of NaN/Inf is implementation-defined and CPU
   and GPU codegen are NOT guaranteed to agree on it.** x86's hardware
   float-to-int conversion of NaN yields `INT_MIN`; NVHPC's GPU codegen for
