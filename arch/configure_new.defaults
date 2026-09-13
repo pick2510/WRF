@@ -242,8 +242,16 @@ CFLAGS_LOCAL    =       -O3 -I/usr/include/tirpc
 LDFLAGS_LOCAL   =       -ltirpc $(GPU_DYN_FLAGS) $(GPU_RAD_FLAGS)
 CPLUSPLUSLIB    =
 ESMF_LDFLAG     =       $(CPLUSPLUSLIB)
-GPU_DYN_FLAGS   =       -acc -gpu=cc120 -Kieee
-GPU_RAD_FLAGS   =       -acc -gpu=cc120 -Kieee
+# -gpu=ccall builds device code for every compute capability this NVHPC
+# release supports, so one binary runs on any of them. It was -gpu=cc120
+# (Blackwell, the card this port was developed on), which made the
+# executable refuse to load anywhere else -- the one genuinely
+# device-specific assumption left in the port, since the runtime chunk
+# sizing already queries the device it finds (see rrtmg_lw_gpu_chunksize).
+# Costs compile time and binary size; narrow it to a specific ccXX only if
+# you are deliberately trading portability for build speed.
+GPU_DYN_FLAGS   =       -acc -gpu=ccall -Kieee
+GPU_RAD_FLAGS   =       -acc -gpu=ccall -Kieee
 FCOPTIM         =       -O3
 FCREDUCEDOPT    =       $(FCOPTIM)
 FCNOOPT         =       -O0

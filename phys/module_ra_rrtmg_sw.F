@@ -14321,14 +14321,18 @@
       INTEGER(kind=im) FUNCTION rrtmg_sw_gpu_chunksize(nlayers, max_ncol) RESULT(ncol_chunk)
 
       use openacc
-      use rrtmg_lw_gpu_chunk, only : rrtmg_lw_gpu_ranks_per_device
+      use rrtmg_lw_gpu_chunk, only : rrtmg_lw_gpu_ranks_per_device, &
+                                     rrtmg_lw_gpu_ranks_per_node, &
+                                     rrtmg_gpu_host_free_bytes
 
       IMPLICIT NONE
       INTEGER(kind=im), INTENT(IN) :: nlayers, max_ncol
 
       INTEGER :: devnum
       INTEGER(kind=im) :: nshare
-      INTEGER(kind=8) :: free_bytes, bytes_per_col
+      INTEGER(kind=8) :: free_bytes, bytes_per_col, host_bytes
+      INTEGER(kind=im) :: host_chunk
+      CHARACTER(len=160) :: chunkmsg
       REAL(kind=rb), PARAMETER :: safety_fraction = 0.5_rb
 
       devnum = acc_get_device_num(acc_device_nvidia)
@@ -14339,8 +14343,39 @@
       ncol_chunk = INT(REAL(free_bytes, rb) * safety_fraction &
                        / REAL(nshare, rb) / REAL(bytes_per_col, rb), im)
 
+! Also bound the chunk by HOST memory. The chain driver allocates a host
+! mirror of every device intermediate, so host RAM scales with the chunk
+! exactly as device memory does -- and the two are not related. A device
+! with more VRAM than this node has RAM per rank would otherwise choose a
+! chunk that cannot be allocated at all. Divided by ranks per NODE (not
+! per GPU): host memory is shared by every rank on the box regardless of
+! how the GPUs are split between them.
+      host_bytes = rrtmg_gpu_host_free_bytes()
+      IF (host_bytes .gt. 0_8) THEN
+         host_chunk = INT(REAL(host_bytes, rb) * safety_fraction &
+                          / REAL(rrtmg_lw_gpu_ranks_per_node(), rb) &
+                          / REAL(bytes_per_col, rb), im)
+         IF (host_chunk .lt. ncol_chunk) ncol_chunk = host_chunk
+      ENDIF
+
       IF (ncol_chunk .gt. max_ncol) ncol_chunk = max_ncol
       IF (ncol_chunk .lt. 1) ncol_chunk = 1
+
+! Say something when the sizing has degenerated, rather than silently
+! running 15000 one-column chunks. Neither case is wrong -- the pipeline is
+! correct for any chunk down to 1 -- but both are worth seeing in the log,
+! because they mean either the memory query failed or this device is too
+! small for the configuration and the run will be extremely slow.
+      IF (free_bytes .le. 0_8) THEN
+         CALL wrf_message('WRF_GPU_RAD WARNING: device free-memory query returned 0; '// &
+              'falling back to the smallest chunk. Radiation will be very slow.')
+      ELSEIF (ncol_chunk .le. 1 .and. max_ncol .gt. 1) THEN
+         WRITE(chunkmsg,'(A,I0,A,I0,A)') &
+              'WRF_GPU_RAD WARNING: chunk clamped to 1 column (needs ', &
+              bytes_per_col/1024_8, ' KB/column, device reports ', &
+              free_bytes/1048576_8, ' MB free). Radiation will be very slow.'
+         CALL wrf_message(chunkmsg)
+      ENDIF
 
       END FUNCTION rrtmg_sw_gpu_chunksize
 
@@ -14368,9 +14403,13 @@ use module_ra_rrtmg_lw, only : inirad, o3data, relcalc, reicalc, retab
 !                               mcica_random_numbers, randomNumberSequence, &
 !                               new_RandomNumberSequence, getRandomReal
 #ifdef WRF_GPU_RAD
+use module_driver_constants, only: max_domains
 use rrtmg_sw_gpu_chunk, only: rrtmg_sw_gpu_chunksize
 use rrtmg_sw_gpu_chain, only: rrtmg_sw_gpu_chain_driver
 use rrtmg_sw_gpu_tables, only: gpu_tables_sw_todevice
+#ifdef _OPENMP
+use omp_lib, only: omp_in_parallel, omp_get_num_threads
+#endif
 #endif
 
 #ifdef WRF_GPU_RAD
@@ -14394,7 +14433,13 @@ use rrtmg_sw_gpu_tables, only: gpu_tables_sw_todevice
 !  See gpu_flush_sw_chunk's skip-a-bad-column branch: the outputs are
 !  INTENT(INOUT) and a skipped column is meant to keep its previous value,
 !  which is only defined once something has written one.
-    LOGICAL, SAVE :: gpu_sw_first_call = .TRUE.
+!
+!  PER DOMAIN, not a single scalar -- nests run through this same routine,
+!  and a scalar would be consumed by domain 1's first call, leaving every
+!  nest's genuine first call treated as "not first". Keyed by
+!  gpu_domain_id (OPTIONAL; defaults to 1 if a caller does not pass it).
+    LOGICAL, SAVE :: gpu_sw_first_call(max_domains) = .TRUE.
+    INTEGER :: gpu_sw_dom
     REAL, ALLOCATABLE :: gpu_sw_play(:,:), gpu_sw_plev(:,:)
     REAL, ALLOCATABLE :: gpu_sw_tlay(:,:), gpu_sw_tlev(:,:), gpu_sw_tsfc(:)
     REAL, ALLOCATABLE :: gpu_sw_h2ovmr(:,:), gpu_sw_o3vmr(:,:), gpu_sw_co2vmr(:,:)
@@ -14466,6 +14511,7 @@ CONTAINS
                        tauaer3d_sw,ssaaer3d_sw,asyaer3d_sw,       & ! jararias 2013/11
                        swddir, swddni, swddif,                    & ! jararias 2013/08
                        xcoszen,julian                             & ! jararias 2013/08
+                      ,gpu_domain_id                              & ! OPTIONAL, WRF_GPU_RAD only
                                                                   )
 !------------------------------------------------------------------
    IMPLICIT NONE
@@ -14476,6 +14522,11 @@ CONTAINS
    INTEGER, INTENT(IN )      ::        ids,ide, jds,jde, kds,kde, &
                                        ims,ime, jms,jme, kms,kme, &
                                        its,ite, jts,jte, kts,kte
+
+!  Which WRF domain this call is for. OPTIONAL so that adding it breaks no
+!  existing caller; used only by the WRF_GPU_RAD path, to key the
+!  per-domain "first radiation call" flag (see gpu_flush_sw_chunk).
+   INTEGER, OPTIONAL, INTENT(IN ) ::   gpu_domain_id
 
    INTEGER, INTENT(IN )      ::        ICLOUD
    INTEGER, INTENT(IN )      ::        MP_PHYSICS
@@ -14830,6 +14881,22 @@ CONTAINS
 ! Pressures are in mb
 
 #ifdef WRF_GPU_RAD
+#ifdef _OPENMP
+!  HARD STOP -- see the identical guard in RRTMG_LWRAD for the full
+!  reasoning. module_radiation_driver calls this routine from inside an
+!  "!$OMP PARALLEL DO" over tiles, and this port's column-batch state is
+!  module-level and therefore SHARED between threads. Safe today only
+!  because the build has OpenMP off, which forces num_tiles=1.
+    IF (omp_in_parallel()) THEN
+       IF (omp_get_num_threads() .gt. 1) THEN
+          CALL wrf_error_fatal('RRTMG_SWRAD: WRF_GPU_RAD is not thread-safe; '// &
+               'rebuild without OpenMP, or set numtiles=1 with OMP_NUM_THREADS=1')
+       ENDIF
+    ENDIF
+#endif
+    gpu_sw_dom = 1
+    IF (PRESENT(gpu_domain_id)) gpu_sw_dom = gpu_domain_id
+    IF (gpu_sw_dom .lt. 1 .or. gpu_sw_dom .gt. max_domains) gpu_sw_dom = 1
 ! nlay is assigned per column inside i_loop below (unchanged); the chunk
 ! arrays need it before the loops, and it is a pure function of the tile
 ! bounds, so it is recomputed here rather than reordered.
@@ -15936,7 +16003,7 @@ CONTAINS
 ! gpu_flush_sw_chunk: a tile takes several chunks, and a bad column in the
 ! second or later chunk of the very first radiation call still needs the
 ! seed (the outputs it would otherwise "hold" have never been written).
-   gpu_sw_first_call = .FALSE.
+   gpu_sw_first_call(gpu_sw_dom) = .FALSE.
 #endif
 
 !-------------------------------------------------------------------
@@ -16016,7 +16083,7 @@ CONTAINS
 ! physically harmless value (no shortwave) instead of whatever the
 ! allocation left behind.
       IF (gpu_sw_bad(gk)) THEN
-         IF (gpu_sw_first_call) THEN
+         IF (gpu_sw_first_call(gpu_sw_dom)) THEN
             gsw(gi,gj)  = 0.
             swcf(gi,gj) = 0.
             IF (gpu_sw_have_swupt) THEN
