@@ -4171,10 +4171,31 @@ contains
          radld = 0._rb
          radclrd = 0._rb
          iclddn = 0
-         urad(0) = 0.0_rb
-         drad(0) = 0.0_rb
-         clrurad(0) = 0.0_rb
-         clrdrad(0) = 0.0_rb
+
+! Zero the WHOLE of each per-thread flux accumulator, not just index 0.
+! The original CPU rtrnmc zeroes urad/drad/clrurad/clrdrad over 0:nlayers
+! before its band loop (and re-zeroes them after each band's
+! scale-and-accumulate); once the g-point loop becomes one OpenACC thread
+! per (column,g-point), these four become private per-thread arrays and
+! that full zeroing has to be reproduced here. It was not: only index 0
+! was set, so every "drad(lev-1) = drad(lev-1) + radld" (lev=nlayers..2)
+! and every "urad(lev) = urad(lev) + radlu" (lev=1..nlayers) accumulated
+! onto uninitialized private memory, and drad(nlayers)/clrdrad(nlayers) --
+! never written by either sweep -- were read straight out of garbage by
+! the atomic-accumulate loop below. Same class of bug as vrtqdr_sw_gpu's
+! missing prup(klev+1) boundary: a value the original establishes outside
+! the loop being ported, lost when the loop's scratch became thread-local.
+! Symptom in the real run: a run-to-run-varying ~9% of columns came back
+! with NaN heating rates from otherwise perfectly physical input profiles,
+! which then fed RTHRATEN -> the acoustic step -> p_hyd and back into this
+! scheme's own sanitize check as a self-sustaining NaN feedback loop.
+!$acc loop seq
+         DO lev = 0, nlayers
+            urad(lev) = 0.0_rb
+            drad(lev) = 0.0_rb
+            clrurad(lev) = 0.0_rb
+            clrdrad(lev) = 0.0_rb
+         ENDDO
 
 ! Downward radiative transfer loop.
 !$acc loop seq
@@ -16464,7 +16485,21 @@ contains
          wkl(iplon,l,7) = o2vmr(iplon,l)
 
          amm = (1._rb - wkl(iplon,l,1)) * amd + wkl(iplon,l,1) * amw
-         coldry(iplon,l) = (pz(iplon,l-1)-pz(iplon,l)) * 1.e3_rb * avogad / &
+! RACE FIX: this used to read pz(iplon,l-1) here. pz(iplon,l-1) is written
+! by a DIFFERENT thread of this very collapse(2) kernel (the (iplon,l-1)
+! iteration writes pz(iplon,l-1) two lines above), so nothing orders that
+! write before this read -- the original CPU inatm gets the ordering free
+! from its sequential layer loop, and the ported kernel silently lost it.
+! In a real 9,534-column chunk roughly 0.3% of (column,layer) cells read
+! pz(iplon,l-1) before it was written, i.e. read uninitialized device
+! memory, giving wildly wrong (often negative, occasionally exactly zero)
+! coldry; the exactly-zero cases then made water = wkl/coldry a 0/0 NaN in
+! setcoef, and from there NaN heating rates for a run-to-run-varying subset
+! of columns. pz(iplon,l-1) is by construction identical to plev(iplon,l)
+! for every l >= 1 (pz(:,0)=plev(:,1) from the boundary kernel above, and
+! pz(:,l)=plev(:,l+1) here), and plev is a read-only input, so reading plev
+! directly is exactly equivalent and race-free.
+         coldry(iplon,l) = (plev(iplon,l)-plev(iplon,l+1)) * 1.e3_rb * avogad / &
                      (1.e2_rb * grav * amm * (1._rb + wkl(iplon,l,1)))
 
          wx(iplon,l,1) = ccl4vmr(iplon,l)
@@ -17088,9 +17123,37 @@ use rrtmg_lw_gpu_tables, only: gpu_tables_lw_todevice
     !
     save retab
     ! For buffer layer adjustment.  Steven Cavallo, Dec 2010.
-    integer , save    :: nlayers    
+    integer , save    :: nlayers
     real, PARAMETER :: deltap = 4.  ! Pressure interval for buffer layer in mb
-    
+
+#ifdef WRF_GPU_RAD
+! --- GPU column-batching state, MODULE-LEVEL (not local to RRTMG_LWRAD) ---
+! Originally declared local to RRTMG_LWRAD and reached by
+! gpu_flush_lw_chunk (a CONTAINS-nested internal procedure) via Fortran
+! host association. Moved to module scope while chasing the "non-physical
+! p/T" flood described below; that move was NOT the fix (see
+! rtrnmc_gpu/inatm_layers_gpu for what actually was), but it is kept
+! because it scopes the batch state more explicitly than host association
+! did, at no cost.
+    INTEGER :: gpu_chunksize, gpu_nfill, gpu_ic, gpu_ncol_tile, gpu_iaer
+    LOGICAL :: gpu_have_lwupt, gpu_have_lwupflx
+    INTEGER, ALLOCATABLE :: gpu_i_idx(:), gpu_j_idx(:)
+    LOGICAL, ALLOCATABLE :: gpu_bad(:)
+!  See gpu_flush_lw_chunk's skip-a-bad-column branch: the outputs are
+!  INTENT(INOUT) and a skipped column is meant to keep its previous value,
+!  which is only defined once something has written one.
+    LOGICAL, SAVE :: gpu_lw_first_call = .TRUE.
+    REAL, ALLOCATABLE :: gpu_play(:,:), gpu_plev(:,:), gpu_tlay(:,:), gpu_tlev(:,:), gpu_tsfc(:)
+    REAL, ALLOCATABLE :: gpu_h2ovmr(:,:), gpu_o3vmr(:,:), gpu_co2vmr(:,:), gpu_ch4vmr(:,:)
+    REAL, ALLOCATABLE :: gpu_n2ovmr(:,:), gpu_o2vmr(:,:), gpu_cfc11vmr(:,:), gpu_cfc12vmr(:,:)
+    REAL, ALLOCATABLE :: gpu_cfc22vmr(:,:), gpu_ccl4vmr(:,:), gpu_emis(:,:)
+    REAL, ALLOCATABLE :: gpu_cldfrac(:,:), gpu_ciwp(:,:), gpu_clwp(:,:), gpu_cswp(:,:)
+    REAL, ALLOCATABLE :: gpu_rei(:,:), gpu_rel(:,:), gpu_res(:,:), gpu_tauaer(:,:,:), gpu_tauc(:,:,:)
+    REAL, ALLOCATABLE :: gpu_totuflux(:,:), gpu_totdflux(:,:), gpu_fnet(:,:), gpu_htr(:,:)
+    REAL, ALLOCATABLE :: gpu_totuclfl(:,:), gpu_totdclfl(:,:), gpu_fnetc(:,:), gpu_htrc(:,:)
+    INTEGER :: gpu_inflglw, gpu_iceflglw, gpu_liqflglw
+#endif
+
 CONTAINS
 
 !------------------------------------------------------------------
@@ -17459,30 +17522,17 @@ CONTAINS
                   264.80,266.50,267.59,268.44,268.69,267.76,      &
                   266.13,263.96,261.54,258.93,256.15,253.23,      &
                   249.89,246.67,243.48,240.25,236.66,233.86/
-#ifdef WRF_GPU_RAD
-! --- GPU column-batching state (WRF_GPU_RAD driver-integration path) ---
-! Every column visited by this tile's i_loop/j_loop shares icld=2 (set just
-! above), iaer=10 (hardcoded inside the original rrtmg_lw), irng=0 and
+! GPU column-batching state for the WRF_GPU_RAD driver-integration path is
+! now declared at MODULE level (see the module specification section above
+! CONTAINS), not here -- see the comment there for why. Every column
+! visited by this tile's i_loop/j_loop shares icld=2 (set just above),
+! iaer=10 (hardcoded inside the original rrtmg_lw), irng=0 and
 ! permuteseed=150 (set right before the original per-column mcica_subcol_lw
 ! call below) -- so the whole tile can be processed in device-sized chunks
 ! via rrtmg_lw_gpu_chain_driver instead of one ncol=1 call per column.
 ! inflglw/iceflglw/liqflglw are likewise tile-constant (they depend only on
 ! the has_reqc/has_reqi/has_reqs/ICLOUD arguments, not on i,j). See
 ! CLAUDE.md's "LW driver integration" section.
-    INTEGER :: gpu_chunksize, gpu_nfill, gpu_ic, gpu_ncol_tile, gpu_iaer
-    LOGICAL :: gpu_have_lwupt, gpu_have_lwupflx
-    INTEGER, ALLOCATABLE :: gpu_i_idx(:), gpu_j_idx(:)
-    LOGICAL, ALLOCATABLE :: gpu_bad(:)
-    REAL, ALLOCATABLE :: gpu_play(:,:), gpu_plev(:,:), gpu_tlay(:,:), gpu_tlev(:,:), gpu_tsfc(:)
-    REAL, ALLOCATABLE :: gpu_h2ovmr(:,:), gpu_o3vmr(:,:), gpu_co2vmr(:,:), gpu_ch4vmr(:,:)
-    REAL, ALLOCATABLE :: gpu_n2ovmr(:,:), gpu_o2vmr(:,:), gpu_cfc11vmr(:,:), gpu_cfc12vmr(:,:)
-    REAL, ALLOCATABLE :: gpu_cfc22vmr(:,:), gpu_ccl4vmr(:,:), gpu_emis(:,:)
-    REAL, ALLOCATABLE :: gpu_cldfrac(:,:), gpu_ciwp(:,:), gpu_clwp(:,:), gpu_cswp(:,:)
-    REAL, ALLOCATABLE :: gpu_rei(:,:), gpu_rel(:,:), gpu_res(:,:), gpu_tauaer(:,:,:), gpu_tauc(:,:,:)
-    REAL, ALLOCATABLE :: gpu_totuflux(:,:), gpu_totdflux(:,:), gpu_fnet(:,:), gpu_htr(:,:)
-    REAL, ALLOCATABLE :: gpu_totuclfl(:,:), gpu_totdclfl(:,:), gpu_fnetc(:,:), gpu_htrc(:,:)
-    INTEGER :: gpu_inflglw, gpu_iceflglw, gpu_liqflglw
-#endif
 !------------------------------------------------------------------
 #if ( WRF_CHEM == 1 )
       IF ( aer_ra_feedback == 1) then
@@ -18411,6 +18461,65 @@ CONTAINS
          gpu_tlay(gpu_ic,:)     = tlay(1,:)
          gpu_tlev(gpu_ic,:)     = tlev(1,:)
          gpu_tsfc(gpu_ic)       = tsfc(1)
+! Defensive sanitization, done HERE (immediately after the copy above)
+! rather than inside gpu_flush_lw_chunk, so it reads the same play/plev/
+! tlay/tlev the host setup code just produced rather than a batch-array
+! element many columns later.
+!
+! HISTORY, because the comment that used to sit here asserted the exact
+! opposite and was wrong: this check once fired for essentially the whole
+! domain (15620 of 15625 columns, every call), and that was read as proof
+! that grid%p_hyd/p_hyd_w were arriving NaN from dyn_em and that radiation
+! was a victim. It was not. The NaN was manufactured by this port's own
+! device kernels -- see the race fix in inatm_layers_gpu and the private-
+! accumulator zeroing fix in rtrnmc_gpu -- and then fed back in a closed
+! loop: NaN heating rate -> RTHRATEN -> t_tendf -> the acoustic step ->
+! mu/muts, al/alt -> p_hyd -> the pressure checked right here. With both
+! kernel bugs fixed this check now fires zero times over a full 10-minute
+! real run, and every stage of the chain is finite for all 15,625 columns.
+!
+! (The earlier "p_hyd is already NaN before radiation runs" conclusion came
+! from comparing two one-shot SAVEd diagnostic flags -- an "entry" probe
+! that fires on the very first call against a "detect-NaN" probe that fires
+! on whatever later call first sees NaN. Comparing those two is meaningless;
+! it manufactures a "corrupted within one call" story out of two different
+! calls. Worth remembering as a debugging trap.)
+!
+! The check is kept as a permanent guard: a non-finite pressure reaching
+! setcoef_gpu's REAL->INTEGER table-index arithmetic is what produced the
+! original CUDA_ERROR_INVALID_ADDRESS_SPACE crash, and a cheap host-side
+! screen is much better than an illegal device address.
+         BLOCK
+         INTEGER :: san_k
+         LOGICAL :: san_bad
+         san_bad = .FALSE.
+         DO san_k = kts, nlayers
+            IF (.NOT. (play(1,san_k) .GE. 1.0e-3 .AND. play(1,san_k) .LE. 1100.0)) san_bad = .TRUE.
+            IF (.NOT. (plev(1,san_k) .GE. 1.0e-3 .AND. plev(1,san_k) .LE. 1100.0)) san_bad = .TRUE.
+            IF (.NOT. (tlay(1,san_k) .GE. 100.0 .AND. tlay(1,san_k) .LE. 400.0)) san_bad = .TRUE.
+            IF (.NOT. (tlev(1,san_k) .GE. 100.0 .AND. tlev(1,san_k) .LE. 400.0)) san_bad = .TRUE.
+         ENDDO
+! plev(nlayers+1) is RRTMG's own top-of-atmosphere interface, which the
+! shared host setup code above deliberately sets to literal 0.0 mb ("Add
+! zero as top level" above) for every column, every call, by design -- so
+! its lower bound must be .GE. 0.0, not .GE. 1.0e-3 like the interior
+! layers/interfaces checked above.
+         IF (.NOT. (plev(1,nlayers+1) .GE. 0.0   .AND. plev(1,nlayers+1) .LE. 1100.0)) san_bad = .TRUE.
+         IF (.NOT. (tlev(1,nlayers+1) .GE. 100.0 .AND. tlev(1,nlayers+1) .LE. 400.0)) san_bad = .TRUE.
+         IF (.NOT. (tsfc(1) .GE. 100.0 .AND. tsfc(1) .LE. 400.0)) san_bad = .TRUE.
+         IF (san_bad) THEN
+            gpu_bad(gpu_ic) = .TRUE.
+            gpu_play(gpu_ic,:) = 1013.25
+            gpu_plev(gpu_ic,:) = 1013.25
+            gpu_tlay(gpu_ic,:) = 288.0
+            gpu_tlev(gpu_ic,:) = 288.0
+            gpu_tsfc(gpu_ic)   = 288.0
+            WRITE(message,'(A,I5,A,I5,A)') &
+               'WRF_GPU_RAD WARNING: non-physical p/T at i=', i, ' j=', j, &
+               ' -- skipping LW update this step'
+            call wrf_message(message)
+         ENDIF
+         END BLOCK
          gpu_h2ovmr(gpu_ic,:)   = h2ovmr(1,:)
          gpu_o3vmr(gpu_ic,:)    = o3vmr(1,:)
          gpu_co2vmr(gpu_ic,:)   = co2vmr(1,:)
@@ -18463,6 +18572,11 @@ CONTAINS
     DEALLOCATE(gpu_tauaer, gpu_tauc)
     DEALLOCATE(gpu_totuflux, gpu_totdflux, gpu_fnet, gpu_htr)
     DEALLOCATE(gpu_totuclfl, gpu_totdclfl, gpu_fnetc, gpu_htrc)
+! Cleared once the whole tile has been flushed, not inside
+! gpu_flush_lw_chunk: a tile takes several chunks, and a bad column in the
+! second or later chunk of the very first radiation call still needs the
+! seed (the outputs it would otherwise "hold" have never been written).
+    gpu_lw_first_call = .FALSE.
 #endif
 
    RETURN
@@ -18503,69 +18617,12 @@ CONTAINS
 ! section either); any unused tail columns on a tile's last partial chunk
 ! just recompute on stale-but-valid leftover data from an earlier chunk
 ! (harmless -- those columns are simply not unpacked below).
-! Defensive sanitization: the diagnostic version of this block (run against
-! the real Hong Kong case) found play/plev genuinely NaN for the domain
-! corner column (i=1,j=1) at some radiation calls, while tlay/tlev at the
-! same column/layers were finite -- a pre-existing bug elsewhere (dpsdt/
-! dmudt domain-average diagnostics are NaN from t=0 in this same run,
-! independent of WRF_GPU_RAD), NOT something introduced by this port. The
-! CPU rrtmg_lw path never crashed on it only by luck: x86's REAL-to-INTEGER
-! conversion of NaN yields INT_MIN, which setcoef's existing
-! "IF (jp.lt.1) jp=1" clamp happens to catch; the GPU's conversion of the
-! same NaN-derived expression does not reliably land somewhere those clamps
-! catch, and an out-of-range jp/jt/indself/indfor/indminor feeding a table
-! lookup in taugb1_gpu is exactly what an invalid/illegal device address
-! during kernel execution looks like. Clamping non-finite/non-physical
-! pressure or temperature to a nominal value here does not fix that
-! upstream bug -- it only keeps this port from crashing on it, the same
-! way the CPU path was accidentally protected. The warning below is left
-! in permanently so the underlying issue stays visible instead of being
-! silently masked.
-   BLOCK
-   INTEGER :: san_ic, san_k
-   LOGICAL :: san_bad
-   DO san_ic = 1, gpu_nfill
-      san_bad = .FALSE.
-      DO san_k = 1, nlayers
-         IF (.NOT. (gpu_play(san_ic,san_k) .GE. 1.0e-3 .AND. gpu_play(san_ic,san_k) .LE. 1100.0)) THEN
-            gpu_play(san_ic,san_k) = 1013.25
-            san_bad = .TRUE.
-         ENDIF
-         IF (.NOT. (gpu_plev(san_ic,san_k) .GE. 1.0e-3 .AND. gpu_plev(san_ic,san_k) .LE. 1100.0)) THEN
-            gpu_plev(san_ic,san_k) = 1013.25
-            san_bad = .TRUE.
-         ENDIF
-         IF (.NOT. (gpu_tlay(san_ic,san_k) .GE. 100.0 .AND. gpu_tlay(san_ic,san_k) .LE. 400.0)) THEN
-            gpu_tlay(san_ic,san_k) = 288.0
-            san_bad = .TRUE.
-         ENDIF
-         IF (.NOT. (gpu_tlev(san_ic,san_k) .GE. 100.0 .AND. gpu_tlev(san_ic,san_k) .LE. 400.0)) THEN
-            gpu_tlev(san_ic,san_k) = 288.0
-            san_bad = .TRUE.
-         ENDIF
-      ENDDO
-      IF (.NOT. (gpu_plev(san_ic,nlayers+1) .GE. 1.0e-3 .AND. gpu_plev(san_ic,nlayers+1) .LE. 1100.0)) THEN
-         gpu_plev(san_ic,nlayers+1) = 1013.25
-         san_bad = .TRUE.
-      ENDIF
-      IF (.NOT. (gpu_tlev(san_ic,nlayers+1) .GE. 100.0 .AND. gpu_tlev(san_ic,nlayers+1) .LE. 400.0)) THEN
-         gpu_tlev(san_ic,nlayers+1) = 288.0
-         san_bad = .TRUE.
-      ENDIF
-      IF (.NOT. (gpu_tsfc(san_ic) .GE. 100.0 .AND. gpu_tsfc(san_ic) .LE. 400.0)) THEN
-         gpu_tsfc(san_ic) = 288.0
-         san_bad = .TRUE.
-      ENDIF
-      IF (san_bad) THEN
-         gpu_bad(san_ic) = .TRUE.
-         WRITE(message,'(A,I5,A,I5,A)') &
-            'WRF_GPU_RAD WARNING: non-physical p/T at i=', &
-            gpu_i_idx(san_ic), ' j=', gpu_j_idx(san_ic), &
-            ' -- skipping LW update this step (pre-existing NaN upstream)'
-         call wrf_message(message)
-      ENDIF
-   ENDDO
-   END BLOCK
+! Defensive sanitization used to live here, at the top of this subroutine,
+! checking gpu_play/gpu_plev/etc. right before the chain-driver call. It is
+! now in RRTMG_LWRAD's accumulate loop instead, right after each column's
+! gpu_play(gpu_ic,:)=play(1,:)-style copy -- see the comment there, which
+! also records what the "reads clean before the call, reads NaN inside it"
+! observation that motivated the move actually turned out to be.
 
 !$acc update device(gpu_play, gpu_plev, gpu_tlay, gpu_tlev, gpu_tsfc) &
 !$acc   device(gpu_h2ovmr, gpu_o3vmr, gpu_co2vmr, gpu_ch4vmr, gpu_n2ovmr, gpu_o2vmr) &
@@ -18601,7 +18658,39 @@ CONTAINS
 ! bad column's LW outputs are skipped entirely this step, holding whatever
 ! value RTHRATENLW/GLW/OLR/LWCF/etc already had (all INTENT(INOUT)) rather
 ! than injecting a finite-but-physically-wrong update.
-      IF (gpu_bad(gk)) CYCLE
+!
+! "Hold the previous value" is only meaningful once a previous value exists.
+! On the very first radiation call of a run nothing has written these yet,
+! so seed a defined, physically harmless value (no radiative heating) that
+! first time through rather than relying on whatever allocation left behind.
+! Note that RTHRATENLW here is really module_radiation_driver's RTHRATEN
+! (it is passed as RTHRATENLW=RTHRATEN), which that driver zeroes over
+! kts:kte+1 at the top of every radiation call -- so in practice the "hold"
+! is a hold of zero, not of the previous call's heating rate. Kept anyway
+! because it costs nothing and does not depend on that driver detail.
+      IF (gpu_bad(gk)) THEN
+         IF (gpu_lw_first_call) THEN
+            glw(gi,gj)  = 0.
+            olr(gi,gj)  = 0.
+            lwcf(gi,gj) = 0.
+            IF (gpu_have_lwupt) THEN
+               lwupt(gi,gj)  = 0. ; lwuptc(gi,gj) = 0.
+               lwdnt(gi,gj)  = 0. ; lwdntc(gi,gj) = 0.
+               lwupb(gi,gj)  = 0. ; lwupbc(gi,gj) = 0.
+               lwdnb(gi,gj)  = 0. ; lwdnbc(gi,gj) = 0.
+            ENDIF
+            IF (gpu_have_lwupflx) THEN
+               DO k = kts, kte+2
+                  lwupflx(gi,k,gj)  = 0. ; lwupflxc(gi,k,gj) = 0.
+                  lwdnflx(gi,k,gj)  = 0. ; lwdnflxc(gi,k,gj) = 0.
+               ENDDO
+            ENDIF
+            DO k = kts, kte
+               rthratenlw(gi,k,gj) = 0.
+            ENDDO
+         ENDIF
+         CYCLE
+      ENDIF
 
       glw(gi,gj) = gpu_totdflux(gk,0)
       olr(gi,gj) = gpu_totuflux(gk,nlayers)
@@ -18822,6 +18911,7 @@ CONTAINS
    IF ( allowed_to_read ) THEN
       IF ( .NOT. gpu_tables_lw_pushed ) THEN
          CALL gpu_tables_lw_todevice()
+!$acc wait
          gpu_tables_lw_pushed = .TRUE.
       ENDIF
    ENDIF
