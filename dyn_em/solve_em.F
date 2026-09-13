@@ -1968,6 +1968,24 @@ BENCH_START(phys_bc_tim)
 
        END DO
        !$OMP END PARALLEL DO
+#ifdef WRF_GPU_DYN
+!  set_physical_bc3d/set_physical_bc2d just ran on the host and, for a
+!  specified/nested (also polar-filtered) domain, really do overwrite
+!  domain-edge values (open-boundary ghost-cell copies, symmetry planes,
+!  etc.) in ph_2/al/p/muts/mu_2/mudf -- this is not just an MPI-halo
+!  formality. The push-to-device a few lines above ("Push the
+!  halo-exchanged values back to the device") only fires when
+!  ntasks>1 .or. periodic_x .or. periodic_y, so a single-rank, non-periodic,
+!  specified-boundary run (this project's real case) never sent these
+!  every-substep edge corrections to the device at all: the next
+!  small_steps iteration's advance_uv/advance_mu_t/advance_w_fast kept
+!  reading stale, pre-correction edge values off the GPU indefinitely,
+!  letting the domain boundary silently diverge from the host-forced
+!  values step after step.
+       IF ( config_flags%polar .or. config_flags%specified .or. config_flags%nested ) THEN
+!$acc update device(grid%ph_2,grid%al,grid%p,grid%mu_2,grid%muts,grid%mudf)
+       END IF
+#endif
 BENCH_END(phys_bc_tim)
 
      END DO small_steps
