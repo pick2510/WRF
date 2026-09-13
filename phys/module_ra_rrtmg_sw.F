@@ -1933,6 +1933,256 @@
 
       end module mcica_subcol_gen_sw
 
+#ifdef WRF_GPU_RAD
+! ncol-batched OpenACC port of mcica_subcol_gen_sw's mcica_subcol_sw, the
+! shortwave McICA stochastic subcolumn cloud generator. Structurally the
+! twin of mcica_subcol_lw_gpu (see its header comment for the reasoning
+! about kissvec's per-column sequential RNG chain and why each overlap
+! mode needs, or does not need, a buffered per-column cdf array) -- the
+! same three overlap assumptions WRF's `icloud` namelist can select are
+! covered, and the same restriction to irng=0 (kissvec) applies, since
+! RRTMG_SWRAD hardcodes irng=0 at its call site rather than exposing it.
+!
+! Three differences from the LW twin, all of them easy to get wrong:
+!  1. nsubcol is ngptsw=112, not ngptlw=140, and the optical-property
+!     inputs are (nbndsw,ncol,nlay) with nbndsw=14.
+!  2. SW carries three more per-subcolumn optical properties than LW --
+!     ssac (single scattering albedo), asmc (asymmetry parameter) and
+!     fsfc (forward scattering fraction) -- alongside tauc.
+!  3. **The clear-subcolumn default for ssac_stoch is 1.0, not 0.0**
+!     (every other property defaults to 0). That asymmetry is in the
+!     original and is physically meaningful: a non-scattering subcolumn
+!     with zero optical depth still needs a well-defined single-scattering
+!     albedo, and spcvmc divides by quantities derived from it.
+!
+! SW's ngb is indexed over bands jpb1=16..jpb2=29, so the band index into
+! the nbndsw-wide optical property arrays is ngb(isubcol) - (ngb(1)-1),
+! exactly as the original computes it via its `ngbm` local.
+      MODULE mcica_subcol_gen_sw_gpu
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrsw, only : nbndsw, ngptsw, mxlay
+
+      IMPLICIT NONE
+
+      CONTAINS
+
+! Host-side pre-validation: the original's STOP statements cannot run on
+! the device, so the same conditions are checked once here before any
+! kernel launch (established pattern, see cldprmc_prep_gpu).
+      SUBROUTINE mcica_subcol_sw_prep_gpu(ncol, nlay, icld, irng, play)
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlay, icld, irng
+      REAL(kind=rb), INTENT(IN) :: play(ncol,nlay)
+      INTEGER(kind=im) :: i
+
+      IF (icld .lt. 1 .or. icld .gt. 3) THEN
+         CALL wrf_error_fatal('mcica_subcol_sw_prep_gpu: only icld=1,2,3 (WRF''s icloud namelist options) are ported')
+      ENDIF
+      IF (irng .ne. 0) THEN
+         CALL wrf_error_fatal('mcica_subcol_sw_prep_gpu: only irng=0 (kissvec RNG, WRF''s only call shape) is ported')
+      ENDIF
+      DO i = 1, ncol
+         IF (play(i,1) .lt. play(i,2)) THEN
+            CALL wrf_error_fatal('mcica_subcol_sw_prep_gpu: KISSVEC SEED GENERATOR REQUIRES PMID FROM BOTTOM FOUR LAYERS.')
+         ENDIF
+      ENDDO
+
+      END SUBROUTINE mcica_subcol_sw_prep_gpu
+
+      SUBROUTINE mcica_subcol_sw_gpu(ncol, nlay, icld, changeSeed, play, &
+                        cldfrac, ciwp, clwp, cswp, tauc, ssac, asmc, fsfc, &
+                        rei, rel, res, &
+                        cldfmcl, ciwpmcl, clwpmcl, cswpmcl, &
+                        reicmcl, relqmcl, resnmcl, &
+                        taucmcl, ssacmcl, asmcmcl, fsfcmcl)
+
+      use rrsw_wvn, only : ngb
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlay, icld, changeSeed
+      REAL(kind=rb), INTENT(IN) :: play(ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: cldfrac(ncol,nlay), ciwp(ncol,nlay), clwp(ncol,nlay), cswp(ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: tauc(nbndsw,ncol,nlay), ssac(nbndsw,ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: asmc(nbndsw,ncol,nlay), fsfc(nbndsw,ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: rei(ncol,nlay), rel(ncol,nlay), res(ncol,nlay)
+      REAL(kind=rb), INTENT(OUT) :: cldfmcl(ngptsw,ncol,nlay), ciwpmcl(ngptsw,ncol,nlay)
+      REAL(kind=rb), INTENT(OUT) :: clwpmcl(ngptsw,ncol,nlay), cswpmcl(ngptsw,ncol,nlay)
+      REAL(kind=rb), INTENT(OUT) :: reicmcl(ncol,nlay), relqmcl(ncol,nlay), resnmcl(ncol,nlay)
+      REAL(kind=rb), INTENT(OUT) :: taucmcl(ngptsw,ncol,nlay), ssacmcl(ngptsw,ncol,nlay)
+      REAL(kind=rb), INTENT(OUT) :: asmcmcl(ngptsw,ncol,nlay), fsfcmcl(ngptsw,ncol,nlay)
+
+      INTEGER(kind=im) :: iplon, ilev, isubcol, n, ngbm, i
+      INTEGER(kind=im) :: seed1, seed2, seed3, seed4, kiss
+      REAL(kind=rb) :: pmid1, pmid2, pmid3, pmid4
+      REAL(kind=rb) :: rand_num, cldf_val
+      REAL(kind=rb) :: cdf(mxlay)
+      LOGICAL :: iscloudy
+
+      REAL(kind=rb), PARAMETER :: cldmin = 1.0e-20_rb
+
+      ngbm = ngb(1) - 1
+
+!$acc parallel loop &
+!$acc   private(ilev, isubcol, n, i, seed1, seed2, seed3, seed4, kiss) &
+!$acc   private(pmid1, pmid2, pmid3, pmid4, rand_num, cldf_val, cdf, iscloudy) &
+!$acc   present(play, cldfrac, ciwp, clwp, cswp, tauc, ssac, asmc, fsfc, rei, rel, res) &
+!$acc   present(cldfmcl, ciwpmcl, clwpmcl, cswpmcl, reicmcl, relqmcl, resnmcl) &
+!$acc   present(taucmcl, ssacmcl, asmcmcl, fsfcmcl, ngb)
+      DO iplon = 1, ncol
+
+         pmid1 = play(iplon,1)*1.e2_rb
+         pmid2 = play(iplon,2)*1.e2_rb
+         pmid3 = play(iplon,3)*1.e2_rb
+         pmid4 = play(iplon,4)*1.e2_rb
+
+         seed1 = (pmid1 - int(pmid1)) * 1000000000_im
+         seed2 = (pmid2 - int(pmid2)) * 1000000000_im
+         seed3 = (pmid3 - int(pmid3)) * 1000000000_im
+         seed4 = (pmid4 - int(pmid4)) * 1000000000_im
+
+! Advance the RNG state by changeSeed steps before generating any
+! subcolumn randoms. RRTMG_SWRAD passes permuteseed=1 (LW uses 150; the
+! two must differ by at least nsubcol between the LW and SW calls of a
+! GCM, which is why they are distinct), but it is taken as an argument
+! here rather than assumed.
+!$acc loop seq
+         DO i = 1, changeSeed
+            seed1 = 69069_im * seed1 + 1327217885_im
+            seed2 = ieor(seed2, ishft(seed2, 13_im))
+            seed2 = ieor(seed2, ishft(seed2, -17_im))
+            seed2 = ieor(seed2, ishft(seed2, 5_im))
+            seed3 = 18000_im * iand(seed3, 65535_im) + ishft(seed3, -16_im)
+            seed4 = 30903_im * iand(seed4, 65535_im) + ishft(seed4, -16_im)
+            kiss = seed1 + seed2 + ishft(seed3, 16_im) + seed4
+            rand_num = kiss*2.328306e-10_rb + 0.5_rb
+         ENDDO
+
+!$acc loop seq
+         DO isubcol = 1, ngptsw
+            n = ngb(isubcol) - ngbm
+
+            IF (icld .eq. 3) THEN
+! Maximum overlap: one random draw per subcolumn, reused at every level.
+               seed1 = 69069_im * seed1 + 1327217885_im
+               seed2 = ieor(seed2, ishft(seed2, 13_im))
+               seed2 = ieor(seed2, ishft(seed2, -17_im))
+               seed2 = ieor(seed2, ishft(seed2, 5_im))
+               seed3 = 18000_im * iand(seed3, 65535_im) + ishft(seed3, -16_im)
+               seed4 = 30903_im * iand(seed4, 65535_im) + ishft(seed4, -16_im)
+               kiss = seed1 + seed2 + ishft(seed3, 16_im) + seed4
+               rand_num = kiss*2.328306e-10_rb + 0.5_rb
+!$acc loop seq
+               DO ilev = 1, nlay
+                  cdf(ilev) = rand_num
+               ENDDO
+            ELSE
+! Random overlap (icld=1) and maximum/random overlap (icld=2) both start
+! from one independent random draw per level.
+!$acc loop seq
+               DO ilev = 1, nlay
+                  seed1 = 69069_im * seed1 + 1327217885_im
+                  seed2 = ieor(seed2, ishft(seed2, 13_im))
+                  seed2 = ieor(seed2, ishft(seed2, -17_im))
+                  seed2 = ieor(seed2, ishft(seed2, 5_im))
+                  seed3 = 18000_im * iand(seed3, 65535_im) + ishft(seed3, -16_im)
+                  seed4 = 30903_im * iand(seed4, 65535_im) + ishft(seed4, -16_im)
+                  kiss = seed1 + seed2 + ishft(seed3, 16_im) + seed4
+                  rand_num = kiss*2.328306e-10_rb + 0.5_rb
+                  cdf(ilev) = rand_num
+               ENDDO
+
+               IF (icld .eq. 2) THEN
+! Maximum/random overlap: walk down the column -- if the layer above is
+! cloudy, reuse its random number; otherwise rescale this level's draw.
+!$acc loop seq
+                  DO ilev = 2, nlay
+                     cldf_val = cldfrac(iplon,ilev-1)
+                     IF (cldf_val .lt. cldmin) cldf_val = 0._rb
+                     IF (cdf(ilev-1) .gt. 1._rb - cldf_val) THEN
+                        cdf(ilev) = cdf(ilev-1)
+                     ELSE
+                        cdf(ilev) = cdf(ilev) * (1._rb - cldf_val)
+                     ENDIF
+                  ENDDO
+               ENDIF
+            ENDIF
+
+!$acc loop seq
+            DO ilev = 1, nlay
+               cldf_val = cldfrac(iplon,ilev)
+               IF (cldf_val .lt. cldmin) cldf_val = 0._rb
+               iscloudy = (cdf(ilev) .ge. 1._rb - cldf_val)
+
+               IF (iscloudy) THEN
+                  cldfmcl(isubcol,iplon,ilev) = 1._rb
+                  clwpmcl(isubcol,iplon,ilev) = clwp(iplon,ilev)
+                  ciwpmcl(isubcol,iplon,ilev) = ciwp(iplon,ilev)
+                  cswpmcl(isubcol,iplon,ilev) = cswp(iplon,ilev)
+                  taucmcl(isubcol,iplon,ilev) = tauc(n,iplon,ilev)
+                  ssacmcl(isubcol,iplon,ilev) = ssac(n,iplon,ilev)
+                  asmcmcl(isubcol,iplon,ilev) = asmc(n,iplon,ilev)
+                  fsfcmcl(isubcol,iplon,ilev) = fsfc(n,iplon,ilev)
+               ELSE
+                  cldfmcl(isubcol,iplon,ilev) = 0._rb
+                  clwpmcl(isubcol,iplon,ilev) = 0._rb
+                  ciwpmcl(isubcol,iplon,ilev) = 0._rb
+                  cswpmcl(isubcol,iplon,ilev) = 0._rb
+                  taucmcl(isubcol,iplon,ilev) = 0._rb
+!  Not a typo and not copy-paste drift from the LW twin: the original
+!  sets the clear-subcolumn single scattering albedo to 1, not 0.
+                  ssacmcl(isubcol,iplon,ilev) = 1._rb
+                  asmcmcl(isubcol,iplon,ilev) = 0._rb
+                  fsfcmcl(isubcol,iplon,ilev) = 0._rb
+               ENDIF
+            ENDDO
+         ENDDO
+
+!$acc loop seq
+         DO ilev = 1, nlay
+            reicmcl(iplon,ilev) = rei(iplon,ilev)
+            relqmcl(iplon,ilev) = rel(iplon,ilev)
+            resnmcl(iplon,ilev) = res(iplon,ilev)
+         ENDDO
+
+      ENDDO
+
+      END SUBROUTINE mcica_subcol_sw_gpu
+
+      SUBROUTINE mcica_subcol_sw_driver_gpu(ncol, nlay, icld, irng, changeSeed, play, &
+                        cldfrac, ciwp, clwp, cswp, tauc, ssac, asmc, fsfc, &
+                        rei, rel, res, &
+                        cldfmcl, ciwpmcl, clwpmcl, cswpmcl, &
+                        reicmcl, relqmcl, resnmcl, &
+                        taucmcl, ssacmcl, asmcmcl, fsfcmcl)
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlay, icld, irng, changeSeed
+      REAL(kind=rb), INTENT(IN) :: play(ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: cldfrac(ncol,nlay), ciwp(ncol,nlay), clwp(ncol,nlay), cswp(ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: tauc(nbndsw,ncol,nlay), ssac(nbndsw,ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: asmc(nbndsw,ncol,nlay), fsfc(nbndsw,ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: rei(ncol,nlay), rel(ncol,nlay), res(ncol,nlay)
+      REAL(kind=rb), INTENT(OUT) :: cldfmcl(ngptsw,ncol,nlay), ciwpmcl(ngptsw,ncol,nlay)
+      REAL(kind=rb), INTENT(OUT) :: clwpmcl(ngptsw,ncol,nlay), cswpmcl(ngptsw,ncol,nlay)
+      REAL(kind=rb), INTENT(OUT) :: reicmcl(ncol,nlay), relqmcl(ncol,nlay), resnmcl(ncol,nlay)
+      REAL(kind=rb), INTENT(OUT) :: taucmcl(ngptsw,ncol,nlay), ssacmcl(ngptsw,ncol,nlay)
+      REAL(kind=rb), INTENT(OUT) :: asmcmcl(ngptsw,ncol,nlay), fsfcmcl(ngptsw,ncol,nlay)
+
+      CALL mcica_subcol_sw_prep_gpu(ncol, nlay, icld, irng, play)
+      CALL mcica_subcol_sw_gpu(ncol, nlay, icld, changeSeed, play, &
+                cldfrac, ciwp, clwp, cswp, tauc, ssac, asmc, fsfc, &
+                rei, rel, res, &
+                cldfmcl, ciwpmcl, clwpmcl, cswpmcl, &
+                reicmcl, relqmcl, resnmcl, &
+                taucmcl, ssacmcl, asmcmcl, fsfcmcl)
+
+      END SUBROUTINE mcica_subcol_sw_driver_gpu
+
+      END MODULE mcica_subcol_gen_sw_gpu
+#endif
+
 !     path:      $Source: /cvsroot/NWP/WRFV3/phys/module_ra_rrtmg_sw.F,v $
 !     author:    $Author: trn $
 !     revision:  $Revision: 1.3 $

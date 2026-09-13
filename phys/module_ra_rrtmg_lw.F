@@ -2913,20 +2913,17 @@ contains
 ! devices, and no hardcoded device count.
 !
 ! The result is cached: MPI_Comm_split_type is collective, and this is
-! reached once per RRTMG_LWRAD call. Every rank in local_communicator
+! reached once per RRTMG_LWRAD call. Every rank in the domain communicator
 ! calls radiation on the same timesteps, so they all execute the
 ! uncached path together on the first radiation call and never again.
       INTEGER(kind=im) FUNCTION rrtmg_lw_gpu_ranks_per_device() RESULT(nshare)
 
-#ifdef DM_PARALLEL
-      use module_dm, only : local_communicator
-#endif
       use openacc
 
       IMPLICIT NONE
 #ifdef DM_PARALLEL
       INCLUDE 'mpif.h'
-      INTEGER :: node_comm, node_size, mydev, ierr
+      INTEGER :: dm_comm, node_comm, node_size, mydev, ierr
       INTEGER, ALLOCATABLE :: node_devs(:)
 #endif
       INTEGER(kind=im), SAVE :: nshare_cached = -1
@@ -2938,8 +2935,15 @@ contains
 
       nshare = 1
 #ifdef DM_PARALLEL
-      IF (local_communicator .ne. MPI_UNDEFINED) THEN
-         CALL MPI_Comm_split_type(local_communicator, MPI_COMM_TYPE_SHARED, 0, &
+!  Reached through wrf_get_dm_communicator rather than by USEing
+!  module_dm's local_communicator directly: this keeps phys from depending
+!  on frame's module *data* layout, which in turn lets the standalone
+!  verification harnesses in /tmp/rrtmg_integrate link this object against
+!  a one-line stub instead of dragging in module_dm.o and, with it, the
+!  whole RSL_LITE/DM layer. Same value either way.
+      CALL wrf_get_dm_communicator(dm_comm)
+      IF (dm_comm .ne. MPI_UNDEFINED) THEN
+         CALL MPI_Comm_split_type(dm_comm, MPI_COMM_TYPE_SHARED, 0, &
                                   MPI_INFO_NULL, node_comm, ierr)
          IF (ierr .eq. MPI_SUCCESS) THEN
             CALL MPI_Comm_size(node_comm, node_size, ierr)
