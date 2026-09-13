@@ -13073,6 +13073,388 @@
 
       end module rrtmg_sw_rad
 
+#ifdef WRF_GPU_RAD
+! ncol-batched OpenACC port of rrtmg_sw_rad's inatm_sw: the GCM-input-to-
+! RRTMG conversion that runs between mcica_subcol_sw and the cldprmc_sw /
+! setcoef_sw / taumol_sw chain. Pressure/temperature transfer, vmr ->
+! molec/cm2 column density (coldry), aerosol transfer, and the McICA
+! cloud-array reindexing.
+!
+! Simpler than the LW twin (inatm_driver_gpu): SW has no wbrodl, no
+! semiss, and -- importantly -- no cross-layer reduction at all, since
+! there is no pwvcm analogue. Every kernel here is purely elementwise over
+! (column, layer) or (column, layer, g-point).
+!
+! TWO THINGS THE LW PORT GOT WRONG AND THIS ONE IS WRITTEN TO AVOID:
+!
+!  1. **No cross-thread array reads.** The original computes both
+!     pdp(l) and coldry(l) from `pz(l-1) - pz(l)` while the same loop
+!     assigns pz(l). In a collapse(2) kernel, pz(iplon,l-1) is written by
+!     a *different thread*, so reading it is a race with no ordering --
+!     that was a real bug in inatm_layers_gpu that produced garbage coldry
+!     for ~0.3% of cells and, where it landed on exactly zero, NaN heating
+!     rates (see CLAUDE.md). pz(iplon,l-1) is identical by construction to
+!     plev(iplon,l) for every l >= 1, and plev is a read-only input, so
+!     both quantities are computed from plev directly here and pz is never
+!     read inside the kernel that writes it.
+!  2. **Defaults are established for the full index range, unconditionally.**
+!     The original opens with wkl=0, ssacmc=1, ssaa=1 and the rest zero,
+!     then overwrites only where icld/iaer say to. Those defaults are not
+!     optional: wkl(5,:) is never assigned by anything, the iceflag/=5
+!     path never assigns cswpmc/resnmc, and ssacmc/ssaa default to 1 rather
+!     than 0. inatm_sw_zero_gpu reproduces all of it before any conditional
+!     kernel runs, rather than relying on device memory being zero.
+      MODULE rrtmg_sw_inatm_gpu
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrsw, only : nbndsw, ngptsw, nmol, mxmol, jpband, jpb1, jpb2, rrsw_scon
+
+      IMPLICIT NONE
+
+      CONTAINS
+
+! Host-side: the per-band solar flux adjustment. Column-independent (it
+! depends only on adjes/dyofyr/scon), involves the `earth_sun` function
+! which lives in the CPU module, and is 14 values -- so it stays on the
+! host and is pushed with the rest of the batch, exactly as the original
+! computes it once per column call.
+      SUBROUTINE inatm_sw_adjflux(adjes, dyofyr, scon, adjflux, solvar)
+
+      use rrtmg_sw_rad, only : earth_sun
+
+      IMPLICIT NONE
+      REAL(kind=rb), INTENT(IN) :: adjes, scon
+      INTEGER(kind=im), INTENT(IN) :: dyofyr
+      REAL(kind=rb), INTENT(OUT) :: adjflux(jpband), solvar(jpband)
+
+      INTEGER(kind=im) :: ib
+      REAL(kind=rb) :: adjflx
+
+      adjflux(:) = 0._rb
+      solvar(:) = 0._rb
+
+      adjflx = adjes
+      IF (dyofyr .gt. 0) THEN
+         adjflx = earth_sun(dyofyr)
+      ENDIF
+
+      DO ib = jpb1, jpb2
+         solvar(ib) = scon / rrsw_scon
+         adjflux(ib) = adjflx * solvar(ib)
+      ENDDO
+
+      END SUBROUTINE inatm_sw_adjflux
+
+! Establish the original's opening defaults over the whole index range.
+! See point 2 of the module header for why this is not optional.
+      SUBROUTINE inatm_sw_zero_gpu(ncol, nlay, wkl, cldfmc, taucmc, ssacmc, &
+                        asmcmc, fsfcmc, ciwpmc, clwpmc, cswpmc, &
+                        reicmc, relqmc, resnmc, taua, ssaa, asma)
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlay
+      REAL(kind=rb), INTENT(OUT) :: wkl(ncol,nlay,mxmol)
+      REAL(kind=rb), INTENT(OUT) :: cldfmc(ncol,ngptsw,nlay), taucmc(ncol,ngptsw,nlay)
+      REAL(kind=rb), INTENT(OUT) :: ssacmc(ncol,ngptsw,nlay), asmcmc(ncol,ngptsw,nlay)
+      REAL(kind=rb), INTENT(OUT) :: fsfcmc(ncol,ngptsw,nlay)
+      REAL(kind=rb), INTENT(OUT) :: ciwpmc(ncol,ngptsw,nlay), clwpmc(ncol,ngptsw,nlay)
+      REAL(kind=rb), INTENT(OUT) :: cswpmc(ncol,ngptsw,nlay)
+      REAL(kind=rb), INTENT(OUT) :: reicmc(ncol,nlay), relqmc(ncol,nlay), resnmc(ncol,nlay)
+      REAL(kind=rb), INTENT(OUT) :: taua(ncol,nlay,nbndsw), ssaa(ncol,nlay,nbndsw)
+      REAL(kind=rb), INTENT(OUT) :: asma(ncol,nlay,nbndsw)
+
+      INTEGER(kind=im) :: iplon, l, ig, ib, imol
+
+!$acc parallel loop collapse(3) present(cldfmc, taucmc, ssacmc, asmcmc, fsfcmc) &
+!$acc   present(ciwpmc, clwpmc, cswpmc)
+      DO l = 1, nlay
+      DO ig = 1, ngptsw
+      DO iplon = 1, ncol
+         cldfmc(iplon,ig,l) = 0.0_rb
+         taucmc(iplon,ig,l) = 0.0_rb
+!  ssacmc defaults to 1, not 0 -- see the mcica_subcol_sw_gpu header.
+         ssacmc(iplon,ig,l) = 1.0_rb
+         asmcmc(iplon,ig,l) = 0.0_rb
+         fsfcmc(iplon,ig,l) = 0.0_rb
+         ciwpmc(iplon,ig,l) = 0.0_rb
+         clwpmc(iplon,ig,l) = 0.0_rb
+         cswpmc(iplon,ig,l) = 0.0_rb
+      ENDDO
+      ENDDO
+      ENDDO
+
+!$acc parallel loop collapse(3) present(taua, ssaa, asma)
+      DO ib = 1, nbndsw
+      DO l = 1, nlay
+      DO iplon = 1, ncol
+         taua(iplon,l,ib) = 0.0_rb
+         ssaa(iplon,l,ib) = 1.0_rb
+         asma(iplon,l,ib) = 0.0_rb
+      ENDDO
+      ENDDO
+      ENDDO
+
+!$acc parallel loop collapse(3) present(wkl)
+      DO imol = 1, mxmol
+      DO l = 1, nlay
+      DO iplon = 1, ncol
+         wkl(iplon,l,imol) = 0.0_rb
+      ENDDO
+      ENDDO
+      ENDDO
+
+!$acc parallel loop collapse(2) present(reicmc, relqmc, resnmc)
+      DO l = 1, nlay
+      DO iplon = 1, ncol
+         reicmc(iplon,l) = 0.0_rb
+         relqmc(iplon,l) = 0.0_rb
+         resnmc(iplon,l) = 0.0_rb
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE inatm_sw_zero_gpu
+
+! Pressure/temperature transfer, layer thickness, and the vmr -> molec/cm2
+! conversion. Note pz/tz index 0 is set in its own tiny kernel first, the
+! way inatm_layers_gpu had to learn to do -- but unlike LW, the main kernel
+! below never reads pz at all, so that ordering is only needed for pz(:,0)
+! itself to exist for downstream consumers, not for coldry.
+      SUBROUTINE inatm_sw_layers_gpu(ncol, nlay, play, plev, tlay, tlev, tsfc, &
+                        h2ovmr, o3vmr, co2vmr, ch4vmr, n2ovmr, o2vmr, &
+                        pavel, pz, pdp, tavel, tz, tbound, coldry, wkl)
+
+      use rrsw_con, only : grav, avogad
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlay
+      REAL(kind=rb), INTENT(IN) :: play(ncol,nlay), tlay(ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: plev(ncol,nlay+1), tlev(ncol,nlay+1), tsfc(ncol)
+      REAL(kind=rb), INTENT(IN) :: h2ovmr(ncol,nlay), o3vmr(ncol,nlay), co2vmr(ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: ch4vmr(ncol,nlay), n2ovmr(ncol,nlay), o2vmr(ncol,nlay)
+      REAL(kind=rb), INTENT(OUT) :: pavel(ncol,nlay), tavel(ncol,nlay), pdp(ncol,nlay)
+      REAL(kind=rb), INTENT(OUT) :: pz(ncol,0:nlay), tz(ncol,0:nlay), tbound(ncol)
+      REAL(kind=rb), INTENT(OUT) :: coldry(ncol,nlay)
+      REAL(kind=rb), INTENT(INOUT) :: wkl(ncol,nlay,mxmol)
+
+      REAL(kind=rb), PARAMETER :: amd = 28.9660_rb
+      REAL(kind=rb), PARAMETER :: amw = 18.0160_rb
+      INTEGER(kind=im) :: iplon, l, imol
+      REAL(kind=rb) :: amm
+
+!$acc parallel loop present(plev, tlev, tsfc, pz, tz, tbound)
+      DO iplon = 1, ncol
+         pz(iplon,0) = plev(iplon,1)
+         tz(iplon,0) = tlev(iplon,1)
+         tbound(iplon) = tsfc(iplon)
+      ENDDO
+
+!$acc parallel loop collapse(2) private(amm, imol) &
+!$acc   present(play, tlay, plev, tlev, h2ovmr, o3vmr, co2vmr, ch4vmr, n2ovmr, o2vmr) &
+!$acc   present(pavel, tavel, pdp, pz, tz, coldry, wkl)
+      DO iplon = 1, ncol
+      DO l = 1, nlay
+         pavel(iplon,l) = play(iplon,l)
+         tavel(iplon,l) = tlay(iplon,l)
+         pz(iplon,l) = plev(iplon,l+1)
+         tz(iplon,l) = tlev(iplon,l+1)
+!  pz(iplon,l-1) == plev(iplon,l) by construction for every l >= 1 (the
+!  boundary kernel above sets pz(:,0) = plev(:,1), and this kernel sets
+!  pz(:,l) = plev(:,l+1)). Read plev, never pz: pz(iplon,l-1) belongs to
+!  another thread of this same kernel. See the module header.
+         pdp(iplon,l) = plev(iplon,l) - plev(iplon,l+1)
+
+         wkl(iplon,l,1) = h2ovmr(iplon,l)
+         wkl(iplon,l,2) = co2vmr(iplon,l)
+         wkl(iplon,l,3) = o3vmr(iplon,l)
+         wkl(iplon,l,4) = n2ovmr(iplon,l)
+         wkl(iplon,l,6) = ch4vmr(iplon,l)
+         wkl(iplon,l,7) = o2vmr(iplon,l)
+
+         amm = (1._rb - wkl(iplon,l,1)) * amd + wkl(iplon,l,1) * amw
+         coldry(iplon,l) = (plev(iplon,l)-plev(iplon,l+1)) * 1.e3_rb * avogad / &
+                     (1.e2_rb * grav * amm * (1._rb + wkl(iplon,l,1)))
+
+!  Convert every molecular amount from volume mixing ratio to molec/cm2.
+!  Fused into this kernel rather than split out as LW does: SW has no
+!  wbrodl summation between the two steps, so there is nothing to order.
+!$acc loop seq
+         DO imol = 1, nmol
+            wkl(iplon,l,imol) = coldry(iplon,l) * wkl(iplon,l,imol)
+         ENDDO
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE inatm_sw_layers_gpu
+
+! Aerosol optical property transfer; only called when iaer >= 1, matching
+! the original's guard. The iaer < 1 case is covered by inatm_sw_zero_gpu's
+! taua=0 / ssaa=1 / asma=0 defaults.
+      SUBROUTINE inatm_sw_aerosol_gpu(ncol, nlay, tauaer, ssaaer, asmaer, taua, ssaa, asma)
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlay
+      REAL(kind=rb), INTENT(IN) :: tauaer(ncol,nlay,nbndsw), ssaaer(ncol,nlay,nbndsw)
+      REAL(kind=rb), INTENT(IN) :: asmaer(ncol,nlay,nbndsw)
+      REAL(kind=rb), INTENT(INOUT) :: taua(ncol,nlay,nbndsw), ssaa(ncol,nlay,nbndsw)
+      REAL(kind=rb), INTENT(INOUT) :: asma(ncol,nlay,nbndsw)
+
+      INTEGER(kind=im) :: iplon, l, ib
+
+!$acc parallel loop collapse(3) present(tauaer, ssaaer, asmaer, taua, ssaa, asma)
+      DO ib = 1, nbndsw
+      DO l = 1, nlay
+      DO iplon = 1, ncol
+         taua(iplon,l,ib) = tauaer(iplon,l,ib)
+         ssaa(iplon,l,ib) = ssaaer(iplon,l,ib)
+         asma(iplon,l,ib) = asmaer(iplon,l,ib)
+      ENDDO
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE inatm_sw_aerosol_gpu
+
+! McICA cloud-array reindexing, (ngptsw,ncol,nlay) -> (ncol,ngptsw,nlay);
+! only called when icld >= 1, matching the original's guard. Note cswpmc
+! and resnmc are only transferred for iceflag==5, exactly as the original
+! does -- for any other iceflag they keep inatm_sw_zero_gpu's zeros.
+      SUBROUTINE inatm_sw_cloud_gpu(ncol, nlay, iceflag, &
+                        cldfmcl, taucmcl, ssacmcl, asmcmcl, fsfcmcl, &
+                        ciwpmcl, clwpmcl, cswpmcl, reicmcl, relqmcl, resnmcl, &
+                        cldfmc, taucmc, ssacmc, asmcmc, fsfcmc, &
+                        ciwpmc, clwpmc, cswpmc, reicmc, relqmc, resnmc)
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlay, iceflag
+      REAL(kind=rb), INTENT(IN) :: cldfmcl(ngptsw,ncol,nlay), taucmcl(ngptsw,ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: ssacmcl(ngptsw,ncol,nlay), asmcmcl(ngptsw,ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: fsfcmcl(ngptsw,ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: ciwpmcl(ngptsw,ncol,nlay), clwpmcl(ngptsw,ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: cswpmcl(ngptsw,ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: reicmcl(ncol,nlay), relqmcl(ncol,nlay), resnmcl(ncol,nlay)
+      REAL(kind=rb), INTENT(INOUT) :: cldfmc(ncol,ngptsw,nlay), taucmc(ncol,ngptsw,nlay)
+      REAL(kind=rb), INTENT(INOUT) :: ssacmc(ncol,ngptsw,nlay), asmcmc(ncol,ngptsw,nlay)
+      REAL(kind=rb), INTENT(INOUT) :: fsfcmc(ncol,ngptsw,nlay)
+      REAL(kind=rb), INTENT(INOUT) :: ciwpmc(ncol,ngptsw,nlay), clwpmc(ncol,ngptsw,nlay)
+      REAL(kind=rb), INTENT(INOUT) :: cswpmc(ncol,ngptsw,nlay)
+      REAL(kind=rb), INTENT(INOUT) :: reicmc(ncol,nlay), relqmc(ncol,nlay), resnmc(ncol,nlay)
+
+      INTEGER(kind=im) :: iplon, l, ig
+
+!$acc parallel loop collapse(3) &
+!$acc   present(cldfmcl, taucmcl, ssacmcl, asmcmcl, fsfcmcl, ciwpmcl, clwpmcl, cswpmcl) &
+!$acc   present(cldfmc, taucmc, ssacmc, asmcmc, fsfcmc, ciwpmc, clwpmc, cswpmc)
+      DO l = 1, nlay
+      DO ig = 1, ngptsw
+      DO iplon = 1, ncol
+         cldfmc(iplon,ig,l) = cldfmcl(ig,iplon,l)
+         taucmc(iplon,ig,l) = taucmcl(ig,iplon,l)
+         ssacmc(iplon,ig,l) = ssacmcl(ig,iplon,l)
+         asmcmc(iplon,ig,l) = asmcmcl(ig,iplon,l)
+         fsfcmc(iplon,ig,l) = fsfcmcl(ig,iplon,l)
+         ciwpmc(iplon,ig,l) = ciwpmcl(ig,iplon,l)
+         clwpmc(iplon,ig,l) = clwpmcl(ig,iplon,l)
+         IF (iceflag .eq. 5) THEN
+            cswpmc(iplon,ig,l) = cswpmcl(ig,iplon,l)
+         ENDIF
+      ENDDO
+      ENDDO
+      ENDDO
+
+!$acc parallel loop collapse(2) present(reicmcl, relqmcl, resnmcl, reicmc, relqmc, resnmc)
+      DO l = 1, nlay
+      DO iplon = 1, ncol
+         reicmc(iplon,l) = reicmcl(iplon,l)
+         relqmc(iplon,l) = relqmcl(iplon,l)
+         IF (iceflag .eq. 5) THEN
+            resnmc(iplon,l) = resnmcl(iplon,l)
+         ENDIF
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE inatm_sw_cloud_gpu
+
+! Single entry point bundling the whole conversion, mirroring the other
+! stages' *_driver_gpu convention and the LW twin's inatm_driver_gpu.
+      SUBROUTINE inatm_sw_driver_gpu(ncol, nlay, icld, iaer, &
+                        play, plev, tlay, tlev, tsfc, h2ovmr, &
+                        o3vmr, co2vmr, ch4vmr, n2ovmr, o2vmr, &
+                        inflgsw, iceflgsw, liqflgsw, &
+                        cldfmcl, taucmcl, ssacmcl, asmcmcl, fsfcmcl, &
+                        ciwpmcl, clwpmcl, cswpmcl, reicmcl, relqmcl, resnmcl, &
+                        tauaer, ssaaer, asmaer, &
+                        pavel, pz, pdp, tavel, tz, tbound, coldry, wkl, &
+                        inflag, iceflag, liqflag, &
+                        cldfmc, taucmc, ssacmc, asmcmc, fsfcmc, &
+                        ciwpmc, clwpmc, cswpmc, reicmc, relqmc, resnmc, &
+                        taua, ssaa, asma)
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlay, icld, iaer
+      INTEGER(kind=im), INTENT(IN) :: inflgsw, iceflgsw, liqflgsw
+      REAL(kind=rb), INTENT(IN) :: play(ncol,nlay), tlay(ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: plev(ncol,nlay+1), tlev(ncol,nlay+1), tsfc(ncol)
+      REAL(kind=rb), INTENT(IN) :: h2ovmr(ncol,nlay), o3vmr(ncol,nlay), co2vmr(ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: ch4vmr(ncol,nlay), n2ovmr(ncol,nlay), o2vmr(ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: cldfmcl(ngptsw,ncol,nlay), taucmcl(ngptsw,ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: ssacmcl(ngptsw,ncol,nlay), asmcmcl(ngptsw,ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: fsfcmcl(ngptsw,ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: ciwpmcl(ngptsw,ncol,nlay), clwpmcl(ngptsw,ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: cswpmcl(ngptsw,ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: reicmcl(ncol,nlay), relqmcl(ncol,nlay), resnmcl(ncol,nlay)
+      REAL(kind=rb), INTENT(IN) :: tauaer(ncol,nlay,nbndsw), ssaaer(ncol,nlay,nbndsw)
+      REAL(kind=rb), INTENT(IN) :: asmaer(ncol,nlay,nbndsw)
+      REAL(kind=rb), INTENT(OUT) :: pavel(ncol,nlay), tavel(ncol,nlay), pdp(ncol,nlay)
+      REAL(kind=rb), INTENT(OUT) :: pz(ncol,0:nlay), tz(ncol,0:nlay), tbound(ncol)
+      REAL(kind=rb), INTENT(OUT) :: coldry(ncol,nlay), wkl(ncol,nlay,mxmol)
+      INTEGER(kind=im), INTENT(OUT) :: inflag, iceflag, liqflag
+      REAL(kind=rb), INTENT(OUT) :: cldfmc(ncol,ngptsw,nlay), taucmc(ncol,ngptsw,nlay)
+      REAL(kind=rb), INTENT(OUT) :: ssacmc(ncol,ngptsw,nlay), asmcmc(ncol,ngptsw,nlay)
+      REAL(kind=rb), INTENT(OUT) :: fsfcmc(ncol,ngptsw,nlay)
+      REAL(kind=rb), INTENT(OUT) :: ciwpmc(ncol,ngptsw,nlay), clwpmc(ncol,ngptsw,nlay)
+      REAL(kind=rb), INTENT(OUT) :: cswpmc(ncol,ngptsw,nlay)
+      REAL(kind=rb), INTENT(OUT) :: reicmc(ncol,nlay), relqmc(ncol,nlay), resnmc(ncol,nlay)
+      REAL(kind=rb), INTENT(OUT) :: taua(ncol,nlay,nbndsw), ssaa(ncol,nlay,nbndsw)
+      REAL(kind=rb), INTENT(OUT) :: asma(ncol,nlay,nbndsw)
+
+!  DELIBERATE (small) DIVERGENCE FROM THE ORIGINAL, documented because a
+!  verification harness will flag it: inatm_sw assigns these three only
+!  inside its "if (icld .ge. 1)" block, yet they are intent(out) scalars
+!  and rrtmg_sw passes them to cldprmc_sw unconditionally -- so for icld=0
+!  the CPU path reads values that were never assigned. That is harmless
+!  there only because icld=0 also means cldfmc is all zero, and cldprmc_sw
+!  skips every g-point whose cldfmc is zero, so the flags are never acted
+!  on. Assigning them unconditionally here is strictly better defined and
+!  cannot change any result. (WRF's real call shape always has icld >= 1
+!  anyway -- ICLOUD is 1/2/3 -- so this path is not exercised in practice.)
+      inflag = inflgsw
+      iceflag = iceflgsw
+      liqflag = liqflgsw
+
+      CALL inatm_sw_zero_gpu(ncol, nlay, wkl, cldfmc, taucmc, ssacmc, &
+                asmcmc, fsfcmc, ciwpmc, clwpmc, cswpmc, &
+                reicmc, relqmc, resnmc, taua, ssaa, asma)
+
+      CALL inatm_sw_layers_gpu(ncol, nlay, play, plev, tlay, tlev, tsfc, &
+                h2ovmr, o3vmr, co2vmr, ch4vmr, n2ovmr, o2vmr, &
+                pavel, pz, pdp, tavel, tz, tbound, coldry, wkl)
+
+      IF (iaer .ge. 1) THEN
+         CALL inatm_sw_aerosol_gpu(ncol, nlay, tauaer, ssaaer, asmaer, taua, ssaa, asma)
+      ENDIF
+
+      IF (icld .ge. 1) THEN
+         CALL inatm_sw_cloud_gpu(ncol, nlay, iceflag, &
+                   cldfmcl, taucmcl, ssacmcl, asmcmcl, fsfcmcl, &
+                   ciwpmcl, clwpmcl, cswpmcl, reicmcl, relqmcl, resnmcl, &
+                   cldfmc, taucmc, ssacmc, asmcmc, fsfcmc, &
+                   ciwpmc, clwpmc, cswpmc, reicmc, relqmc, resnmc)
+      ENDIF
+
+      END SUBROUTINE inatm_sw_driver_gpu
+
+      END MODULE rrtmg_sw_inatm_gpu
+#endif
+
 !------------------------------------------------------------------
 MODULE module_ra_rrtmg_sw
 
