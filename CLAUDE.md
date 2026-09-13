@@ -380,10 +380,27 @@ addition, original CPU per-column path untouched) that:
      (`/mnt/nvme/wrf_hk_cpu_d01`) to judge the radiation port: that build
      differs by ~5% in `dmudt` because of `WRF_GPU_DYN`, equally in both
      GPU builds — a separate, pre-existing question.
-  10. **Wall clock**: 242s with GPU LW vs 305s with CPU LW for the same
-     10-minute run (1 rank), i.e. ~1.26x end-to-end with only LW ported.
-     SW is still entirely on the CPU and is now the dominant remaining
-     radiation cost.
+  10. **Wall clock**, real Hong Kong case, 10 minutes simulated, same
+     machine (40-core box + RTX 5060), `nvfortran -O3` throughout:
+
+     | build | ranks | wall |
+     |---|---|---|
+     | CPU-only (`WRF_cpu`) | 1 | 312.0s |
+     | `WRF_GPU_DYN` only (CPU radiation) | 1 | 304.6s |
+     | `WRF_GPU_DYN` + `WRF_GPU_RAD` | 1 | **242.2s** |
+     | CPU-only | 4 | 100.6s |
+     | CPU-only | 8 | 57.3s |
+
+     So at equal rank count the LW port is worth **1.29x** end-to-end
+     (essentially all of it from radiation — the dyn port is at parity, as
+     documented), but **the GPU build is not yet competitive with simply
+     using the CPU cores this box has**: 4-rank CPU is 2.4x faster than the
+     1-rank GPU build and 8-rank is 4.2x faster. Two things have to change
+     before the GPU path wins in practice: SW radiation must be ported (it
+     is still entirely on the CPU and is now the dominant remaining
+     radiation cost), and the multi-rank chunk-sizing limitation above must
+     be fixed so the GPU build can use more than one rank at all. Quote the
+     1.29x as "LW-only, 1 rank", never as a headline GPU-vs-CPU number.
 
 - **Chunk sizing is solved, device-independently**:
   `rrtmg_lw_gpu_chunksize(nlayers, max_ncol)` (module `rrtmg_lw_gpu_chunk`,
@@ -404,6 +421,17 @@ addition, original CPU per-column path untouched) that:
   wasn't, when the estimate was first written) — the sizing *mechanism* is
   solid, the number it multiplies is worth double-checking against the
   chain driver's actual `ALLOCATE` list.
+  **Known limitation — the sizing is per-process, so multi-rank runs on a
+  single GPU fail.** `acc_get_property(..., acc_property_free_memory)`
+  reports the whole device's free memory, and every rank believes it is
+  alone: at `-np 4` on the 8GB RTX 5060 the first ranks each size a chunk
+  to ~half the card and a later one dies with
+  `Out of memory allocating 171143280 bytes of device memory /
+  total/free CUDA memory: 8177909760/50921472` before the first timestep.
+  1 rank is fine. Fixing this means dividing the free-memory figure by the
+  number of ranks sharing the device (e.g. from the node-local MPI
+  communicator size, or `MPI_COMM_TYPE_SHARED`), not hardcoding anything —
+  needed before the 2-/4-rank verification below can even be attempted.
 - **Build wiring done, but differently than originally planned**: rather
   than dispatching between a CPU and a GPU version of `RRTMG_LWRAD` from
   `module_radiation_driver.F:1521` (the `dyn_em`-style `IF`/`ELSE` shape),
