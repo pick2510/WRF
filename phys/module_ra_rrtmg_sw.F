@@ -13455,6 +13455,719 @@
       END MODULE rrtmg_sw_inatm_gpu
 #endif
 
+#ifdef WRF_GPU_RAD
+! Single entry point chaining mcica_subcol_sw -> inatm_sw -> cldprmc_sw ->
+! setcoef_sw -> taumol_sw -> spcvmc_sw for a whole column batch, and then
+! reproducing rrtmg_sw's own output loop (flux transfer, direct/diffuse
+! split, heating rates). Mirrors RRTMG_SWRAD's per-column
+! `mcica_subcol_sw` + `rrtmg_sw` call pair exactly, the way
+! rrtmg_lw_gpu_chain_driver mirrors the LW pair.
+!
+! Structural differences from the LW chain worth knowing before reading:
+!
+!  * taumol_sw is NOT a sibling of spcvmc_sw the way taumol is of rtrnmc.
+!    In the CPU code taumol_sw is called from *inside* spcvmc_sw, on
+!    spcvmc_sw's own locals. The port hoisted it out (taumol_sw_driver_gpu
+!    produces sfluxzen/taug/taur, spcvmc_sw_driver_gpu consumes them), so
+!    here they are two consecutive calls. There is no SW analogue of LW's
+!    lw_combine_taua_gpu: SW never adds aerosol optical depth into taug --
+!    aerosol enters spcvmc_sw as its own ztaua/zasya/zomga triple, because
+!    SW needs the scattering properties, not just an extinction sum.
+!
+!  * rrtmg_sw does real work between setcoef_sw and spcvmc_sw that
+!    rrtmg_lw has no counterpart for, and it is all in the host code
+!    rather than in a named subroutine: the solar-zenith clamp, the
+!    per-band surface-albedo expansion, the cloud-array transpose from
+!    (g-point,layer) to (layer,g-point), and the aerosol selection. Those
+!    are the four small kernels below (sw_prep_albedo_gpu,
+!    sw_transfer_cloud_gpu, sw_transfer_aerosol_gpu) -- they are part of
+!    the science path, not plumbing, and skipping any of them silently
+!    produces plausible-looking but wrong fluxes.
+!
+!  * rrtmg_sw's output loop computes more than LW's: the direct/diffuse
+!    decomposition and the UV/near-IR sub-band fluxes WRF feeds to SSiB,
+!    plus the heating rate from pdp. sw_fluxes_gpu reproduces all of it.
+      MODULE rrtmg_sw_gpu_chain
+
+      use parkind, only : im => kind_im, rb => kind_rb
+      use parrrsw, only : nbndsw, ngptsw, mxmol, naerec, jpband, jpb1, jpb2
+
+      IMPLICIT NONE
+
+      CONTAINS
+
+! Host-side pre-validation for cldprmc_sw, reformulated to run on
+! *pre-mcica* per-column data. Same motivation and same exactness
+! argument as LW's cldprmc_prep_batch_gpu: cldprmc_sw_prep_gpu wants the
+! post-mcica per-subcolumn arrays, which only exist on the device by the
+! time they could be checked, and copying them back purely for a bound
+! check would be an expensive round-trip.
+!
+! Why looping bands instead of g-points is exact, not an approximation:
+! mcica_subcol_sw sets cldfmc to 1 and copies ciwp/clwp/cswp/tauc into the
+! subcolumn wherever that g-point's random draw is cloudy, and leaves them
+! 0 otherwise. So every quantity the per-g-point checks read is either
+! that band's pre-mcica value or zero, and "zero" only ever means the
+! check is skipped. Checking the pre-mcica value for every band therefore
+! covers a superset of the (cell, band) pairs the original would check,
+! never a subset -- and the extra ones are cells mcica happened to draw
+! clear, where validating a bound that would have been skipped is
+! harmless. The band-indexed lookups (wavenum2, fdlice3) depend on
+! ngb(ig), which is constant within a band, so grouping loses nothing.
+      SUBROUTINE cldprmc_sw_prep_batch_gpu(ncol, nlayers, icld, inflag, iceflag, liqflag, &
+                        cldfrac, ciwp, clwp, cswp, tauc, rei, rel, res)
+
+      use rrsw_cld, only : fdlice3, abari, bbari, cbari, dbari, ebari, fbari
+      use rrsw_wvn, only : wavenum2, ngb
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, icld, inflag, iceflag, liqflag
+      REAL(kind=rb), INTENT(IN) :: cldfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: ciwp(ncol,nlayers), clwp(ncol,nlayers), cswp(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: tauc(nbndsw,ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: rei(ncol,nlayers), rel(ncol,nlayers), res(ncol,nlayers)
+
+      INTEGER(kind=im) :: iplon, lay, ibx, ib, icx, indx, ngbm
+      REAL(kind=rb) :: cwp, radice, radliq, radsno, factor, fint
+      REAL(kind=rb) :: extcoice, ssacoice, gice, fdelta
+      REAL(kind=rb), PARAMETER :: eps = 1.e-06_rb
+      REAL(kind=rb), PARAMETER :: cldmin = 1.e-20_rb
+      CHARACTER*80 :: errmess
+
+      IF (inflag .eq. 1) THEN
+         CALL wrf_error_fatal('cldprmc_sw_prep_batch_gpu: INFLAG = 1 OPTION NOT AVAILABLE WITH MCICA')
+      ENDIF
+      IF (inflag .lt. 2) RETURN
+!  icld < 1 leaves cldfmc identically zero (inatm_sw skips the cloud
+!  transfer), so cldprmc_sw cycles every g-point and validates nothing.
+      IF (icld .lt. 1) RETURN
+
+      ngbm = ngb(1) - 1
+
+      DO iplon = 1, ncol
+      DO lay = 1, nlayers
+         IF (cldfrac(iplon,lay) .lt. cldmin) CYCLE
+         cwp = ciwp(iplon,lay) + clwp(iplon,lay) + cswp(iplon,lay)
+
+         DO ibx = 1, nbndsw
+            ib = ibx + ngbm
+            IF (cwp .lt. cldmin .and. tauc(ibx,iplon,lay) .lt. cldmin) CYCLE
+
+            radice = rei(iplon,lay)
+
+            IF ((ciwp(iplon,lay)+cswp(iplon,lay)) .ne. 0.0_rb) THEN
+               IF (iceflag .eq. 1) THEN
+                  icx = 5
+                  IF (wavenum2(ib) .gt. 1.43e04_rb) THEN
+                     icx = 1
+                  ELSEIF (wavenum2(ib) .gt. 7.7e03_rb) THEN
+                     icx = 2
+                  ELSEIF (wavenum2(ib) .gt. 5.3e03_rb) THEN
+                     icx = 3
+                  ELSEIF (wavenum2(ib) .gt. 4.0e03_rb) THEN
+                     icx = 4
+                  ELSEIF (wavenum2(ib) .ge. 2.5e03_rb) THEN
+                     icx = 5
+                  ENDIF
+                  extcoice = (abari(icx) + bbari(icx)/radice)
+                  ssacoice = 1._rb - cbari(icx) - dbari(icx) * radice
+                  gice = ebari(icx) + fbari(icx) * radice
+                  IF (gice .ge. 1._rb) gice = 1._rb - eps
+                  IF (extcoice .lt. 0.0_rb) &
+                     CALL wrf_error_fatal('cldprmc_sw_prep_batch_gpu: ICE EXTINCTION LESS THAN 0.0')
+                  IF (ssacoice .gt. 1.0_rb) &
+                     CALL wrf_error_fatal('cldprmc_sw_prep_batch_gpu: ICE SSA GRTR THAN 1.0')
+                  IF (ssacoice .lt. 0.0_rb) &
+                     CALL wrf_error_fatal('cldprmc_sw_prep_batch_gpu: ICE SSA LESS THAN 0.0')
+                  IF (gice .gt. 1.0_rb) &
+                     CALL wrf_error_fatal('cldprmc_sw_prep_batch_gpu: ICE ASYM GRTR THAN 1.0')
+                  IF (gice .lt. 0.0_rb) &
+                     CALL wrf_error_fatal('cldprmc_sw_prep_batch_gpu: ICE ASYM LESS THAN 0.0')
+
+               ELSEIF (iceflag .eq. 2) THEN
+                  IF (radice .lt. 5.0_rb .or. radice .gt. 131.0_rb) &
+                     CALL wrf_error_fatal('cldprmc_sw_prep_batch_gpu: ICE RADIUS OUT OF BOUNDS')
+
+               ELSEIF (iceflag .ge. 3) THEN
+                  IF (radice .lt. 5.0_rb .or. radice .gt. 140.0_rb) THEN
+                     WRITE(errmess,'(A,i5,i5,f8.2,f8.2)') &
+                        'cldprmc_sw_prep_batch_gpu: ICE GENERALIZED EFFECTIVE SIZE OUT OF BOUNDS', &
+                        ib, lay, ciwp(iplon,lay), radice
+                     CALL wrf_error_fatal(errmess)
+                  ENDIF
+                  factor = (radice - 2._rb)/3._rb
+                  indx = int(factor)
+                  IF (indx .eq. 46) indx = 45
+                  fint = factor - float(indx)
+                  fdelta = fdlice3(indx,ib) + fint * &
+                           (fdlice3(indx+1,ib) - fdlice3(indx,ib))
+                  IF (fdelta .lt. 0.0_rb) &
+                     CALL wrf_error_fatal('cldprmc_sw_prep_batch_gpu: FDELTA LESS THAN 0.0')
+                  IF (fdelta .gt. 1.0_rb) &
+                     CALL wrf_error_fatal('cldprmc_sw_prep_batch_gpu: FDELTA GT THAN 1.0')
+               ENDIF
+            ENDIF
+
+            IF (cswp(iplon,lay) .gt. 0.0_rb .and. iceflag .eq. 5) THEN
+               radsno = res(iplon,lay)
+               IF (radsno .lt. 5.0_rb .or. radsno .gt. 140.0_rb) THEN
+                  WRITE(errmess,'(A,i5,i5,f8.2,f8.2)') &
+                     'cldprmc_sw_prep_batch_gpu: SNOW GENERALIZED EFFECTIVE SIZE OUT OF BOUNDS', &
+                     ib, lay, cswp(iplon,lay), radsno
+                  CALL wrf_error_fatal(errmess)
+               ENDIF
+               factor = (radsno - 2._rb)/3._rb
+               indx = int(factor)
+               IF (indx .eq. 46) indx = 45
+               fint = factor - float(indx)
+               fdelta = fdlice3(indx,ib) + fint * &
+                        (fdlice3(indx+1,ib) - fdlice3(indx,ib))
+               IF (fdelta .lt. 0.0_rb) &
+                  CALL wrf_error_fatal('cldprmc_sw_prep_batch_gpu: SNOW FDELTA LESS THAN 0.0')
+               IF (fdelta .gt. 1.0_rb) &
+                  CALL wrf_error_fatal('cldprmc_sw_prep_batch_gpu: SNOW FDELTA GT THAN 1.0')
+            ENDIF
+
+            IF (clwp(iplon,lay) .ne. 0.0_rb .and. liqflag .eq. 1) THEN
+               radliq = rel(iplon,lay)
+               IF (radliq .lt. 1.5_rb .or. radliq .gt. 60._rb) &
+                  CALL wrf_error_fatal('cldprmc_sw_prep_batch_gpu: LIQUID EFFECTIVE RADIUS OUT OF BOUNDS')
+            ENDIF
+         ENDDO
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE cldprmc_sw_prep_batch_gpu
+
+! The solar-zenith clamp and the per-band surface-albedo expansion that
+! rrtmg_sw does inline between setcoef_sw and spcvmc_sw. The band split is
+! the original's: near-IR bands 1-9 and 14 take the "land"/direct-diffuse
+! pair (aldir/aldif), UV/visible bands 10-13 take the "sea" pair
+! (asdir/asdif).
+      SUBROUTINE sw_prep_albedo_gpu(ncol, asdir, asdif, aldir, aldif, coszen, &
+                        albdir, albdif, prmu0)
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol
+      REAL(kind=rb), INTENT(IN) :: asdir(ncol), asdif(ncol), aldir(ncol), aldif(ncol)
+      REAL(kind=rb), INTENT(IN) :: coszen(ncol)
+      REAL(kind=rb), INTENT(OUT) :: albdir(ncol,nbndsw), albdif(ncol,nbndsw)
+      REAL(kind=rb), INTENT(OUT) :: prmu0(ncol)
+
+      INTEGER(kind=im) :: iplon, ib
+      REAL(kind=rb), PARAMETER :: zepzen = 1.e-10_rb
+      REAL(kind=rb) :: cossza
+
+!$acc parallel loop present(coszen, prmu0)
+      DO iplon = 1, ncol
+         cossza = coszen(iplon)
+         IF (cossza .le. zepzen) cossza = zepzen
+         prmu0(iplon) = cossza
+      ENDDO
+
+!$acc parallel loop collapse(2) present(asdir, asdif, aldir, aldif, albdir, albdif)
+      DO ib = 1, nbndsw
+      DO iplon = 1, ncol
+         IF (ib .ge. 10 .and. ib .le. 13) THEN
+            albdir(iplon,ib) = asdir(iplon)
+            albdif(iplon,ib) = asdif(iplon)
+         ELSE
+            albdir(iplon,ib) = aldir(iplon)
+            albdif(iplon,ib) = aldif(iplon)
+         ENDIF
+      ENDDO
+      ENDDO
+
+      END SUBROUTINE sw_prep_albedo_gpu
+
+! rrtmg_sw's cloud transpose: cldprmc_sw works in (g-point, layer) order,
+! spcvmc_sw wants (layer, g-point). Note the icld=0 branch sets zomgcmc
+! (single-scattering albedo) to 1, not 0 -- the same "clear means
+! non-absorbing, not non-existent" convention that ssacmc follows in
+! inatm_sw_zero_gpu.
+      SUBROUTINE sw_transfer_cloud_gpu(ncol, nlayers, icld, &
+                        cldfmc, taucmc, taormc, asmcmc, ssacmc, &
+                        zcldfmc, ztaucmc, ztaormc, zasycmc, zomgcmc)
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, icld
+      REAL(kind=rb), INTENT(IN) :: cldfmc(ncol,ngptsw,nlayers), taucmc(ncol,ngptsw,nlayers)
+      REAL(kind=rb), INTENT(IN) :: taormc(ncol,ngptsw,nlayers), asmcmc(ncol,ngptsw,nlayers)
+      REAL(kind=rb), INTENT(IN) :: ssacmc(ncol,ngptsw,nlayers)
+      REAL(kind=rb), INTENT(OUT) :: zcldfmc(ncol,nlayers,ngptsw), ztaucmc(ncol,nlayers,ngptsw)
+      REAL(kind=rb), INTENT(OUT) :: ztaormc(ncol,nlayers,ngptsw), zasycmc(ncol,nlayers,ngptsw)
+      REAL(kind=rb), INTENT(OUT) :: zomgcmc(ncol,nlayers,ngptsw)
+
+      INTEGER(kind=im) :: iplon, l, ig
+
+      IF (icld .lt. 1) THEN
+!$acc parallel loop collapse(3) present(zcldfmc, ztaucmc, ztaormc, zasycmc, zomgcmc)
+         DO ig = 1, ngptsw
+         DO l = 1, nlayers
+         DO iplon = 1, ncol
+            zcldfmc(iplon,l,ig) = 0.0_rb
+            ztaucmc(iplon,l,ig) = 0.0_rb
+            ztaormc(iplon,l,ig) = 0.0_rb
+            zasycmc(iplon,l,ig) = 0.0_rb
+            zomgcmc(iplon,l,ig) = 1.0_rb
+         ENDDO
+         ENDDO
+         ENDDO
+      ELSE
+!$acc parallel loop collapse(3) present(cldfmc, taucmc, taormc, asmcmc, ssacmc) &
+!$acc   present(zcldfmc, ztaucmc, ztaormc, zasycmc, zomgcmc)
+         DO ig = 1, ngptsw
+         DO l = 1, nlayers
+         DO iplon = 1, ncol
+            zcldfmc(iplon,l,ig) = cldfmc(iplon,ig,l)
+            ztaucmc(iplon,l,ig) = taucmc(iplon,ig,l)
+            ztaormc(iplon,l,ig) = taormc(iplon,ig,l)
+            zasycmc(iplon,l,ig) = asmcmc(iplon,ig,l)
+            zomgcmc(iplon,l,ig) = ssacmc(iplon,ig,l)
+         ENDDO
+         ENDDO
+         ENDDO
+      ENDIF
+
+      END SUBROUTINE sw_transfer_cloud_gpu
+
+! rrtmg_sw's aerosol selection. Three shapes, matching the original's
+! if/elseif chain exactly:
+!   iaer =  0  no aerosol (extinction 0, ssa 1, asymmetry 0)
+!   iaer =  6  ECMWF six-type climatology, summed from ecaer with the
+!              rsrtaua/rsrpiza/rsrasya band ratios (WRF aer_opt=1)
+!   iaer = 10  direct specification, already sitting in inatm_sw's
+!              taua/ssaa/asma (WRF aer_opt=0/2/3)
+! Anything else is a hard error rather than a silent fallthrough: the
+! original leaves ztaua/zasya/zomga *undefined* for an unrecognised iaer,
+! and reproducing undefined behaviour is not a goal.
+      SUBROUTINE sw_transfer_aerosol_gpu(ncol, nlayers, iaer, taua, ssaa, asma, ecaer, &
+                        ztaua, zasya, zomga)
+
+      use rrsw_aer, only : rsrtaua, rsrpiza, rsrasya
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, iaer
+      REAL(kind=rb), INTENT(IN) :: taua(ncol,nlayers,nbndsw), ssaa(ncol,nlayers,nbndsw)
+      REAL(kind=rb), INTENT(IN) :: asma(ncol,nlayers,nbndsw)
+      REAL(kind=rb), INTENT(IN) :: ecaer(ncol,nlayers,naerec)
+      REAL(kind=rb), INTENT(OUT) :: ztaua(ncol,nlayers,nbndsw), zasya(ncol,nlayers,nbndsw)
+      REAL(kind=rb), INTENT(OUT) :: zomga(ncol,nlayers,nbndsw)
+
+      INTEGER(kind=im) :: iplon, l, ib, ia
+      REAL(kind=rb) :: zt, zo, za
+
+      IF (iaer .eq. 0) THEN
+!$acc parallel loop collapse(3) present(ztaua, zasya, zomga)
+         DO ib = 1, nbndsw
+         DO l = 1, nlayers
+         DO iplon = 1, ncol
+            ztaua(iplon,l,ib) = 0.0_rb
+            zasya(iplon,l,ib) = 0.0_rb
+            zomga(iplon,l,ib) = 1.0_rb
+         ENDDO
+         ENDDO
+         ENDDO
+
+      ELSEIF (iaer .eq. 6) THEN
+!$acc parallel loop collapse(3) private(zt, zo, za) &
+!$acc   present(ecaer, rsrtaua, rsrpiza, rsrasya, ztaua, zasya, zomga)
+         DO ib = 1, nbndsw
+         DO l = 1, nlayers
+         DO iplon = 1, ncol
+            zt = 0.0_rb
+            zo = 0.0_rb
+            za = 0.0_rb
+!$acc loop seq
+            DO ia = 1, naerec
+               zt = zt + rsrtaua(ib,ia) * ecaer(iplon,l,ia)
+               zo = zo + rsrtaua(ib,ia) * ecaer(iplon,l,ia) * rsrpiza(ib,ia)
+               za = za + rsrtaua(ib,ia) * ecaer(iplon,l,ia) * rsrpiza(ib,ia) * rsrasya(ib,ia)
+            ENDDO
+            IF (zo .ne. 0.0_rb) za = za / zo
+            IF (zt .ne. 0.0_rb) zo = zo / zt
+            ztaua(iplon,l,ib) = zt
+            zomga(iplon,l,ib) = zo
+            zasya(iplon,l,ib) = za
+         ENDDO
+         ENDDO
+         ENDDO
+
+      ELSEIF (iaer .eq. 10) THEN
+!$acc parallel loop collapse(3) present(taua, ssaa, asma, ztaua, zasya, zomga)
+         DO ib = 1, nbndsw
+         DO l = 1, nlayers
+         DO iplon = 1, ncol
+            ztaua(iplon,l,ib) = taua(iplon,l,ib)
+            zasya(iplon,l,ib) = asma(iplon,l,ib)
+            zomga(iplon,l,ib) = ssaa(iplon,l,ib)
+         ENDDO
+         ENDDO
+         ENDDO
+
+      ELSE
+         CALL wrf_error_fatal('sw_transfer_aerosol_gpu: unsupported IAER (expected 0, 6 or 10)')
+      ENDIF
+
+      END SUBROUTINE sw_transfer_aerosol_gpu
+
+! rrtmg_sw's output loop: flux transfer, the direct/diffuse split (total,
+! UV/visible and near-IR), and the heating rates from pdp.
+!
+! The heating loop runs 1..nlayers-1 rather than 1..nlayers because the
+! original immediately overwrites index nlayers with zero -- computing it
+! and then discarding it is identical, so it is simply not computed.
+! heatfac is a plain module scalar set once in rrtmg_sw_ini, so it is
+! captured by value at kernel launch and deliberately not in present().
+      SUBROUTINE sw_fluxes_gpu(ncol, nlayers, pdp, &
+                        zbbfu, zbbfd, zbbcu, zbbcd, zbbfddir, &
+                        zuvfd, zuvfddir, znifd, znifddir, &
+                        swuflx, swdflx, swuflxc, swdflxc, swhr, swhrc, &
+                        sibvisdir, sibvisdif, sibnirdir, sibnirdif, swdkdir, swdkdif)
+
+      use rrsw_con, only : heatfac
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers
+      REAL(kind=rb), INTENT(IN) :: pdp(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: zbbfu(ncol,nlayers+1), zbbfd(ncol,nlayers+1)
+      REAL(kind=rb), INTENT(IN) :: zbbcu(ncol,nlayers+1), zbbcd(ncol,nlayers+1)
+      REAL(kind=rb), INTENT(IN) :: zbbfddir(ncol,nlayers+1)
+      REAL(kind=rb), INTENT(IN) :: zuvfd(ncol,nlayers+1), zuvfddir(ncol,nlayers+1)
+      REAL(kind=rb), INTENT(IN) :: znifd(ncol,nlayers+1), znifddir(ncol,nlayers+1)
+      REAL(kind=rb), INTENT(OUT) :: swuflx(ncol,nlayers+1), swdflx(ncol,nlayers+1)
+      REAL(kind=rb), INTENT(OUT) :: swuflxc(ncol,nlayers+1), swdflxc(ncol,nlayers+1)
+      REAL(kind=rb), INTENT(OUT) :: swhr(ncol,nlayers), swhrc(ncol,nlayers)
+      REAL(kind=rb), INTENT(OUT) :: sibvisdir(ncol,nlayers+1), sibvisdif(ncol,nlayers+1)
+      REAL(kind=rb), INTENT(OUT) :: sibnirdir(ncol,nlayers+1), sibnirdif(ncol,nlayers+1)
+      REAL(kind=rb), INTENT(OUT) :: swdkdir(ncol,nlayers+1), swdkdif(ncol,nlayers+1)
+
+      INTEGER(kind=im) :: iplon, i
+      REAL(kind=rb) :: zdpgcp
+
+!$acc parallel loop collapse(2) present(zbbfu, zbbfd, zbbcu, zbbcd, zbbfddir) &
+!$acc   present(zuvfd, zuvfddir, znifd, znifddir) &
+!$acc   present(swuflx, swdflx, swuflxc, swdflxc) &
+!$acc   present(sibvisdir, sibvisdif, sibnirdir, sibnirdif, swdkdir, swdkdif)
+      DO i = 1, nlayers+1
+      DO iplon = 1, ncol
+         swuflxc(iplon,i) = zbbcu(iplon,i)
+         swdflxc(iplon,i) = zbbcd(iplon,i)
+         swuflx(iplon,i) = zbbfu(iplon,i)
+         swdflx(iplon,i) = zbbfd(iplon,i)
+
+!  Total-sky direct/diffuse
+         swdkdir(iplon,i) = zbbfddir(iplon,i)
+         swdkdif(iplon,i) = zbbfd(iplon,i) - zbbfddir(iplon,i)
+
+!  UV/visible direct/diffuse
+         sibvisdir(iplon,i) = zuvfddir(iplon,i)
+         sibvisdif(iplon,i) = zuvfd(iplon,i) - zuvfddir(iplon,i)
+
+!  Near-IR direct/diffuse
+         sibnirdir(iplon,i) = znifddir(iplon,i)
+         sibnirdif(iplon,i) = znifd(iplon,i) - znifddir(iplon,i)
+      ENDDO
+      ENDDO
+
+!$acc parallel loop collapse(2) private(zdpgcp) &
+!$acc   present(pdp, zbbfu, zbbfd, zbbcu, zbbcd, swhr, swhrc)
+      DO i = 1, nlayers-1
+      DO iplon = 1, ncol
+         zdpgcp = heatfac / pdp(iplon,i)
+         swhrc(iplon,i) = ((zbbcd(iplon,i+1) - zbbcu(iplon,i+1)) &
+                         - (zbbcd(iplon,i)   - zbbcu(iplon,i)))   * zdpgcp
+         swhr(iplon,i)  = ((zbbfd(iplon,i+1) - zbbfu(iplon,i+1)) &
+                         - (zbbfd(iplon,i)   - zbbfu(iplon,i)))   * zdpgcp
+      ENDDO
+      ENDDO
+
+!$acc parallel loop present(swhr, swhrc)
+      DO iplon = 1, ncol
+         swhrc(iplon,nlayers) = 0.0_rb
+         swhr(iplon,nlayers) = 0.0_rb
+      ENDDO
+
+      END SUBROUTINE sw_fluxes_gpu
+
+! The chain itself. Allocates and device-creates every intermediate the
+! sequence needs, runs it, tears it down.
+!
+! The caller owns the device residency of the INTENT(IN) inputs and the
+! INTENT(OUT) outputs -- both must already be present on the device when
+! this is called, exactly as for rrtmg_lw_gpu_chain_driver.
+!
+! adjes/dyofyr/scon are column-independent, so the per-band solar
+! adjustment is computed once on the host (inatm_sw_adjflux, which needs
+! the earth_sun function) and broadcast across the batch, rather than
+! recomputed per column the way the original does.
+      SUBROUTINE rrtmg_sw_gpu_chain_driver(ncol, nlayers, icld, iaer, irng, changeSeed, &
+                        play, plev, tlay, tlev, tsfc, h2ovmr, o3vmr, co2vmr, ch4vmr, n2ovmr, o2vmr, &
+                        asdir, asdif, aldir, aldif, coszen, adjes, dyofyr, scon, &
+                        inflgsw, iceflgsw, liqflgsw, &
+                        cldfrac, ciwp, clwp, cswp, tauc, ssac, asmc, fsfc, rei, rel, res, &
+                        tauaer, ssaaer, asmaer, ecaer, &
+                        swuflx, swdflx, swhr, swuflxc, swdflxc, swhrc, &
+                        sibvisdir, sibvisdif, sibnirdir, sibnirdif, swdkdir, swdkdif)
+
+      use mcica_subcol_gen_sw_gpu, only : mcica_subcol_sw_driver_gpu
+      use rrtmg_sw_inatm_gpu, only : inatm_sw_driver_gpu, inatm_sw_adjflux
+      use rrtmg_sw_cldprmc_gpu, only : cldprmc_sw_gpu
+      use rrtmg_sw_setcoef_gpu, only : setcoef_sw_driver_gpu
+      use rrtmg_sw_taumol_gpu, only : taumol_sw_driver_gpu
+      use rrtmg_sw_spcvmc_gpu, only : spcvmc_sw_driver_gpu
+
+      IMPLICIT NONE
+      INTEGER(kind=im), INTENT(IN) :: ncol, nlayers, icld, iaer, irng, changeSeed
+      REAL(kind=rb), INTENT(IN) :: play(ncol,nlayers), tlay(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: plev(ncol,nlayers+1), tlev(ncol,nlayers+1), tsfc(ncol)
+      REAL(kind=rb), INTENT(IN) :: h2ovmr(ncol,nlayers), o3vmr(ncol,nlayers), co2vmr(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: ch4vmr(ncol,nlayers), n2ovmr(ncol,nlayers), o2vmr(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: asdir(ncol), asdif(ncol), aldir(ncol), aldif(ncol)
+      REAL(kind=rb), INTENT(IN) :: coszen(ncol)
+      REAL(kind=rb), INTENT(IN) :: adjes, scon
+      INTEGER(kind=im), INTENT(IN) :: dyofyr
+      INTEGER(kind=im), INTENT(IN) :: inflgsw, iceflgsw, liqflgsw
+      REAL(kind=rb), INTENT(IN) :: cldfrac(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: ciwp(ncol,nlayers), clwp(ncol,nlayers), cswp(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: tauc(nbndsw,ncol,nlayers), ssac(nbndsw,ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: asmc(nbndsw,ncol,nlayers), fsfc(nbndsw,ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: rei(ncol,nlayers), rel(ncol,nlayers), res(ncol,nlayers)
+      REAL(kind=rb), INTENT(IN) :: tauaer(ncol,nlayers,nbndsw), ssaaer(ncol,nlayers,nbndsw)
+      REAL(kind=rb), INTENT(IN) :: asmaer(ncol,nlayers,nbndsw)
+      REAL(kind=rb), INTENT(IN) :: ecaer(ncol,nlayers,naerec)
+      REAL(kind=rb), INTENT(OUT) :: swuflx(ncol,nlayers+1), swdflx(ncol,nlayers+1)
+      REAL(kind=rb), INTENT(OUT) :: swuflxc(ncol,nlayers+1), swdflxc(ncol,nlayers+1)
+      REAL(kind=rb), INTENT(OUT) :: swhr(ncol,nlayers), swhrc(ncol,nlayers)
+      REAL(kind=rb), INTENT(OUT) :: sibvisdir(ncol,nlayers+1), sibvisdif(ncol,nlayers+1)
+      REAL(kind=rb), INTENT(OUT) :: sibnirdir(ncol,nlayers+1), sibnirdif(ncol,nlayers+1)
+      REAL(kind=rb), INTENT(OUT) :: swdkdir(ncol,nlayers+1), swdkdif(ncol,nlayers+1)
+
+! mcica_subcol_sw outputs
+      REAL(kind=rb), ALLOCATABLE :: cldfmcl(:,:,:), ciwpmcl(:,:,:), clwpmcl(:,:,:), cswpmcl(:,:,:)
+      REAL(kind=rb), ALLOCATABLE :: reicmcl(:,:), relqmcl(:,:), resnmcl(:,:)
+      REAL(kind=rb), ALLOCATABLE :: taucmcl(:,:,:), ssacmcl(:,:,:), asmcmcl(:,:,:), fsfcmcl(:,:,:)
+
+! inatm_sw outputs
+      REAL(kind=rb), ALLOCATABLE :: pavel(:,:), pz(:,:), pdp(:,:), tavel(:,:), tz(:,:), tbound(:)
+      REAL(kind=rb), ALLOCATABLE :: coldry(:,:), wkl(:,:,:)
+      REAL(kind=rb), ALLOCATABLE :: cldfmc(:,:,:), taucmc(:,:,:), ssacmc(:,:,:)
+      REAL(kind=rb), ALLOCATABLE :: asmcmc(:,:,:), fsfcmc(:,:,:)
+      REAL(kind=rb), ALLOCATABLE :: ciwpmc(:,:,:), clwpmc(:,:,:), cswpmc(:,:,:)
+      REAL(kind=rb), ALLOCATABLE :: reicmc(:,:), relqmc(:,:), resnmc(:,:)
+      REAL(kind=rb), ALLOCATABLE :: taua(:,:,:), ssaa(:,:,:), asma(:,:,:)
+      INTEGER(kind=im) :: inflag, iceflag, liqflag
+
+! cldprmc_sw output
+      REAL(kind=rb), ALLOCATABLE :: taormc(:,:,:)
+
+! setcoef_sw outputs
+      INTEGER(kind=im), ALLOCATABLE :: laytrop(:), jp(:,:), jt(:,:), jt1(:,:)
+      INTEGER(kind=im), ALLOCATABLE :: indself(:,:), indfor(:,:)
+      REAL(kind=rb), ALLOCATABLE :: co2mult(:,:), colch4(:,:), colco2(:,:), colh2o(:,:)
+      REAL(kind=rb), ALLOCATABLE :: colmol(:,:), coln2o(:,:), colo2(:,:), colo3(:,:)
+      REAL(kind=rb), ALLOCATABLE :: fac00(:,:), fac01(:,:), fac10(:,:), fac11(:,:)
+      REAL(kind=rb), ALLOCATABLE :: selffac(:,:), selffrac(:,:), forfac(:,:), forfrac(:,:)
+
+! taumol_sw outputs
+      REAL(kind=rb), ALLOCATABLE :: sfluxzen(:,:), taug(:,:,:), taur(:,:,:)
+
+! spcvmc_sw inputs assembled between setcoef_sw and spcvmc_sw
+      REAL(kind=rb), ALLOCATABLE :: albdir(:,:), albdif(:,:), prmu0(:), adjflux_b(:,:)
+      REAL(kind=rb), ALLOCATABLE :: zcldfmc(:,:,:), ztaucmc(:,:,:), ztaormc(:,:,:)
+      REAL(kind=rb), ALLOCATABLE :: zasycmc(:,:,:), zomgcmc(:,:,:)
+      REAL(kind=rb), ALLOCATABLE :: ztaua(:,:,:), zasya(:,:,:), zomga(:,:,:)
+
+! spcvmc_sw outputs
+      REAL(kind=rb), ALLOCATABLE :: zbbfd(:,:), zbbfu(:,:), zbbcd(:,:), zbbcu(:,:)
+      REAL(kind=rb), ALLOCATABLE :: zuvfd(:,:), zuvcd(:,:), znifd(:,:), znicd(:,:)
+      REAL(kind=rb), ALLOCATABLE :: zbbfddir(:,:), zbbcddir(:,:)
+      REAL(kind=rb), ALLOCATABLE :: zuvfddir(:,:), zuvcddir(:,:)
+      REAL(kind=rb), ALLOCATABLE :: znifddir(:,:), znicddir(:,:)
+
+      REAL(kind=rb) :: adjflux(jpband), solvar(jpband)
+      INTEGER(kind=im) :: iplon, ib
+
+! --- Host-side pre-validation (before anything touches the device) ---
+!  mcica_subcol_sw's own range check, hoisted here because the icld=0 case
+!  never reaches mcica_subcol_sw_prep_gpu (see the guarded call below).
+      IF (icld .lt. 0 .or. icld .gt. 3) THEN
+         CALL wrf_error_fatal('rrtmg_sw_gpu_chain_driver: INVALID ICLD')
+      ENDIF
+
+      CALL cldprmc_sw_prep_batch_gpu(ncol, nlayers, icld, inflgsw, iceflgsw, liqflgsw, &
+                cldfrac, ciwp, clwp, cswp, tauc, rei, rel, res)
+
+! --- Host-side, column-independent: the Earth/Sun distance adjustment ---
+      CALL inatm_sw_adjflux(adjes, dyofyr, scon, adjflux, solvar)
+
+! --- Allocate everything ---
+      ALLOCATE(cldfmcl(ngptsw,ncol,nlayers), ciwpmcl(ngptsw,ncol,nlayers))
+      ALLOCATE(clwpmcl(ngptsw,ncol,nlayers), cswpmcl(ngptsw,ncol,nlayers))
+      ALLOCATE(reicmcl(ncol,nlayers), relqmcl(ncol,nlayers), resnmcl(ncol,nlayers))
+      ALLOCATE(taucmcl(ngptsw,ncol,nlayers), ssacmcl(ngptsw,ncol,nlayers))
+      ALLOCATE(asmcmcl(ngptsw,ncol,nlayers), fsfcmcl(ngptsw,ncol,nlayers))
+
+      ALLOCATE(pavel(ncol,nlayers), pz(ncol,0:nlayers), pdp(ncol,nlayers))
+      ALLOCATE(tavel(ncol,nlayers), tz(ncol,0:nlayers), tbound(ncol))
+      ALLOCATE(coldry(ncol,nlayers), wkl(ncol,nlayers,mxmol))
+      ALLOCATE(cldfmc(ncol,ngptsw,nlayers), taucmc(ncol,ngptsw,nlayers))
+      ALLOCATE(ssacmc(ncol,ngptsw,nlayers), asmcmc(ncol,ngptsw,nlayers))
+      ALLOCATE(fsfcmc(ncol,ngptsw,nlayers))
+      ALLOCATE(ciwpmc(ncol,ngptsw,nlayers), clwpmc(ncol,ngptsw,nlayers))
+      ALLOCATE(cswpmc(ncol,ngptsw,nlayers))
+      ALLOCATE(reicmc(ncol,nlayers), relqmc(ncol,nlayers), resnmc(ncol,nlayers))
+      ALLOCATE(taua(ncol,nlayers,nbndsw), ssaa(ncol,nlayers,nbndsw), asma(ncol,nlayers,nbndsw))
+
+      ALLOCATE(taormc(ncol,ngptsw,nlayers))
+
+      ALLOCATE(laytrop(ncol), jp(ncol,nlayers), jt(ncol,nlayers), jt1(ncol,nlayers))
+      ALLOCATE(indself(ncol,nlayers), indfor(ncol,nlayers))
+      ALLOCATE(co2mult(ncol,nlayers), colch4(ncol,nlayers), colco2(ncol,nlayers), colh2o(ncol,nlayers))
+      ALLOCATE(colmol(ncol,nlayers), coln2o(ncol,nlayers), colo2(ncol,nlayers), colo3(ncol,nlayers))
+      ALLOCATE(fac00(ncol,nlayers), fac01(ncol,nlayers), fac10(ncol,nlayers), fac11(ncol,nlayers))
+      ALLOCATE(selffac(ncol,nlayers), selffrac(ncol,nlayers))
+      ALLOCATE(forfac(ncol,nlayers), forfrac(ncol,nlayers))
+
+      ALLOCATE(sfluxzen(ncol,ngptsw), taug(ncol,nlayers,ngptsw), taur(ncol,nlayers,ngptsw))
+
+      ALLOCATE(albdir(ncol,nbndsw), albdif(ncol,nbndsw), prmu0(ncol), adjflux_b(ncol,jpband))
+      ALLOCATE(zcldfmc(ncol,nlayers,ngptsw), ztaucmc(ncol,nlayers,ngptsw))
+      ALLOCATE(ztaormc(ncol,nlayers,ngptsw), zasycmc(ncol,nlayers,ngptsw))
+      ALLOCATE(zomgcmc(ncol,nlayers,ngptsw))
+      ALLOCATE(ztaua(ncol,nlayers,nbndsw), zasya(ncol,nlayers,nbndsw), zomga(ncol,nlayers,nbndsw))
+
+      ALLOCATE(zbbfd(ncol,nlayers+1), zbbfu(ncol,nlayers+1))
+      ALLOCATE(zbbcd(ncol,nlayers+1), zbbcu(ncol,nlayers+1))
+      ALLOCATE(zuvfd(ncol,nlayers+1), zuvcd(ncol,nlayers+1))
+      ALLOCATE(znifd(ncol,nlayers+1), znicd(ncol,nlayers+1))
+      ALLOCATE(zbbfddir(ncol,nlayers+1), zbbcddir(ncol,nlayers+1))
+      ALLOCATE(zuvfddir(ncol,nlayers+1), zuvcddir(ncol,nlayers+1))
+      ALLOCATE(znifddir(ncol,nlayers+1), znicddir(ncol,nlayers+1))
+
+      DO ib = 1, jpband
+      DO iplon = 1, ncol
+         adjflux_b(iplon,ib) = adjflux(ib)
+      ENDDO
+      ENDDO
+
+!$acc enter data create(cldfmcl, ciwpmcl, clwpmcl, cswpmcl, reicmcl, relqmcl, resnmcl) &
+!$acc   create(taucmcl, ssacmcl, asmcmcl, fsfcmcl) &
+!$acc   create(pavel, pz, pdp, tavel, tz, tbound, coldry, wkl) &
+!$acc   create(cldfmc, taucmc, ssacmc, asmcmc, fsfcmc, ciwpmc, clwpmc, cswpmc) &
+!$acc   create(reicmc, relqmc, resnmc, taua, ssaa, asma, taormc) &
+!$acc   create(laytrop, jp, jt, jt1, indself, indfor) &
+!$acc   create(co2mult, colch4, colco2, colh2o, colmol, coln2o, colo2, colo3) &
+!$acc   create(fac00, fac01, fac10, fac11, selffac, selffrac, forfac, forfrac) &
+!$acc   create(sfluxzen, taug, taur) &
+!$acc   create(albdir, albdif, prmu0) &
+!$acc   create(zcldfmc, ztaucmc, ztaormc, zasycmc, zomgcmc, ztaua, zasya, zomga) &
+!$acc   create(zbbfd, zbbfu, zbbcd, zbbcu, zuvfd, zuvcd, znifd, znicd) &
+!$acc   create(zbbfddir, zbbcddir, zuvfddir, zuvcddir, znifddir, znicddir) &
+!$acc   copyin(adjflux_b)
+
+!  The CPU mcica_subcol_sw opens with "if (icld.eq.0) return", leaving all
+!  its outputs untouched -- and nothing downstream reads them, because
+!  inatm_sw's cloud transfer is itself under "if (icld .ge. 1)". Skipping
+!  the call is therefore what reproduces the original, not an
+!  optimisation: running it anyway would burn the RNG and fabricate
+!  subcolumn cloud arrays for a call the CPU leaves clear.
+      IF (icld .ge. 1) THEN
+         CALL mcica_subcol_sw_driver_gpu(ncol, nlayers, icld, irng, changeSeed, play, &
+                   cldfrac, ciwp, clwp, cswp, tauc, ssac, asmc, fsfc, &
+                   rei, rel, res, &
+                   cldfmcl, ciwpmcl, clwpmcl, cswpmcl, &
+                   reicmcl, relqmcl, resnmcl, &
+                   taucmcl, ssacmcl, asmcmcl, fsfcmcl)
+      ENDIF
+
+      CALL inatm_sw_driver_gpu(ncol, nlayers, icld, iaer, &
+                play, plev, tlay, tlev, tsfc, h2ovmr, &
+                o3vmr, co2vmr, ch4vmr, n2ovmr, o2vmr, &
+                inflgsw, iceflgsw, liqflgsw, &
+                cldfmcl, taucmcl, ssacmcl, asmcmcl, fsfcmcl, &
+                ciwpmcl, clwpmcl, cswpmcl, reicmcl, relqmcl, resnmcl, &
+                tauaer, ssaaer, asmaer, &
+                pavel, pz, pdp, tavel, tz, tbound, coldry, wkl, &
+                inflag, iceflag, liqflag, &
+                cldfmc, taucmc, ssacmc, asmcmc, fsfcmc, &
+                ciwpmc, clwpmc, cswpmc, reicmc, relqmc, resnmc, &
+                taua, ssaa, asma)
+
+      CALL cldprmc_sw_gpu(ncol, nlayers, inflag, iceflag, liqflag, &
+                cldfmc, ciwpmc, clwpmc, cswpmc, reicmc, relqmc, resnmc, &
+                taormc, taucmc, ssacmc, asmcmc, fsfcmc)
+
+      CALL setcoef_sw_driver_gpu(ncol, nlayers, pavel, tavel, coldry, wkl(:,:,1:7), &
+                laytrop, jp, jt, jt1, co2mult, colch4, colco2, &
+                colh2o, colmol, coln2o, colo2, colo3, &
+                fac00, fac01, fac10, fac11, &
+                selffac, selffrac, indself, forfac, forfrac, indfor)
+
+      CALL taumol_sw_driver_gpu(ncol, nlayers, &
+                colh2o, colco2, colch4, colo2, colo3, colmol, &
+                laytrop, jp, jt, jt1, &
+                fac00, fac01, fac10, fac11, &
+                selffac, selffrac, indself, forfac, forfrac, indfor, &
+                sfluxzen, taug, taur)
+
+      CALL sw_prep_albedo_gpu(ncol, asdir, asdif, aldir, aldif, coszen, &
+                albdir, albdif, prmu0)
+
+      CALL sw_transfer_cloud_gpu(ncol, nlayers, icld, &
+                cldfmc, taucmc, taormc, asmcmc, ssacmc, &
+                zcldfmc, ztaucmc, ztaormc, zasycmc, zomgcmc)
+
+      CALL sw_transfer_aerosol_gpu(ncol, nlayers, iaer, taua, ssaa, asma, ecaer, &
+                ztaua, zasya, zomga)
+
+      CALL spcvmc_sw_driver_gpu(ncol, nlayers, albdif, albdir, &
+                zcldfmc, ztaucmc, zasycmc, zomgcmc, ztaormc, &
+                ztaua, zasya, zomga, prmu0, adjflux_b, &
+                sfluxzen, taug, taur, &
+                zbbfd, zbbfu, zbbcd, zbbcu, zuvfd, zuvcd, znifd, znicd, &
+                zbbfddir, zbbcddir, zuvfddir, zuvcddir, znifddir, znicddir)
+
+      CALL sw_fluxes_gpu(ncol, nlayers, pdp, &
+                zbbfu, zbbfd, zbbcu, zbbcd, zbbfddir, &
+                zuvfd, zuvfddir, znifd, znifddir, &
+                swuflx, swdflx, swuflxc, swdflxc, swhr, swhrc, &
+                sibvisdir, sibvisdif, sibnirdir, sibnirdif, swdkdir, swdkdif)
+
+!$acc exit data delete(cldfmcl, ciwpmcl, clwpmcl, cswpmcl, reicmcl, relqmcl, resnmcl) &
+!$acc   delete(taucmcl, ssacmcl, asmcmcl, fsfcmcl) &
+!$acc   delete(pavel, pz, pdp, tavel, tz, tbound, coldry, wkl) &
+!$acc   delete(cldfmc, taucmc, ssacmc, asmcmc, fsfcmc, ciwpmc, clwpmc, cswpmc) &
+!$acc   delete(reicmc, relqmc, resnmc, taua, ssaa, asma, taormc) &
+!$acc   delete(laytrop, jp, jt, jt1, indself, indfor) &
+!$acc   delete(co2mult, colch4, colco2, colh2o, colmol, coln2o, colo2, colo3) &
+!$acc   delete(fac00, fac01, fac10, fac11, selffac, selffrac, forfac, forfrac) &
+!$acc   delete(sfluxzen, taug, taur) &
+!$acc   delete(albdir, albdif, prmu0) &
+!$acc   delete(zcldfmc, ztaucmc, ztaormc, zasycmc, zomgcmc, ztaua, zasya, zomga) &
+!$acc   delete(zbbfd, zbbfu, zbbcd, zbbcu, zuvfd, zuvcd, znifd, znicd) &
+!$acc   delete(zbbfddir, zbbcddir, zuvfddir, zuvcddir, znifddir, znicddir) &
+!$acc   delete(adjflux_b)
+
+      DEALLOCATE(cldfmcl, ciwpmcl, clwpmcl, cswpmcl, reicmcl, relqmcl, resnmcl)
+      DEALLOCATE(taucmcl, ssacmcl, asmcmcl, fsfcmcl)
+      DEALLOCATE(pavel, pz, pdp, tavel, tz, tbound, coldry, wkl)
+      DEALLOCATE(cldfmc, taucmc, ssacmc, asmcmc, fsfcmc, ciwpmc, clwpmc, cswpmc)
+      DEALLOCATE(reicmc, relqmc, resnmc, taua, ssaa, asma, taormc)
+      DEALLOCATE(laytrop, jp, jt, jt1, indself, indfor)
+      DEALLOCATE(co2mult, colch4, colco2, colh2o, colmol, coln2o, colo2, colo3)
+      DEALLOCATE(fac00, fac01, fac10, fac11, selffac, selffrac, forfac, forfrac)
+      DEALLOCATE(sfluxzen, taug, taur)
+      DEALLOCATE(albdir, albdif, prmu0, adjflux_b)
+      DEALLOCATE(zcldfmc, ztaucmc, ztaormc, zasycmc, zomgcmc, ztaua, zasya, zomga)
+      DEALLOCATE(zbbfd, zbbfu, zbbcd, zbbcu, zuvfd, zuvcd, znifd, znicd)
+      DEALLOCATE(zbbfddir, zbbcddir, zuvfddir, zuvcddir, znifddir, znicddir)
+
+      END SUBROUTINE rrtmg_sw_gpu_chain_driver
+
+      END MODULE rrtmg_sw_gpu_chain
+#endif
+
 !------------------------------------------------------------------
 MODULE module_ra_rrtmg_sw
 
