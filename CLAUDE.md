@@ -53,7 +53,9 @@ are line-by-line transcriptions of the 3.9.1.1 *algorithms*, and they live in
 modules neither version of WRF touches, so any CPU routine that changed
 between versions leaves its GPU mirror silently stale. `port/audit.py`
 extracts each mirrored CPU routine from both revisions and reports how much
-it moved. Result:
+it moved (`python3 port/audit.py V3.9.1.1 v4.7.1 <file>`; pass `--expand-old`
+for a file under a macro layer one version has and the other does not, or
+every number will be meaningless). Result:
 
 | CPU routine | changed lines | action |
 |---|---|---|
@@ -66,7 +68,12 @@ it moved. Result:
 | `mcica_subcol_lw`/`_sw` | 37 / 40 | new `hgt/idcor/juldat/lat` args |
 | `generate_stochastic_clouds`/`_sw` | 118 / 110 | new `icld=4,5` exponential overlap |
 
-Run that audit again before trusting any future rebase.
+Run that audit again before trusting any future rebase, and follow it with
+`port/stmt_compare.py` on each GPU mirror — `audit.py` only tells you the CPU
+routine moved, `stmt_compare.py` tells you whether the mirror still computes
+the same thing. The `dyn_em` acoustic port is the cautionary tale: it merged
+cleanly, audited as "mostly unchanged", and still carried four wrong terms
+that only the statement-level comparison found.
 
 ### What is deliberately NOT ported
 
@@ -226,6 +233,269 @@ conclude from — rank count only reaches the chunk indirectly (via
 rank counts can land on similar chunks and the "control" perturbs almost
 nothing. Force `WRF_GPU_RAD_CHUNK` instead; that is the control that has
 known perturbation size.
+
+### `dyn_em` forward-ported to v4.7.1 — advection, then the acoustic step
+
+Both halves are now on the v4.7.1 branch. They are separate commits because
+they were separately verified, and because the advection half carries a
+performance finding that bears on whether the acoustic half was worth doing.
+
+**Advection** (`module_advect_em.F`, `module_em.F`, `solve_em.F`'s advection
+residency). Four real bugs the merge would have shipped silently, all found
+by auditing rather than by the clean merge:
+- v4.7.1's IEVA scheme splits vertical velocity, and the CPU path advects
+  with `wwE`; the GPU scalar fast path still passed `ww`.
+- `advect_scalar_o5v3` declares `present(rom)`, and `rom` is `wwE`, whose
+  actual argument is a `solve_em` local — no residency, so it would have
+  aborted at run time.
+- the `advect_w` fast path was gated on `h_mom_adv_order`/`v_mom_adv_order`;
+  the original gates on the *scalar* orders.
+- two science changes re-applied into the kernels: the hybrid-coordinate
+  `cb*mut → cb*(c1(k)*mut+c2(k))` edge terms, and the polar guard moving
+  from `kts..ktf` to `kts+1..ktf+1`.
+
+**The advection result is a negative one and it is the important number
+here.** One fixed-dt step, isolating advection: RMS difference relative to
+field maximum U 2.0e-7, V 6.7e-7, T 3.1e-8, PH 1.7e-7, QVAPOR 8.6e-8, W
+7.7e-6 — the single-precision floor. But 10 minutes on d01, 4 ranks,
+back-to-back: radiation-only GPU 50s vs CPU 91s (**1.82x**), radiation +
+advection GPU 56s vs CPU 99s (**1.77x**). Adding GPU advection made the
+ratio marginally *worse*. Compare ratios and not seconds — the second pair
+ran with the machine ~30% slower, and reading 50s against 56s would have
+been the trap.
+
+**Acoustic step** (`module_small_step_em.F`, `solve_em.F`'s acoustic
+residency). This was expected to be a re-derivation rather than a merge,
+because v4.7.1 deleted the `HYBRID_COORD` macro layer (`mu(...)`,
+`Mut(...)`, `muts(...)`, `mudf_xy(...)`, `MUTHMUTF_*`, ...) that V3.9.1.1's
+routines were written against and inlined every expansion by hand. That
+framing was half wrong, and the correction is the reusable part:
+
+**Expand the macros mechanically, then the two versions are nearly the same
+code.** `port/audit.py` shows this in one table — `--expand-old` runs
+V3.9.1.1's side through `port/expand_hybrid.py` first, and nothing else
+changes:
+
+```
+python3 port/audit.py V3.9.1.1 v4.7.1 dyn_em/module_small_step_em.F [--expand-old]
+
+routine              raw   expanded
+advance_mu_t          10      0
+advance_uv            32      0
+advance_w             52     25
+calc_coef_w           26      0
+calc_p_rho            18      0
+sumflux                8      0
+```
+
+So `calc_p_rho`, `advance_uv` and `advance_mu_t` did not change at all;
+`calc_coef_w` is a loop-nest reshuffle with identical arithmetic; and
+`advance_w`'s 25 lines are exactly two changes (a new `phi_adv_z==2` branch,
+and `dampwt` promoted from scalar to `kts:kte` array). Almost all of the
+apparent churn was spelling.
+
+Both of `advance_w`'s changes are carried into `advance_w_fast`.
+`phi_adv_z` (v4.7.1 namelist, default 1) selects between staggering
+d(phi)/d(nu) first and destaggering omega first; **both branches are ported**
+so the GPU build is not a silent capability regression, even though this case
+runs the default. The branch is on a host-side logical, so every thread in a
+kernel takes the same side and the divergence is free. `dampwt` stays a
+thread-private scalar in the GPU routine: v4.7.1's array is written and read
+within the same `k` iteration, so the two are identical arithmetic, and a
+per-thread array private would be pure waste.
+
+Two things make this trustworthy rather than hopeful. **Both are checked in
+as scripts — use them, do not re-derive them:**
+- `port/expand_hybrid.py` does the expansion while preserving formatting
+  (`cpp -P` destroys blank lines and continuation alignment, which makes its
+  output useless as a source to port from). `--check` runs the real
+  preprocessor over the same input and diffs the two: it reports **0
+  disagreements** on V3.9.1.1's `module_small_step_em.F`. Run `--check`
+  before trusting the output; it is the whole reason the expansion can be
+  used as a porting source rather than a guess.
+- `port/stmt_compare.py` compares a restructured GPU routine to its CPU twin
+  **statement by statement**, normalising the promoted scratch buffers back
+  to their CPU names (`fast_rhs3(i,k,j)` → `rhs(i,k)`, and so on). A
+  whole-routine diff cannot do this — the whole point of the rewrite is that
+  the structure differs, so `diff` reports everything and hides the one line
+  that matters. On the finished port `advance_mu_t_fast` comes back
+  **"identical statement sets"**, and every line the other three report is a
+  divergence that can be named out loud (`mudf_xy` inlined, `cof` hoisted to
+  a scalar, `dampwt` kept a scalar, the model-top indices spelled `k_end`).
+  Read its output as a checklist, and treat any line you cannot justify as a
+  bug.
+
+**Four real defects in the V3.9.1.1 GPU acoustic port, all the same
+mistake.** Each `_fast` routine replaces a macro-wrapped array with a plain
+scratch buffer, and in four places that silently dropped what the macro was
+supplying. **These are bugs on `origin/openacc-em-dynamics` too** — they are
+not forward-port damage:
+1. `advance_uv_fast`, u update: `mudf_xy(i)` expands to
+   `(c1h(k)*mudf_xy(i))`; the rewrite inlined the `-emdiv*...` product and
+   lost the `c1h(k)` weight.
+2. the same in the v update.
+3. `advance_mu_t_fast`, the `ww` column recurrence: `dmdt(i)` expands to
+   `(c1h(k)*dmdt(i))`, but the promoted `fast_dmdt2(i,j)` was used bare.
+   Note `advance_mu_t` uses the *uppercase* `DMDT(i)` unweighted in the mu
+   update immediately above — so one use carries the weight and the other
+   does not, which is exactly why this is easy to get wrong.
+4. `advance_w_fast`, model-top kernel: `MUTHKM1` and `muave(i,j)` expand to
+   expressions in `k`, and the CPU routine supplies `k` by assigning
+   `K=k_end+1` just before the block. The rewrite replaced every *visible*
+   `k` with `k_end` and dropped that assignment, not realising two macros
+   still hid a `k`. In a `collapse(2)` kernel over (j,i) `k` is then an
+   uninitialised private integer indexing `c1h`/`c2h`/`c1f`.
+
+The first three are wrong wherever `c1h(k) /= 1`, and on this case that is
+most of the domain: `C1H` runs 1.01 at k=1, 1.67 at k=16, 0.32 at k=33, and
+is **exactly 0 from k=37 to the model top** (k=64). So over the top 44% of
+the column the buggy kernels were applying a divergence-damping term (and,
+in `advance_mu_t_fast`, a mass tendency) that the CPU code multiplies by
+zero. `ncks -H -C -v C1H` on any output from this case shows the profile —
+worth checking before assuming a dropped `c1h` factor is a small error.
+They survived a `dmudt`-based verification anyway, which is the lesson:
+a domain-averaged scalar diagnostic is not sensitive enough to catch a
+wrong term confined to the upper half of the column.
+
+All four are fixed on this branch, and the fix for (4) spells the indices
+`c1h(k_end)` / `c1f(k_end+1)` so no loop variable is live across kernels;
+that substitution was checked character-for-character against the CPU
+statement with `k := k_end+1`.
+
+**`calc_coef_w` gets a `_fast` twin rather than in-place directives.**
+v4.7.1 changed `cof` from a scalar to `REAL, DIMENSION(ims:ime)`. As an
+automatic array its bounds are runtime values, and NVHPC cannot gang-private
+it: `NVFORTRAN-W-0155-Size of private array is not constant, local memory
+not used. Results may be incorrect.` That warning is a hard stop, not noise.
+`cof` is filled with the same loop-invariant constant everywhere, so
+`calc_coef_w_fast` hoists it back to a scalar — which it can do freely
+because it is a separate routine. `calc_p_rho` needed no such thing and is
+annotated in place with zero semantic change.
+
+**The port is a pure addition.** Compile-out every `#ifdef WRF_GPU_DYN`
+block from `module_small_step_em.F` and the result is byte-identical to
+v4.7.1. Worth re-running as a check after any future edit:
+`python3` filter dropping guarded lines, then `diff` against
+`git show v4.7.1:dyn_em/module_small_step_em.F`.
+
+**Verification — and read the control before reading the numbers.** One
+fixed-dt step from the cloudy restart, comparing the acoustic-GPU build
+against a build identical except that the acoustic step runs on the host
+(radiation *and* advection on the GPU in both, so neither can contribute and
+McICA cannot reseed):
+
+| | U | V | W | T | PH | MU | P | QVAPOR |
+|---|---|---|---|---|---|---|---|---|
+| RMS rel. | 4.5e-7 | 1.7e-6 | 1.2e-4 | 1.2e-7 | 2.7e-7 | 1.3e-6 | 7.0e-5 | 3.9e-7 |
+
+`P` and `W` are ~100x noisier than everything else, which looks alarming and
+is not. Two things settle it:
+- **The difference is unbiased.** `|mean(A-B)| / rms(A-B)` is <= 0.003 for
+  every field, against a `1/sqrt(N)` floor of 0.001. A dropped term or a
+  wrong coefficient produces a *structured* difference with a ratio of order
+  1; this is a zero-mean scatter. The vertical profile agrees — the
+  differences are spread through the column, not piled at the model top or
+  the surface where a boundary-kernel bug would put them.
+- **Three independent controls all produce the same scatter, or more.** Each
+  perturbs the run in a way that provably is not a porting bug:
+
+  | comparison | `P` rms rel | `W` rms rel |
+  |---|---|---|
+  | acoustic on GPU vs on host | 7.0e-5 | 1.2e-4 |
+  | same binary, `WRF_GPU_RAD_CHUNK=97` vs default | 7.5e-5 | 1.3e-4 |
+  | same binary, 1 rank vs 4 ranks | 7.1e-5 | 1.3e-4 |
+  | same binary, 2 ranks vs 4 ranks | 7.2e-5 | 1.3e-4 |
+
+  The port sits *inside* the noise this configuration generates on its own.
+  This is the McICA sensitivity already documented above, reaching the
+  dynamics: `P` and `W` are the fields the acoustic step rebuilds from the
+  radiatively perturbed state, so they carry that scatter and `U`/`T`/`PH`
+  do not.
+
+The rank rows double as the residency test. The acoustic residency has
+several `IF ( ntasks .GT. 1 .or. ... )` guards around halo exchanges and
+their device updates, so 1, 2 and 4 ranks take genuinely different paths
+through it; all three reach `SUCCESS COMPLETE WRF` and land on the same
+numbers.
+
+**Correction to something written here earlier from reasoning rather than
+measurement**: the decomposition control was described as *inert* for
+`dyn_em`, on the argument that these kernels are elementwise per (i,k,j)
+with no cross-tile reduction, so rank count cannot perturb them. The premise
+is true and the conclusion was wrong — the table above shows 1-vs-4 ranks
+producing the same scatter as everything else, because rank count reaches
+radiation (via `ranks_per_device`, hence chunk size, hence summation order)
+and radiation then perturbs the dynamics. In the *full model* the
+decomposition control is live, and it is the cheapest of the three: no env
+var, no second build. The CPU-only 1-vs-2-rank control recorded under
+"Field-level verification" really was inert, but that build had no GPU
+radiation in the loop — which is precisely the difference.
+
+**Timing: the acoustic port is a wash, and one pair of runs would have said
+otherwise.** 10 model minutes on d01, fixed `dt=25`, 4 ranks, alternating the
+two builds in the same directory. Because both drift together as the card
+heats (it sits at ~2797 of 3090 MHz), the statistic that means anything is
+the *paired* difference, not the mean of each column:
+
+| pass | acoustic | acoustic-on-host | difference |
+|---|---|---|---|
+| 1 | 70.4 | 57.0 | +13.4 (cold, discarded) |
+| 2 | 60.4 | 65.6 | -5.2 |
+| 3 | 60.4 | 63.7 | -3.3 |
+| 4 | 70.5 | 70.8 | -0.3 |
+| 5 | 70.6 | 64.9 | +5.7 |
+| 6 | 63.2 | 59.8 | +3.4 |
+
+Five warm pairs: **mean +0.1 s, stdev 4.5 s, s.e.m. 2.0 s** — no measurable
+difference either way, on a ~64 s run. The all-CPU build is 121-131 s, so
+radiation is still carrying the entire 2x.
+
+Two traps in that table, both of which this project has now hit more than
+once. Pass 1 is the cold-cache pass — the first build to run pays for a 9.5 GB
+`wrffdda_d01` read and a cold CUDA code cache, and reporting it alone would
+have claimed a 23% regression that does not exist. And the *unpaired* column
+means (acoustic 65.0, host 65.0) happen to agree here, but they would not have
+if the two builds had not been interleaved: run all of one build and then all
+of the other and the thermal drift lands entirely on the second.
+
+So both `dyn_em` halves now measure the same way: correct, and worth nothing
+on this GPU at this domain size. **Do not start the diffusion port on the
+strength of "dynamics on the GPU should help" — it did not, twice.**
+
+**Why it is a wash: the acoustic step is transfer-bound by a factor of 32,
+and the fix is specific.** `NVCOMPILER_ACC_TIME=1`, 1 rank, same 10-minute
+run:
+
+| | device time |
+|---|---|
+| all five acoustic kernels, 6312 launches | **0.26 s** |
+| `solve_em`'s acoustic data movement | **8.41 s** |
+
+The compute is already free. Of the 8.41 s, **3.10 s is the single
+`!$acc enter data copyin` that opens the residency** — it fires 72 times
+(once per RK step per tile) and moves 4752 transfers' worth of ~40 arrays,
+and most of that list is *run-constant*: `c1h/c2h/c1f/c2f`, `c3h/c4h/c3f/c4f`,
+`znu`, `rdn/rdnw/dnw`, `fnm/fnp`, every `msf*`, `ht`, `alb`, `phb`,
+`cf1/cf2/cf3`. Those never change after initialisation and are being
+re-uploaded three times per model step. The rest is `update self` /
+`update device` round trips around the host-only halo and boundary routines
+(1.01 s for `u_2`/`v_2` alone at line 1466).
+
+So the obvious next move on this line is **not** more kernels — it is
+splitting that copyin into a once-per-run residency for the invariants and a
+per-RK-step one for the genuinely mutable fields. That is a bounded change
+with a measured 3 s target on a ~64 s run, and it would help the advection
+half too (`rk_scalar_tend` and `rk_tendency` spend 1.9 s and 1.2 s in
+transfers against ~0.02 s of compute each — the same shape).
+
+Recorded because it was guessed wrong first: the initial explanation here was
+"launch-bound, the 63x63x64 tile is too small". That is measurably false —
+6312 launches account for essentially all of the 0.26 s kernel time, so the
+launches are fine and the kernels are fine. It is the data.
+
+Reach for one of these controls whenever a dynamics comparison looks too
+noisy, and always check the control actually perturbs before reading
+anything into it.
 
 ### RRTMG-LW — fully ported and verified (module_ra_rrtmg_lw.F)
 All behind `#ifdef WRF_GPU_RAD`, all additive (original CPU code untouched):
@@ -992,11 +1262,15 @@ Two device assumptions remain, documented rather than removed:
 
 ### Prior work (done, stable, not part of current focus)
 `dyn_em` advection (`advect_u/v/w/scalar_o5v3`) and the acoustic loop
-(`advance_uv/mu_t/w_fast`) are fully ported to OpenACC for the
-`h_*_adv_order=5`/`v_*_adv_order=3` combination the Hong Kong case runs,
-verified at 1/2/4 ranks, commits `f411e1135`..`ee73040e8`. GPU wall-clock is
-at CPU parity. Diffusion (`module_diffusion_em.F`, `diff_opt=2`/`km_opt=4`)
-was scoped but never started.
+(`advance_uv/mu_t/w_fast`) were first ported to OpenACC on the V3.9.1.1 line
+for the `h_*_adv_order=5`/`v_*_adv_order=3` combination the Hong Kong case
+runs, verified at 1/2/4 ranks, commits `f411e1135`..`ee73040e8`. GPU
+wall-clock is at CPU parity. Both halves are now forward-ported to v4.7.1 —
+see "`dyn_em` forward-ported to v4.7.1" above, which also lists four real
+defects in the V3.9.1.1 acoustic kernels that are still live on
+`origin/openacc-em-dynamics`. Diffusion (`module_diffusion_em.F`,
+`diff_opt=2`/`km_opt=4`) was scoped but never started, and the advection
+timing result above is a reason to profile before starting it.
 
 A **dormant CUDA Fortran port** also exists in the tree:
 `phys/module_ra_rrtmg_lwf.F` (`ra_lw_physics=24`) and
@@ -1316,6 +1590,41 @@ fail ("attempt to read past end of file").
 ## OpenACC conventions (hard constraints, established during `dyn_em` port,
 ## reconfirmed during RRTMG)
 
+- **When a restructured kernel replaces a macro-wrapped array with a plain
+  scratch buffer, it silently drops whatever the macro was supplying.** This
+  is not hypothetical: it is four of the four defects found in the V3.9.1.1
+  acoustic port (see "`dyn_em` forward-ported to v4.7.1"). WRF's
+  `HYBRID_COORD` layer makes `mudf_xy(i)` mean `(c1h(k)*mudf_xy(i))` and
+  `MUTHKM1` mean `(c1h(k-1)*MUT(i,j)+c2h(k-1))`, so a rewrite that promotes
+  `mudf_xy` to a buffer, or that replaces every *visible* `k` with a literal
+  bound, changes the arithmetic without touching a single visible operator.
+  Two properties make it especially treacherous: the macros are
+  case-sensitive, so the same array appears both wrapped (`dmdt(i)`) and raw
+  (`DMDT(i)`) within ten lines of each other and only one carries the
+  weight; and a macro can be the *only* reason a loop variable is still
+  live, so deleting an assignment like `K=k_end+1` leaves an uninitialised
+  private index in a kernel.
+  **Rule: before restructuring a routine that sits under a macro layer,
+  macro-expand it first and restructure the expanded text.** Check the
+  expander against `cpp` itself, then compare the finished kernel to the CPU
+  routine **statement by statement** with the promoted buffers normalised
+  back to their CPU names — a whole-routine diff cannot do this, because the
+  point of the rewrite is that the structure differs.
+- **When a comparison looks too noisy, get a control with a known
+  perturbation before calling it a bug — and check the control actually
+  perturbs.** `|mean(A-B)| / rms(A-B)` against the `1/sqrt(N)` floor
+  separates a wrong term (structured, ratio ~1) from FP scatter (zero-mean)
+  in one cheap pass, and should be the first thing computed. For magnitude,
+  use more than one control and check they agree: `WRF_GPU_RAD_CHUNK` (known
+  perturbation size) and plain rank count both work on any build that has GPU
+  radiation in the loop, and on the acoustic port they landed within 10% of
+  each other and of the quantity under test. **"This control cannot perturb
+  anything" is a claim to measure, not to reason out** — the rank control was
+  written off for `dyn_em` on the correct observation that its kernels are
+  elementwise per (i,k,j), and it turned out to be live anyway because rank
+  count reaches radiation through `ranks_per_device`. The CPU 1-vs-2-rank
+  control under "Field-level verification" was genuinely inert; the
+  difference is whether GPU radiation is in the loop.
 - **When a sequential CPU loop becomes a parallel kernel, audit every array
   read whose index is not the thread's own index.** Two separate real bugs
   in the LW chain (commit `0c1f32692`) were the same mistake in two

@@ -1106,6 +1106,23 @@ BENCH_START(small_step_prep_tim)
                              grid%j_start(ij), grid%j_end(ij),                        &
                              k_start    , k_end                                       )
  
+#ifdef WRF_GPU_DYN
+!  calc_p_rho is called before, and then during every acoustic step.  Retain
+!  its fixed coefficients and work fields for the entire acoustic phase.
+!  The surrounding routines remain host code, so mutable fields are updated
+!  explicitly at each CPU/GPU boundary below.
+!$acc enter data copyin(grid%al,grid%p,grid%ph_2,grid%alt,grid%t_2,grid%t_save,c2a,pm1) &
+!$acc& copyin(grid%mu_2,grid%muts,grid%c1h,grid%c2h,grid%c1f,grid%c2f,grid%c3h,grid%c4h) &
+!$acc& copyin(grid%c3f,grid%c4f,grid%znu,grid%rdnw,grid%dnw,grid%mut,grid%rdn,cqw) &
+!$acc& copyin(grid%w_2,rw_tend,grid%ww,w_save,grid%u_2,grid%v_2,muave,t_2save,ph_save) &
+!$acc& copyin(grid%phb,ph_tend,grid%ht,grid%alb,grid%fnm,grid%fnp,grid%cf1,grid%cf2) &
+!$acc& copyin(grid%cf3,ww1,grid%u_save,grid%v_save,grid%muu,grid%muv,grid%mudf) &
+!$acc& copyin(grid%ru_m,grid%rv_m,grid%ww_m,t_tend,mu_tend,grid%msfux,grid%msfuy) &
+!$acc& copyin(grid%msfvx,grid%msfvx_inv,grid%msfvy,grid%msftx,grid%msfty) &
+!$acc& copyin(grid%ru_tend,grid%rv_tend,grid%pb,grid%php,cqu,cqv) &
+!$acc& create(a,alpha,gamma)
+#endif
+
        CALL calc_p_rho( grid%al, grid%p, grid%ph_2,                 &
                         grid%alt, grid%t_2, grid%t_save, c2a, pm1,  &
                         grid%mu_2, grid%muts,                       &
@@ -1119,8 +1136,34 @@ BENCH_START(small_step_prep_tim)
                         grid%i_start(ij), grid%i_end(ij),           &
                         grid%j_start(ij), grid%j_end(ij),           &
                         k_start    , k_end                          )
+#ifdef WRF_GPU_DYN_CPU_P
+!  Diagnostic fallback: calc_p_rho ran on the host: push its outputs back to
+!  the device instead of pulling stale device values over them.
+!$acc update device(grid%al,grid%p,grid%ph_2,pm1)
+#else
+#ifdef WRF_GPU_DYN
+!  pm1 is calc_p_rho's own device-resident scratch (divergence-damping
+!  reference pressure) -- never read or written by any host code, so it
+!  never needs to leave the device here.
+!$acc update self(grid%al,grid%p,grid%ph_2)
+#endif
+#endif
 
        IF (config_flags%non_hydrostatic) THEN
+#ifdef WRF_GPU_DYN
+         CALL calc_coef_w_fast( a,alpha,gamma,               &
+                           grid%mut,                         &
+                           grid%c1h, grid%c2h, grid%c1f, grid%c2f, &
+                           grid%c3h, grid%c4h, grid%c3f, grid%c4f, &
+                           cqw, grid%rdn, grid%rdnw, c2a,    &
+                           dts_rk, g, grid%epssm,            &
+                           config_flags%top_lid,             &
+                           ids, ide, jds, jde, kds, kde,     &
+                           ims, ime, jms, jme, kms, kme,     &
+                           grid%i_start(ij), grid%i_end(ij), &
+                           grid%j_start(ij), grid%j_end(ij), &
+                           k_start    , k_end               )
+#else
          CALL calc_coef_w( a,alpha,gamma,                    &
                            grid%mut,                         &
                            grid%c1h, grid%c2h, grid%c1f, grid%c2f, &
@@ -1133,6 +1176,7 @@ BENCH_START(small_step_prep_tim)
                            grid%i_start(ij), grid%i_end(ij), &
                            grid%j_start(ij), grid%j_end(ij), &
                            k_start    , k_end               )
+#endif
        ENDIF
 
      ENDDO
@@ -1263,11 +1307,35 @@ BENCH_START(set_phys_bc2_tim)
      END DO
      !$OMP END PARALLEL DO
 BENCH_END(set_phys_bc2_tim)
+#ifdef WRF_GPU_DYN
+!  HALO_EM_B, PERIOD_BDY_EM_B, and the physical BC calls above ran on the
+!  host and can rewrite domain-edge values (open/specified boundaries) that
+!  were already resident on the GPU from the enter-data copyin earlier in
+!  this tile loop.  Without this update the GPU acoustic step uses stale
+!  boundary p/al/mu/mudf, which blows up non-periodic (real-data) domains.
+!$acc update device(grid%al,grid%p,grid%ph_2,grid%alt,grid%t_save,grid%mu_2, &
+!$acc& grid%mudf,grid%u_save,grid%v_save,grid%php,grid%pb,grid%ru_tend,grid%rv_tend)
+#endif
      small_steps : DO iteration = 1 , number_of_small_timesteps
 
        ! Boundary condition time (or communication time).  
 #ifdef DM_PARALLEL
+#ifdef WRF_GPU_DYN
+       IF ( ntasks .GT. 1 .or. config_flags%periodic_y ) THEN
+#endif
 #      include "PERIOD_BDY_EM_B.inc"
+#ifdef WRF_GPU_DYN
+       END IF
+#endif
+#endif
+#ifdef WRF_GPU_DYN
+!  PERIOD_BDY_EM_B is generated host code.  Its periodic halo values feed
+!  advance_uv, so refresh them only when a periodic dimension is enabled.
+       IF ( ( ntasks .GT. 1 .or. config_flags%periodic_y ) .AND. &
+            ( config_flags%periodic_x .or. config_flags%periodic_y ) ) THEN
+!$acc update device(grid%ru_tend,grid%rv_tend,grid%ph_2,grid%al,grid%p,grid%mu_2, &
+!$acc& grid%mudf,grid%php,grid%alt,grid%pb)
+       END IF
 #endif
 
        !$OMP PARALLEL DO   &
@@ -1276,6 +1344,26 @@ BENCH_END(set_phys_bc2_tim)
        DO ij = 1 , grid%num_tiles
 
 BENCH_START(advance_uv_tim)
+#ifdef WRF_GPU_DYN
+         CALL advance_uv_fast ( grid%u_2, grid%ru_tend, grid%v_2, grid%rv_tend,   &
+                           grid%p, grid%pb,                                       &
+                           grid%ph_2, grid%php, grid%alt,  grid%al,               &
+                           grid%mu_2, grid%muu, cqu, grid%muv, cqv, grid%mudf,    &
+                           grid%c1h, grid%c2h, grid%c1f, grid%c2f,                &
+                           grid%c3h, grid%c4h, grid%c3f, grid%c4f,                &
+                           grid%msfux, grid%msfuy, grid%msfvx,                    &
+                           grid%msfvx_inv, grid%msfvy,                            &
+                           grid%rdx, grid%rdy, dts_rk,                            &
+                           grid%cf1, grid%cf2, grid%cf3, grid%fnm, grid%fnp,      &
+                           grid%emdiv,                                            &
+                           grid%rdnw, config_flags,grid%spec_zone,                &
+                           config_flags%non_hydrostatic, config_flags%top_lid,    &
+                           ids, ide, jds, jde, kds, kde,                          &
+                           ims, ime, jms, jme, kms, kme,                          &
+                           grid%i_start(ij), grid%i_end(ij),                      &
+                           grid%j_start(ij), grid%j_end(ij),                      &
+                           k_start    , k_end                                     )
+#else
          CALL advance_uv ( grid%u_2, grid%ru_tend, grid%v_2, grid%rv_tend,        &
                            grid%p, grid%pb,                                       &
                            grid%ph_2, grid%php, grid%alt,  grid%al,               &
@@ -1294,10 +1382,24 @@ BENCH_START(advance_uv_tim)
                            grid%i_start(ij), grid%i_end(ij),                      &
                            grid%j_start(ij), grid%j_end(ij),                      &
                            k_start    , k_end                                     )
+#endif
 BENCH_END(advance_uv_tim)
 
        END DO
        !$OMP END PARALLEL DO
+
+#ifdef WRF_GPU_DYN_CPU_UV
+!  Diagnostic fallback: keep UV on host, then refresh its device copy.
+!$acc update device(grid%u_2,grid%v_2)
+#else
+#ifdef WRF_GPU_DYN
+!  Polar filters, specified boundaries, and MPI halos remain host routines.
+       IF ( ntasks .GT. 1 .or. config_flags%periodic_y .or. config_flags%polar .or. &
+            config_flags%specified .or. config_flags%nested ) THEN
+!$acc update self(grid%u_2,grid%v_2)
+       END IF
+#endif
+#endif
 
 !-----------------------------------------------------------
 !  acoustic integration polar filter for smallstep u, v
@@ -1379,7 +1481,13 @@ BENCH_END(spec_bdy_uv_tim)
 !  u_2               x
 !  v_2                          x
 !
+#ifdef WRF_GPU_DYN
+       IF ( ntasks .GT. 1 .or. config_flags%periodic_y ) THEN
+#endif
 #     include "HALO_EM_C.inc"
+#ifdef WRF_GPU_DYN
+       END IF
+#endif
 #endif
 
        !$OMP PARALLEL DO   &
@@ -1389,6 +1497,42 @@ BENCH_END(spec_bdy_uv_tim)
         !  advance the mass in the column, theta, and calculate ww
 
 BENCH_START(advance_mu_t_tim)
+#ifdef WRF_GPU_DYN
+!  advance_uv_fast runs entirely on the device; only the host-only
+!  spec_bdyupdate calls and HALO_EM_C.inc in between touch anything, and
+!  both only touch u_2/v_2 (see the update self just above this block).
+!  Every other array in this list (ww, u_save, v_save, mu_2, mut, muave,
+!  muts, muu, muv, mudf, ru_m, rv_m, ww_m, t_2, t_save, t_2save, t_tend,
+!  mu_tend) is untouched by host code here, so re-pushing it is a pure
+!  redundant transfer of data the device already has correctly -- this was
+!  previously the single largest data-movement cost in the acoustic loop
+!  (~700ms of the ~2.9s total per NVCOMPILER_ACC_TIME profiling on a
+!  2-minute run) and none of it was necessary.
+           IF ( ntasks .GT. 1 .or. config_flags%periodic_y .or. config_flags%polar .or. &
+                config_flags%specified .or. config_flags%nested ) THEN
+!$acc update device(grid%u_2,grid%v_2)
+           END IF
+#endif
+#ifdef WRF_GPU_DYN
+         CALL advance_mu_t_fast( grid%ww, ww1, grid%u_2, grid%u_save, grid%v_2, grid%v_save, &
+                          grid%mu_2, grid%mut, muave, grid%muts, grid%muu, grid%muv,    &
+                          grid%mudf,                                                    &
+                          grid%c1h, grid%c2h, grid%c1f, grid%c2f,                       &
+                          grid%c3h, grid%c4h, grid%c3f, grid%c4f,                       &
+                          grid%ru_m, grid%rv_m, grid%ww_m,                              &
+                          grid%t_2, grid%t_save, t_2save, t_tend,                       &
+                          mu_tend,                                                      &
+                          grid%rdx, grid%rdy, dts_rk, grid%epssm,                       &
+                          grid%dnw, grid%fnm, grid%fnp, grid%rdnw,                      &
+                          grid%msfux,grid%msfuy, grid%msfvx, grid%msfvx_inv,            &
+                          grid%msfvy, grid%msftx,grid%msfty,                            &
+                          iteration, config_flags,                                      &
+                          ids, ide, jds, jde, kds, kde,      &
+                          ims, ime, jms, jme, kms, kme,      &
+                          grid%i_start(ij), grid%i_end(ij),  &
+                          grid%j_start(ij), grid%j_end(ij),  &
+                          k_start    , k_end                )
+#else
          CALL advance_mu_t( grid%ww, ww1, grid%u_2, grid%u_save, grid%v_2, grid%v_save, &
                           grid%mu_2, grid%mut, muave, grid%muts, grid%muu, grid%muv,    &
                           grid%mudf,                                                    &
@@ -1407,6 +1551,7 @@ BENCH_START(advance_mu_t_tim)
                           grid%i_start(ij), grid%i_end(ij),  &
                           grid%j_start(ij), grid%j_end(ij),  &
                           k_start    , k_end                )
+#endif
 BENCH_END(advance_mu_t_tim)
        ENDDO
        !$OMP END PARALLEL DO
@@ -1415,6 +1560,19 @@ BENCH_END(advance_mu_t_tim)
 !  acoustic integration polar filter for smallstep mu, t
 !-----------------------------------------------------------
 
+#ifdef WRF_GPU_DYN_CPU_MU
+!  Diagnostic fallback: advance_mu_t ran on the host: push its outputs back
+!  to the device instead of pulling stale device values over them.
+!$acc update device(grid%ww,grid%mu_2,grid%muts,grid%t_2,muave)
+#else
+#ifdef WRF_GPU_DYN
+!  These optional host routines are the only consumers between advance_mu_t
+!  and advance_w.  Avoid a round trip for periodic, non-polar domains.
+       IF ( config_flags%polar .or. config_flags%specified .or. config_flags%nested ) THEN
+!$acc update self(grid%t_2,grid%mu_2,grid%muts)
+       END IF
+#endif
+#endif
        IF ( (config_flags%polar) ) THEN
 
          CALL pxft ( grid=grid                                               &
@@ -1496,6 +1654,32 @@ BENCH_END(spec_bdy_t_tim)
 
 BENCH_START(advance_w_tim)
          IF ( config_flags%non_hydrostatic ) THEN
+#ifdef WRF_GPU_DYN
+           IF ( config_flags%polar .or. config_flags%specified .or. config_flags%nested ) THEN
+!$acc update device(grid%t_2,grid%mu_2,grid%muts)
+           END IF
+#endif
+#ifdef WRF_GPU_DYN
+           CALL advance_w_fast( grid%w_2, rw_tend, grid%ww, w_save,    &
+                           grid%u_2, grid%v_2,                         &
+                           grid%mu_2, grid%mut, muave, grid%muts,      &
+                           grid%c1h, grid%c2h, grid%c1f, grid%c2f,     &
+                           grid%c3h, grid%c4h, grid%c3f, grid%c4f,     &
+                           t_2save, grid%t_2, grid%t_save,             &
+                           grid%ph_2, ph_save, grid%phb, ph_tend,      &
+                           grid%ht, c2a, cqw, grid%alt, grid%alb,      &
+                           a, alpha, gamma,                            &
+                           grid%rdx, grid%rdy, dts_rk, t0, grid%epssm, &
+                           grid%dnw, grid%fnm, grid%fnp, grid%rdnw,    &
+                           grid%rdn, grid%cf1, grid%cf2, grid%cf3,     &
+                           grid%msftx, grid%msfty,                     &
+                           config_flags,  config_flags%top_lid,        &
+                           ids,ide, jds,jde, kds,kde,                  &
+                           ims,ime, jms,jme, kms,kme,                  &
+                           grid%i_start(ij), grid%i_end(ij),           &
+                           grid%j_start(ij), grid%j_end(ij),           &
+                           k_start    , k_end                          )
+#else
            CALL advance_w( grid%w_2, rw_tend, grid%ww, w_save,         &
                            grid%u_2, grid%v_2,                         &
                            grid%mu_2, grid%mut, muave, grid%muts,      &
@@ -1515,9 +1699,32 @@ BENCH_START(advance_w_tim)
                            grid%i_start(ij), grid%i_end(ij),           &
                            grid%j_start(ij), grid%j_end(ij),           &
                            k_start    , k_end                          )
+#endif
+#ifdef WRF_GPU_DYN_CPU_W
+!  Diagnostic fallback: advance_w ran on the host: push its outputs back to
+!  the device instead of pulling stale device values over them.
+!$acc update device(grid%w_2,grid%ww,t_2save,grid%ph_2)
+#else
+#ifdef WRF_GPU_DYN
+!  sumflux, boundary handling, and the next host acoustic step consume these.
+!  t_2save is a pure inter-kernel device scratch between advance_mu_t_fast
+!  and advance_w_fast (never read/written by any host code), so it never
+!  needs to leave the device.
+           IF ( config_flags%polar .or. config_flags%specified .or. config_flags%nested ) THEN
+!$acc update self(grid%w_2,grid%ww,grid%ph_2)
+           ELSE
+!$acc update self(grid%ww)
+           END IF
+#endif
+#endif
          ENDIF
 BENCH_END(advance_w_tim)
 
+#ifdef WRF_GPU_DYN
+       IF ( .NOT. config_flags%non_hydrostatic ) THEN
+!$acc update self(grid%ww)
+       END IF
+#endif
        ENDDO
        !$OMP END PARALLEL DO
 
@@ -1620,6 +1827,15 @@ BENCH_END(spec_bdynhyd_tim)
          ENDIF
 
 BENCH_START(cald_p_rho_tim)
+#ifdef WRF_GPU_DYN
+!  Only ph_2 was written by host code since the last push of t_2/mu_2/muts
+!  (spec_bdyupdate_ph writes ph_2 only; muts is a read-only input to it) --
+!  advance_w_fast/calc_p_rho both take mu1/muts/t_2 as INTENT(IN), so their
+!  device-side values are still current and re-pushing them is redundant.
+         IF ( config_flags%polar .or. config_flags%specified .or. config_flags%nested ) THEN
+!$acc update device(grid%ph_2)
+         END IF
+#endif
          CALL calc_p_rho( grid%al, grid%p, grid%ph_2,                 &
                           grid%alt, grid%t_2, grid%t_save, c2a, pm1,  &
                           grid%mu_2, grid%muts,                       &
@@ -1633,11 +1849,35 @@ BENCH_START(cald_p_rho_tim)
                           grid%i_start(ij), grid%i_end(ij), &
                           grid%j_start(ij), grid%j_end(ij), &
                           k_start    , k_end               )
+#ifdef WRF_GPU_DYN_CPU_P
+!  Diagnostic fallback: calc_p_rho ran on the host: push its outputs back to
+!  the device instead of pulling stale device values over them.
+!$acc update device(grid%al,grid%p,grid%ph_2,pm1)
+#else
+#ifdef WRF_GPU_DYN
+!  pm1 is calc_p_rho's own device-resident scratch (divergence-damping
+!  reference pressure) -- never read or written by any host code, so it
+!  never needs to leave the device here.
+!$acc update self(grid%al,grid%p,grid%ph_2)
+#endif
+#endif
 BENCH_END(cald_p_rho_tim)
 
        ENDDO
        !$OMP END PARALLEL DO
 
+#ifdef WRF_GPU_DYN
+!  HALO_EM_C2/PERIOD_BDY_EM_B3 below exchange ph_2, al, p, mu_2, muts, and
+!  mudf between MPI ranks on the host.  al/p/ph_2/pm1 were already pulled to
+!  the host above (calc_p_rho's update self), but mu_2/muts/mudf were not --
+!  without pulling them here the halo exchange reads stale host copies and
+!  ships wrong edge values to the neighboring rank, corrupting mu/t near
+!  every inter-rank tile boundary.  This is multi-rank only: with a single
+!  patch and no periodicity these includes are no-ops.
+       IF ( ntasks .GT. 1 .or. config_flags%periodic_x .or. config_flags%periodic_y ) THEN
+!$acc update self(grid%mu_2,grid%muts,grid%mudf)
+       END IF
+#endif
 #ifdef DM_PARALLEL
 !
 !  Stencils for patch communications  (WCS, 29 June 2001)
@@ -1658,6 +1898,14 @@ BENCH_END(cald_p_rho_tim)
 
 #      include "HALO_EM_C2.inc"
 #      include "PERIOD_BDY_EM_B3.inc"
+#endif
+#ifdef WRF_GPU_DYN
+!  Push the halo-exchanged values back to the device: the next small_steps
+!  iteration's advance_uv reads ph_2/al/p/mu_2/muv/mudf on the GPU, and
+!  without this update it would use the pre-exchange (wrong) device copies.
+       IF ( ntasks .GT. 1 .or. config_flags%periodic_x .or. config_flags%periodic_y ) THEN
+!$acc update device(grid%ph_2,grid%al,grid%p,grid%mu_2,grid%muts,grid%mudf)
+       END IF
 #endif
 
 BENCH_START(phys_bc_tim)
@@ -1717,6 +1965,16 @@ BENCH_START(phys_bc_tim)
 BENCH_END(phys_bc_tim)
 
      END DO small_steps
+
+#ifdef WRF_GPU_DYN
+!  calc_mu_uv_1 and small_step_finish below are host routines that read and
+!  write mu_2/muts/t_2/ph_2.  Nothing between here and the end of the
+!  acoustic loop pulled the GPU-computed values back to the host, so fetch
+!  them now instead of letting the host routines run on stale pre-loop data.
+!  mudf is NOT an argument to either call (verified) -- it's still correctly
+!  re-fetched on its own right before its actual consumer, below.
+!$acc update self(grid%mu_2,grid%muts,grid%t_2,grid%ph_2)
+#endif
 
      !$OMP PARALLEL DO   &
      !$OMP PRIVATE ( ij )
@@ -1803,6 +2061,25 @@ BENCH_END(small_step_finish_tim)
 
      END DO
      !$OMP END PARALLEL DO
+
+#ifdef WRF_GPU_DYN
+!  t_2, mu_2, and muts were already refreshed on the host before
+!  calc_mu_uv_1/small_step_finish above, and those host routines are the
+!  ones that produced the final values here -- do not pull the (now stale)
+!  device copies back over them.  mudf is untouched by that host code, so
+!  it still needs a fresh pull for whatever consumes it next.
+!$acc update self(grid%mudf)
+!$acc exit data delete(grid%al,grid%p,grid%ph_2,grid%alt,grid%t_2,grid%t_save,c2a,pm1) &
+!$acc& delete(grid%mu_2,grid%muts,grid%c1h,grid%c2h,grid%c1f,grid%c2f,grid%c3h,grid%c4h) &
+!$acc& delete(grid%c3f,grid%c4f,grid%znu,grid%rdnw,grid%dnw,grid%mut,grid%rdn,cqw) &
+!$acc& delete(grid%w_2,rw_tend,grid%ww,w_save,grid%u_2,grid%v_2,muave,t_2save,ph_save) &
+!$acc& delete(grid%phb,ph_tend,grid%ht,grid%alb,grid%fnm,grid%fnp,grid%cf1,grid%cf2) &
+!$acc& delete(grid%cf3,ww1,grid%u_save,grid%v_save,grid%muu,grid%muv,grid%mudf) &
+!$acc& delete(grid%ru_m,grid%rv_m,grid%ww_m,t_tend,mu_tend,grid%msfux,grid%msfuy) &
+!$acc& delete(grid%msfvx,grid%msfvx_inv,grid%msfvy,grid%msftx,grid%msfty) &
+!$acc& delete(grid%ru_tend,grid%rv_tend,grid%pb,grid%php,cqu,cqv) &
+!$acc& delete(a,alpha,gamma)
+#endif
 
 !-----------------------------------------------------------
 !  polar filter for full dynamics variables and time-averaged mass fluxes 
@@ -2202,12 +2479,8 @@ BENCH_END(small_step_finish_tim)
 !  "ENDIF other_scalar_advance" writes any of them, so bring them onto the
 !  device once for the whole span instead of once per call.
 !
-!  NOTE: this is the advection residency only. The acoustic-step residency
-!  that V3.9.1.1 also had here is deliberately absent -- the GPU calc_p_rho
-!  / calc_coef_w / advance_* kernels are not forward-ported to v4.7.1 yet,
-!  and that block is only correct in company with them: it is followed by
-!  "!$acc update self(...)" after each call, which would overwrite correct
-!  host results with stale device values if those routines ran on the host.
+!  This is the advection residency; the acoustic step has its own, earlier in
+!  this routine, around the small_steps loop.
 !$acc enter data copyin(grid%ru_m,grid%rv_m,grid%ww_m,grid%muts,grid%c1h, &
 !$acc& grid%c2h,grid%msfux,grid%msfuy,grid%msfvx,grid%msfvy,grid%msftx,   &
 !$acc& grid%msfty,grid%fnm,grid%fnp,grid%rdnw,grid%rdn,config_flags)
