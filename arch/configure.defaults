@@ -2295,38 +2295,38 @@ CPLUSPLUSLIB    =
 ESMF_LDFLAG     =       $(CPLUSPLUSLIB)
 # Which device architectures to generate code for.
 #
-# The DEFAULT, ccall, builds device code for every compute capability this
-# NVHPC release supports (12 of them here, sm_75 through sm_121), so one
-# binary runs on any of them. Any build that leaves this machine must use
-# it. Nothing else in the port is allowed to assume a particular GPU
-# either: the runtime chunk sizing queries whatever device it finds via
-# acc_get_property (see rrtmg_lw_gpu_chunksize), rather than hardcoding a
-# VRAM size.
+# The DEFAULT, ccnative, builds device code for the GPU installed in THIS
+# machine, asking the driver what that is rather than encoding a card into
+# the build recipe. It is the default because it is roughly 2.5x faster to
+# compile the two radiation files, which dominate every rebuild:
 #
-# ccall is also most of the compile time for the two radiation files, so
-# for local iteration override it from the environment:
+#     module_ra_rrtmg_lw.f90    118.1 s (ccall)  ->  46.9 s (ccnative)
+#     module_ra_rrtmg_sw.f90     82.1 s (ccall)  ->  31.8 s (ccnative)
 #
-#     export WRF_GPU_ARCH=ccnative     # the GPU in this machine
+# THE RESULTING BINARY RUNS ONLY ON THIS MACHINE'S GPU. On anything else it
+# fails at launch with "no kernel image is available for execution on the
+# device". Before handing a binary to anyone, or publishing numbers from
+# one, rebuild for every architecture:
+#
+#     export WRF_GPU_ARCH=ccall        # sm_75 .. sm_121, 12 of them
 #     ./compile em_real
 #
-# Prefer ccnative over naming a ccXY: it asks the driver what is installed
-# instead of encoding one card into a build recipe, so the same command
-# works on any machine. An explicit ccXY (cc120, cc90, ...) or a list also
-# works if you need to cross-build.
+# An explicit ccXY (cc120, cc90, ...) or a comma-separated list also works
+# if you need to cross-build for a specific target.
 #
-# Two things to know before using it:
-#  - The result runs ONLY on the architecture(s) named. On anything else it
-#    fails at launch with "no kernel image is available for execution on
-#    the device". Never hand such a binary to anyone.
-#  - It changes build time, NOT results: the code generated for a given
-#    architecture is identical whether or not others were built alongside
-#    it. Verification runs are still valid, but do a final ccall build
-#    before publishing numbers, so the thing measured is the thing shipped.
+# This switch changes build time, NOT results: the code generated for a
+# given architecture is identical whether or not others were built
+# alongside it, so a ccnative verification run is still valid.
+#
+# Note this is the only place in the port that assumes a particular GPU,
+# and it is a build-time assumption only. Nothing at runtime may make one:
+# the chunk sizing queries whatever device it finds via acc_get_property
+# (see rrtmg_lw_gpu_chunksize) rather than hardcoding a VRAM size.
 #
 # -Kieee is required regardless: without it the GPU and CPU paths disagree
 # well above the single-precision noise floor and every verification
 # tolerance here becomes meaningless.
-WRF_GPU_ARCH   ?=       ccall
+WRF_GPU_ARCH   ?=       ccnative
 GPU_DYN_FLAGS   =       -acc -gpu=$(WRF_GPU_ARCH) -Kieee
 GPU_RAD_FLAGS   =       -acc -gpu=$(WRF_GPU_ARCH) -Kieee
 # Deliberately plain -O3, not the aarch64 entry's "-fast -Mvect=noaltcode

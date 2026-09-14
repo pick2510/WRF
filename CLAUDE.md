@@ -4,6 +4,61 @@ This file captures accumulated knowledge for the ongoing effort to port WRF's
 RRTMG radiation scheme (and, earlier, `dyn_em`) to OpenACC/GPU. Read this
 before resuming GPU-port work in this repo.
 
+## Where the time actually goes (measured, read this before porting anything)
+
+Full `-DBENCH` breakdown, Hong Kong d01, 10 model minutes, fixed `dt=25`,
+24 steps, 1 rank, on the build that has GPU RRTMG **and** GPU `dyn_em`
+advection + acoustic. `solve_em` total 108.8 s:
+
+| phase | s | % | on |
+|---|---|---|---|
+| `rad_driver` | **44.6** | **41%** | GPU |
+| `micro_driver` (Thompson, `mp_physics=8`) | **20.5** | **19%** | CPU |
+| `dyn_em` advection (`rk_scalar_tend`+`rk_tend`+`update_scal`) | 10.4 | 10% | GPU |
+| `dyn_em` acoustic (all 8 phases) | 9.0 | 8% | GPU |
+| diffusion + TKE (`hor_diff` 5.7, `deform_div` 0.8, …) | 7.1 | 6.5% | CPU |
+| `pbl_driver` | 4.3 | 4% | CPU |
+| everything else (BCs, halos, `surf`, `fdda`, `phy_prep`) | 9.4 | 9% | CPU |
+
+**Radiation is still 41% even after being ported**, and the reason is one
+kernel pair. From `NVCOMPILER_ACC_TIME` on the same run (26.9 s of radiation
+GPU kernel time):
+
+| kernel | s | launches | ms/launch |
+|---|---|---|---|
+| `mcica_subcol_lw_gpu` | **9.92** | 47 | **211** |
+| `mcica_subcol_sw_gpu` | **9.38** | 96 | **98** |
+| `inatm_cloud_gpu` | 2.13 | 94 | 22.7 |
+| `rtrnmc_gpu` | 0.98 | 47 | 20.9 |
+| everything else | < 0.8 each | | < 16 |
+
+**McICA alone is 19.3 s — 72% of all radiation GPU time and 17.7% of the
+entire timestep**, at 10x the per-launch cost of the next kernel. It is the
+largest single item in the model that is already on the GPU, so it needs
+kernel tuning rather than a port, and kissvec is bitwise integer arithmetic
+so bit-exactness is the acceptance bar (see the LW/SW McICA entries below).
+Worth checking first: the coalescing of the `cldfmc`-style
+`(ncol, ngpt, nlay)` writes, and register/local-memory pressure from the
+per-thread RNG state — the arithmetic itself is only ~1.4 G integer ops for
+the whole domain, which should not cost 200 ms.
+
+**Two long-standing assumptions this kills.** Diffusion
+(`module_diffusion_em.F`, `diff_opt=2`/`km_opt=4`) has been the scoped "next
+phase" since the original plan — it is **6.5%**, so porting it perfectly
+would buy less than the acoustic step did, which was nothing. And Thompson
+microphysics, which has never been considered, is **19%** and entirely on
+the CPU — three times diffusion.
+
+Reproduce with: `-DBENCH` in `ARCH_LOCAL`, plus temporarily un-stubbing the
+timers in `dyn_em/module_first_rk_step_part{1,2}.F` (upstream hardcodes
+`#define BENCH_START(A)` to *nothing* at the top of both files, so every
+physics and diffusion timer there is dead even in a `-DBENCH` build — that
+is why radiation and diffusion look like 0). Case: `/mnt/nvme/hk471_bench`.
+Two aggregation traps: `solve_em`'s own timers are zeroed per call so they
+must be **summed**, while any timer you add to part1/part2 as `SAVE` is
+cumulative and must be **maxed**, not summed — summing a running total gave
+a first reading of 636% of `solve_em`.
+
 ## Top-level priority
 
 Profiling the real Hong Kong case (`/mnt/nvme/wrf_hk_gpu_d01`, `radt=1`,
@@ -16,11 +71,18 @@ stable — see "Prior work" below).
 chained, integrated into their WRF drivers, and verified against the
 CPU-only build at the field level. 10-minute real case: **312.0s CPU 1-rank
 → 103.7s GPU 1-rank (3.0x)**, and the 4-rank GPU build (57.6s) matches the
-8-rank CPU build (57.3s). With radiation off the critical path, the next
-lever is whatever now dominates — profile before choosing; the scoped-but-
-never-started `dyn_em` diffusion port (`module_diffusion_em.F`,
-`diff_opt=2`/`km_opt=4`) is the obvious candidate but is no longer
-obviously the right one without fresh numbers.
+8-rank CPU build (57.3s).
+
+**Radiation is nevertheless still 41% of the timestep**, and "profile before
+choosing the next lever" has now actually been done — see "Where the time
+actually goes" at the top of this file. The short version: radiation is
+still first at 41%, but 17.7% of the whole step is **two McICA kernels that
+are already on the GPU and are simply slow** (211 ms and 98 ms per launch,
+10x the next kernel). Tuning those is the highest-value work available and
+needs no new port. Thompson microphysics is second at 19% and untouched.
+Diffusion — the phase that has been scoped as "next" since the original plan
+— is **6.5%**, i.e. smaller than the acoustic step, which measured as worth
+nothing. Do not start it.
 
 Full architectural analysis, phase plan, and rationale live in `plan.md` at
 the repo root — read that for the "why" behind the sequencing. This file is
@@ -1242,13 +1304,18 @@ OpenACC at all. The mitigation is the sizing above, not error handling.
 
 **Device portability.** Runtime sizing was already device-independent
 (`acc_get_property` + a measured ranks-per-device count; verified from 2GB
-to 80GB). The *build* was not: `-gpu=cc120` meant the executable only
-loaded on Blackwell. Now **`-gpu=ccall`** in both `configure.wrf` and the
-tracked `arch/configure_new.defaults`, so one binary carries device code
-for **sm_75 through sm_121** — 12 architectures, Turing through Blackwell
-(`cuobjdump --list-elf main/wrf.exe` to check). Costs binary size (114MB)
-and compile time; measured runtime cost is nil (single domain, 4 ranks:
-57.6s → 55.6s, inside run-to-run noise).
+to 80GB). The *build* is a separate question, controlled by `WRF_GPU_ARCH`
+in `configure.wrf` and the tracked `arch/configure.defaults`.
+
+`WRF_GPU_ARCH=ccall` carries device code for **sm_75 through sm_121** — 12
+architectures, Turing through Blackwell (`cuobjdump --list-elf main/wrf.exe`
+to check). It costs binary size (114MB) and a lot of compile time; measured
+*runtime* cost is nil (single domain, 4 ranks: 57.6s → 55.6s, inside
+run-to-run noise). **`ccnative` is now the default** because build time
+dominates day-to-day work here — see the build methodology section. The
+trade is explicit and one-directional: a `ccnative` binary silently will not
+start on any other GPU, so set `WRF_GPU_ARCH=ccall` before sharing one or
+quoting numbers from one.
 
 Two device assumptions remain, documented rather than removed:
 - `acc_device_nvidia` is hardcoded in 5 places — NVIDIA-only.
@@ -1355,10 +1422,25 @@ CUDA Fortran port" and go directly to a real OpenACC port of the reference
   above.
 - **Memory**: the box has 62GB RAM. Builds normally use ~1-3GB and finish in
   2-3 minutes. If a build hangs and system memory drops toward zero with
-  heavy swapping, something has gone wrong (e.g., a duplicate/stray build or
-  WRF run left running) — check `free -h` and `pgrep -af "wrf.exe|nvfortran|
-  mpifort|make -r"`, and `pkill -9` stale processes before retrying. This
-  happened once this session and was unrelated to any code change.
+  heavy swapping, something has gone wrong — check `free -h` and
+  `pgrep -af "wrf.exe|nvfortran|mpifort|make -r"`, and `pkill -9` stale
+  processes before retrying.
+- **`/tmp` is a 32GB tmpfs on this box, so anything written there is RAM —
+  and killed nvfortran runs leak ~395MB apiece into it.** This is the actual
+  cause of the memory-exhaustion failure mode above, and it compounds:
+  interrupting a `-j 12` build strands up to a dozen `.ilm` intermediates,
+  none of which anything ever cleans up. After a few killed builds
+  `/tmp/nvfortran*` had grown to **2418 files / 14GB of resident RAM**, and
+  the next build was OOM-killed by the harness with no obvious cause.
+  Two habits prevent it:
+  ```
+  ls /tmp/nvfortran* | wc -l          # after any interrupted build
+  pgrep -c nvfortran                  # 0 => every one of them is an orphan
+  rm -f /tmp/nvfortran*
+  ```
+  and, better, build with the compiler's scratch on real disk:
+  `export TMPDIR=/mnt/nvme/tmp_build`. Do that whenever a build may be
+  interrupted. `du -sh /tmp/*` is the one-line diagnosis.
 
 ## Build/verify methodology (established and repeatedly used)
 
@@ -1383,22 +1465,30 @@ For each new `_gpu` subroutine ported:
    "Two v4.7.1 build traps" below. Both traps surface only at link time,
    and neither names the real cause.
 
-   **For iteration, add `export WRF_GPU_ARCH=ccnative`** — a fourth line,
-   and the single biggest build-time saving available here. The default,
-   `ccall`, generates device code for all 12 compute capabilities this
-   NVHPC supports, and that is most of the cost of the two radiation
-   files. Measured, same machine, same file:
+   **`WRF_GPU_ARCH` defaults to `ccnative`** — device code for this
+   machine's GPU only. That is the single biggest build-time saving here,
+   because generating all 12 compute capabilities is most of the cost of
+   the two radiation files. Measured, same machine, same file:
 
    | file | `ccall` | `ccnative` |
    |---|---|---|
    | `module_ra_rrtmg_lw.f90` | 118.1 s | 46.9 s |
    | `module_ra_rrtmg_sw.f90` | 82.1 s | 31.8 s |
 
-   ~2.5x each, about two minutes off every radiation rebuild. Details and
-   the correctness caveats are in the `arch/configure.defaults` stanza;
-   the short version is that it changes build time and not results, but
-   the binary then runs *only* on this machine's GPU, so do a final
-   default-`ccall` build before publishing numbers or sharing a binary.
+   ~2.5x each, about two minutes off every radiation rebuild.
+
+   **The cost of that default is that the binary runs ONLY on this
+   machine's GPU** — anywhere else it dies at launch with "no kernel image
+   is available for execution on the device". Before sharing a binary or
+   publishing numbers, rebuild portable:
+
+   ```
+   export WRF_GPU_ARCH=ccall     # sm_75 .. sm_121
+   ```
+
+   The switch changes build time and not results, so a `ccnative`
+   verification run is still valid. Details in the
+   `arch/configure.defaults` stanza.
 
    Note `-gpu=native` is **not** a valid NVHPC keyword (the spelling is
    `ccnative`); passing it fails with an unhelpful wall of valid keywords.
@@ -1853,9 +1943,35 @@ fail ("attempt to read past end of file").
   (tracked, committed — remember the `-Kieee` fix if regenerating
   `configure.wrf` from scratch via `./configure`, since the shipped template
   is missing it and it was only hand-added to the live `configure.wrf`).
-- Real case to test against: `/mnt/nvme/wrf_hk_gpu_d01` (126×126 domain,
-  6.25km, 65 vertical layers, Hong Kong, March 2025 case). `namelist.input`
-  there should be left at `run_minutes = 10` between sessions.
+- **Real case to test against: `/mnt/nvme/hk471`** — the current, clean one.
+  Hong Kong, March 2025; d01 126×126 @6.25km, d02 126×126 @1.25km, 65
+  vertical levels. Built as:
+  - every table a symlink into this tree's own `run/` — checked, and every
+    table the case ships is byte-identical to v4.7.1's, so there is no
+    version skew to worry about;
+  - `wrfinput_d0*`, `wrfbdy_d01`, `wrffdda_d01` symlinked straight from
+    `/mnt/DC550/HONGKONG/domain_16`. **There is no WPS/`real.exe` step** —
+    the case is already built, so do not regenerate it from `met_em`;
+  - `solar_iofields.txt` and `namelist.input` copied from the same place.
+  `namelist.input.pristine` is the user's file verbatim; the active
+  `namelist.input` differs from it *only* in run length and `max_dom`.
+  **Cap it at two domains** — d03 at 250 m makes the computational load too
+  large for an iteration case.
+  Verified: 2 simulated minutes, 4 ranks, both domains, `SUCCESS COMPLETE
+  WRF`, the user's namelist otherwise untouched. All four namelist variables
+  that had to be worked around on V3.9.1.1 (`dzbot`, `use_wudapt_lcz`,
+  `solar_diagnostics`, `iofields_filename`) are present in v4.7.1's Registry
+  — `solar_diagnostics` lives in `Registry/registry.solar_fields` and
+  `iofields_filename` in `Registry/registry.io_boilerplate`, not in
+  `Registry.EM_COMMON`, so grep all of `Registry/` before concluding one is
+  missing.
+  `/mnt/nvme/hk471_bench` is the same case cut to d01 only at fixed `dt=25`
+  for profiling, so a breakdown is not blended across two grids.
+  Note `wrffdda_d01` is 9.5 GB on spinning disk: the first run over it is
+  cold-cache and must never be used for a timing comparison.
+- Older scratch dirs (`/mnt/nvme/wrf_hk_gpu_d01`, `wrf_hk_cpu_d01`,
+  `wrf_hk_nest_*`, `wrf471_gpu`, `wrf471_cpu`) are from the V3.9.1.1 line and
+  from ad-hoc single-step tests; prefer `hk471` for anything new.
 - Standalone test harnesses and dumps: `/tmp/rrtmg_integrate/` (not in git,
   ephemeral but worth preserving within a machine/session for regression
   re-checks).
