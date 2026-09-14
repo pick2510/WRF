@@ -14554,7 +14554,7 @@
       MODULE rrtmg_sw_gpu_chunk
 
       use parkind, only : im => kind_im, rb => kind_rb
-      use parrrsw, only : nbndsw, ngptsw, mxmol
+      use parrrsw, only : nbndsw, ngptsw, mxmol, naerec
 
       IMPLICIT NONE
 
@@ -14579,6 +14579,10 @@
 ! rtrnmc's up/down sweep does. (This comment previously said "roughly 5x",
 ! which was a bad arithmetic shortcut and never what the code computed.)
 !
+! The second-to-last term is the column-contiguous host staging buffers
+! gpu_sw_stage / _cld / _aer / _eca, resident for the whole RRTMG_SWRAD
+! call alongside the batch arrays they feed.
+!
 ! The last term does not scale with nlayers: mcica_subcol_sw_gpu's
 ! seedsv(ngptsw,ncol,4), the per-subcolumn RNG state its first kernel
 ! records for its second, live only for the duration of that one call.
@@ -14595,7 +14599,8 @@
 
       nbytes = 4_8 * nlay8 * (56_8*INT(ngptsw,8) + 13_8*INT(nbndsw,8) &
                                + INT(mxmol,8) + 80_8) &
-             + 4_8 * 4_8 * INT(ngptsw,8)
+             + 4_8 * 4_8 * INT(ngptsw,8) &
+             + 4_8 * (nlay8*17_8 + nlay8*INT(nbndsw,8)*7_8 + nlay8*INT(naerec,8))
 
       END FUNCTION rrtmg_sw_gpu_bytes_per_column
 
@@ -14776,6 +14781,18 @@ use omp_lib, only: omp_in_parallel, omp_get_num_threads
     REAL, ALLOCATABLE :: gpu_sw_coszen(:)
     REAL, ALLOCATABLE :: gpu_sw_cldfrac(:,:), gpu_sw_ciwp(:,:), gpu_sw_clwp(:,:), gpu_sw_cswp(:,:)
     REAL, ALLOCATABLE :: gpu_sw_rei(:,:), gpu_sw_rel(:,:), gpu_sw_res(:,:)
+!  Column-contiguous staging, exactly as in the LW twin (see the comment on
+!  gpu_stage in module_ra_rrtmg_lw.F): the batch arrays are ncol-major so
+!  the device kernels coalesce, which makes the host's per-column fill a
+!  strided write. Staging here and transposing on the device measured 5.4x
+!  cheaper on the LW side.
+!    gpu_sw_stage      -- the nlay-deep scalars-per-layer
+!    gpu_sw_stage_cld  -- taucld/ssacld/asmcld/fsfcld, band-major
+!    gpu_sw_stage_aer  -- tauaer/ssaaer/asmaer (nbndsw) and ecaer (naerec)
+    REAL, ALLOCATABLE :: gpu_sw_stage(:,:,:), gpu_sw_stage_cld(:,:,:,:)
+    REAL, ALLOCATABLE :: gpu_sw_stage_aer(:,:,:,:), gpu_sw_stage_eca(:,:,:)
+!  Slot order must match the transpose kernels in gpu_flush_sw_chunk.
+    INTEGER, PARAMETER :: NSTAGE_SW = 17
     REAL, ALLOCATABLE :: gpu_sw_tauc(:,:,:), gpu_sw_ssac(:,:,:)
     REAL, ALLOCATABLE :: gpu_sw_asmc(:,:,:), gpu_sw_fsfc(:,:,:)
     REAL, ALLOCATABLE :: gpu_sw_tauaer(:,:,:), gpu_sw_ssaaer(:,:,:), gpu_sw_asmaer(:,:,:)
@@ -15394,6 +15411,12 @@ CONTAINS
     ALLOCATE(gpu_sw_clwp(gpu_sw_chunksize,gpu_sw_nlay), gpu_sw_cswp(gpu_sw_chunksize,gpu_sw_nlay))
     ALLOCATE(gpu_sw_rei(gpu_sw_chunksize,gpu_sw_nlay), gpu_sw_rel(gpu_sw_chunksize,gpu_sw_nlay))
     ALLOCATE(gpu_sw_res(gpu_sw_chunksize,gpu_sw_nlay))
+    ALLOCATE(gpu_sw_stage(gpu_sw_nlay+1, NSTAGE_SW, gpu_sw_chunksize))
+    ALLOCATE(gpu_sw_stage_cld(nbndsw, gpu_sw_nlay, 4, gpu_sw_chunksize))
+    ALLOCATE(gpu_sw_stage_aer(gpu_sw_nlay, nbndsw, 3, gpu_sw_chunksize))
+    ALLOCATE(gpu_sw_stage_eca(gpu_sw_nlay, naerec, gpu_sw_chunksize))
+    gpu_sw_stage = 0.0; gpu_sw_stage_cld = 0.0
+    gpu_sw_stage_aer = 0.0; gpu_sw_stage_eca = 0.0
     ALLOCATE(gpu_sw_tauc(nbndsw,gpu_sw_chunksize,gpu_sw_nlay))
     ALLOCATE(gpu_sw_ssac(nbndsw,gpu_sw_chunksize,gpu_sw_nlay))
     ALLOCATE(gpu_sw_asmc(nbndsw,gpu_sw_chunksize,gpu_sw_nlay))
@@ -15434,7 +15457,8 @@ CONTAINS
 ! it resident for every flush in this call; a flush only "update device"s
 ! the just-filled inputs and "update host"s the results. Same design (and
 ! same reason) as gpu_flush_lw_chunk -- see the redesign note there.
-!$acc enter data copyin(gpu_sw_play, gpu_sw_plev, gpu_sw_tlay, gpu_sw_tlev, gpu_sw_tsfc) &
+!$acc enter data create(gpu_sw_stage, gpu_sw_stage_cld, gpu_sw_stage_aer, gpu_sw_stage_eca) &
+!$acc   copyin(gpu_sw_play, gpu_sw_plev, gpu_sw_tlay, gpu_sw_tlev, gpu_sw_tsfc) &
 !$acc   copyin(gpu_sw_h2ovmr, gpu_sw_o3vmr, gpu_sw_co2vmr, gpu_sw_ch4vmr, gpu_sw_n2ovmr, gpu_sw_o2vmr) &
 !$acc   copyin(gpu_sw_asdir, gpu_sw_asdif, gpu_sw_aldir, gpu_sw_aldif, gpu_sw_coszen) &
 !$acc   copyin(gpu_sw_cldfrac, gpu_sw_ciwp, gpu_sw_clwp, gpu_sw_cswp) &
@@ -16443,11 +16467,11 @@ CONTAINS
          gpu_sw_j_idx(gpu_sw_ic) = j
          gpu_sw_bad(gpu_sw_ic) = .FALSE.
          gpu_sw_coszrs(gpu_sw_ic) = coszrs
-         gpu_sw_play(gpu_sw_ic,:) = play(1,:)
-         gpu_sw_plev(gpu_sw_ic,:) = plev(1,:)
-         gpu_sw_tlay(gpu_sw_ic,:) = tlay(1,:)
-         gpu_sw_tlev(gpu_sw_ic,:) = tlev(1,:)
-         gpu_sw_tsfc(gpu_sw_ic)   = tsfc(1)
+         gpu_sw_stage(1:gpu_sw_nlay  , 1,gpu_sw_ic) = play(1,1:gpu_sw_nlay)
+         gpu_sw_stage(1:gpu_sw_nlay+1, 2,gpu_sw_ic) = plev(1,1:gpu_sw_nlay+1)
+         gpu_sw_stage(1:gpu_sw_nlay  , 3,gpu_sw_ic) = tlay(1,1:gpu_sw_nlay)
+         gpu_sw_stage(1:gpu_sw_nlay+1, 4,gpu_sw_ic) = tlev(1,1:gpu_sw_nlay+1)
+         gpu_sw_tsfc(gpu_sw_ic)             = tsfc(1)
 ! Defensive sanitization, the LW port's guard applied to the SW inputs and
 ! for the same reason: a non-finite pressure reaching setcoef_sw_gpu's
 ! REAL->INTEGER table-index arithmetic is an invalid device address, not a
@@ -16478,43 +16502,43 @@ CONTAINS
          IF (.NOT. (tsfc(1) .GE. 100.0 .AND. tsfc(1) .LE. 400.0)) san_bad = .TRUE.
          IF (san_bad) THEN
             gpu_sw_bad(gpu_sw_ic) = .TRUE.
-            gpu_sw_play(gpu_sw_ic,:) = 1013.25
-            gpu_sw_plev(gpu_sw_ic,:) = 1013.25
-            gpu_sw_tlay(gpu_sw_ic,:) = 288.0
-            gpu_sw_tlev(gpu_sw_ic,:) = 288.0
-            gpu_sw_tsfc(gpu_sw_ic)   = 288.0
+            gpu_sw_stage(:,1,gpu_sw_ic) = 1013.25
+            gpu_sw_stage(:,2,gpu_sw_ic) = 1013.25
+            gpu_sw_stage(:,3,gpu_sw_ic) = 288.0
+            gpu_sw_stage(:,4,gpu_sw_ic) = 288.0
+            gpu_sw_tsfc(gpu_sw_ic)      = 288.0
             WRITE(msg,'(A,I5,A,I5,A)') &
                'WRF_GPU_RAD WARNING: non-physical p/T at i=', i, ' j=', j, &
                ' -- skipping SW update this step'
             call wrf_message(msg)
          ENDIF
          END BLOCK
-         gpu_sw_h2ovmr(gpu_sw_ic,:) = h2ovmr(1,:)
-         gpu_sw_o3vmr(gpu_sw_ic,:)  = o3vmr(1,:)
-         gpu_sw_co2vmr(gpu_sw_ic,:) = co2vmr(1,:)
-         gpu_sw_ch4vmr(gpu_sw_ic,:) = ch4vmr(1,:)
-         gpu_sw_n2ovmr(gpu_sw_ic,:) = n2ovmr(1,:)
-         gpu_sw_o2vmr(gpu_sw_ic,:)  = o2vmr(1,:)
+         gpu_sw_stage(1:gpu_sw_nlay, 5,gpu_sw_ic) = h2ovmr(1,1:gpu_sw_nlay)
+         gpu_sw_stage(1:gpu_sw_nlay, 6,gpu_sw_ic) = o3vmr(1,1:gpu_sw_nlay)
+         gpu_sw_stage(1:gpu_sw_nlay, 7,gpu_sw_ic) = co2vmr(1,1:gpu_sw_nlay)
+         gpu_sw_stage(1:gpu_sw_nlay, 8,gpu_sw_ic) = ch4vmr(1,1:gpu_sw_nlay)
+         gpu_sw_stage(1:gpu_sw_nlay, 9,gpu_sw_ic) = n2ovmr(1,1:gpu_sw_nlay)
+         gpu_sw_stage(1:gpu_sw_nlay,10,gpu_sw_ic) = o2vmr(1,1:gpu_sw_nlay)
          gpu_sw_asdir(gpu_sw_ic)    = asdir(1)
          gpu_sw_asdif(gpu_sw_ic)    = asdif(1)
          gpu_sw_aldir(gpu_sw_ic)    = aldir(1)
          gpu_sw_aldif(gpu_sw_ic)    = aldif(1)
          gpu_sw_coszen(gpu_sw_ic)   = coszen(1)
-         gpu_sw_cldfrac(gpu_sw_ic,:) = cldfrac(1,:)
-         gpu_sw_ciwp(gpu_sw_ic,:)    = ciwpth(1,:)
-         gpu_sw_clwp(gpu_sw_ic,:)    = clwpth(1,:)
-         gpu_sw_cswp(gpu_sw_ic,:)    = cswpth(1,:)
-         gpu_sw_rei(gpu_sw_ic,:)     = rei(1,:)
-         gpu_sw_rel(gpu_sw_ic,:)     = rel(1,:)
-         gpu_sw_res(gpu_sw_ic,:)     = res(1,:)
-         gpu_sw_tauc(:,gpu_sw_ic,:)  = taucld(:,1,:)
-         gpu_sw_ssac(:,gpu_sw_ic,:)  = ssacld(:,1,:)
-         gpu_sw_asmc(:,gpu_sw_ic,:)  = asmcld(:,1,:)
-         gpu_sw_fsfc(:,gpu_sw_ic,:)  = fsfcld(:,1,:)
-         gpu_sw_tauaer(gpu_sw_ic,:,:) = tauaer(1,:,:)
-         gpu_sw_ssaaer(gpu_sw_ic,:,:) = ssaaer(1,:,:)
-         gpu_sw_asmaer(gpu_sw_ic,:,:) = asmaer(1,:,:)
-         gpu_sw_ecaer(gpu_sw_ic,:,:)  = ecaer(1,:,:)
+         gpu_sw_stage(1:gpu_sw_nlay,11,gpu_sw_ic) = cldfrac(1,1:gpu_sw_nlay)
+         gpu_sw_stage(1:gpu_sw_nlay,12,gpu_sw_ic) = ciwpth(1,1:gpu_sw_nlay)
+         gpu_sw_stage(1:gpu_sw_nlay,13,gpu_sw_ic) = clwpth(1,1:gpu_sw_nlay)
+         gpu_sw_stage(1:gpu_sw_nlay,14,gpu_sw_ic) = cswpth(1,1:gpu_sw_nlay)
+         gpu_sw_stage(1:gpu_sw_nlay,15,gpu_sw_ic) = rei(1,1:gpu_sw_nlay)
+         gpu_sw_stage(1:gpu_sw_nlay,16,gpu_sw_ic) = rel(1,1:gpu_sw_nlay)
+         gpu_sw_stage(1:gpu_sw_nlay,17,gpu_sw_ic) = res(1,1:gpu_sw_nlay)
+         gpu_sw_stage_cld(1:nbndsw,1:gpu_sw_nlay,1,gpu_sw_ic) = taucld(1:nbndsw,1,1:gpu_sw_nlay)
+         gpu_sw_stage_cld(1:nbndsw,1:gpu_sw_nlay,2,gpu_sw_ic) = ssacld(1:nbndsw,1,1:gpu_sw_nlay)
+         gpu_sw_stage_cld(1:nbndsw,1:gpu_sw_nlay,3,gpu_sw_ic) = asmcld(1:nbndsw,1,1:gpu_sw_nlay)
+         gpu_sw_stage_cld(1:nbndsw,1:gpu_sw_nlay,4,gpu_sw_ic) = fsfcld(1:nbndsw,1,1:gpu_sw_nlay)
+         gpu_sw_stage_aer(1:gpu_sw_nlay,1:nbndsw,1,gpu_sw_ic) = tauaer(1,1:gpu_sw_nlay,1:nbndsw)
+         gpu_sw_stage_aer(1:gpu_sw_nlay,1:nbndsw,2,gpu_sw_ic) = ssaaer(1,1:gpu_sw_nlay,1:nbndsw)
+         gpu_sw_stage_aer(1:gpu_sw_nlay,1:nbndsw,3,gpu_sw_ic) = asmaer(1,1:gpu_sw_nlay,1:nbndsw)
+         gpu_sw_stage_eca(1:gpu_sw_nlay,1:naerec,gpu_sw_ic)   = ecaer(1,1:gpu_sw_nlay,1:naerec)
          gpu_sw_icld      = icld
          gpu_sw_inflgsw   = inflgsw
          gpu_sw_iceflgsw  = iceflgsw
@@ -16593,7 +16617,8 @@ CONTAINS
       CALL gpu_flush_sw_chunk()
    ENDIF
 
-!$acc exit data delete(gpu_sw_play, gpu_sw_plev, gpu_sw_tlay, gpu_sw_tlev, gpu_sw_tsfc) &
+!$acc exit data delete(gpu_sw_stage, gpu_sw_stage_cld, gpu_sw_stage_aer, gpu_sw_stage_eca) &
+!$acc   delete(gpu_sw_play, gpu_sw_plev, gpu_sw_tlay, gpu_sw_tlev, gpu_sw_tsfc) &
 !$acc   delete(gpu_sw_h2ovmr, gpu_sw_o3vmr, gpu_sw_co2vmr, gpu_sw_ch4vmr, gpu_sw_n2ovmr, gpu_sw_o2vmr) &
 !$acc   delete(gpu_sw_asdir, gpu_sw_asdif, gpu_sw_aldir, gpu_sw_aldif, gpu_sw_coszen) &
 !$acc   delete(gpu_sw_cldfrac, gpu_sw_ciwp, gpu_sw_clwp, gpu_sw_cswp) &
@@ -16613,6 +16638,7 @@ CONTAINS
    DEALLOCATE(gpu_sw_rei, gpu_sw_rel, gpu_sw_res)
    DEALLOCATE(gpu_sw_tauc, gpu_sw_ssac, gpu_sw_asmc, gpu_sw_fsfc)
    DEALLOCATE(gpu_sw_tauaer, gpu_sw_ssaaer, gpu_sw_asmaer, gpu_sw_ecaer)
+   DEALLOCATE(gpu_sw_stage, gpu_sw_stage_cld, gpu_sw_stage_aer, gpu_sw_stage_eca)
    DEALLOCATE(gpu_sw_swuflx, gpu_sw_swdflx, gpu_sw_swuflxc, gpu_sw_swdflxc)
    DEALLOCATE(gpu_sw_swhr, gpu_sw_swhrc)
    DEALLOCATE(gpu_sw_visdir, gpu_sw_visdif, gpu_sw_nirdir, gpu_sw_nirdif)
@@ -16653,14 +16679,129 @@ CONTAINS
 ! stale-but-valid) staging defaults and are simply not unpacked below.
    IMPLICIT NONE
    INTEGER :: gk, gi, gj, gkk
+   INTEGER :: sk, sc, sb
 
-!$acc update device(gpu_sw_play, gpu_sw_plev, gpu_sw_tlay, gpu_sw_tlev, gpu_sw_tsfc) &
-!$acc   device(gpu_sw_h2ovmr, gpu_sw_o3vmr, gpu_sw_co2vmr, gpu_sw_ch4vmr, gpu_sw_n2ovmr, gpu_sw_o2vmr) &
-!$acc   device(gpu_sw_asdir, gpu_sw_asdif, gpu_sw_aldir, gpu_sw_aldif, gpu_sw_coszen) &
-!$acc   device(gpu_sw_cldfrac, gpu_sw_ciwp, gpu_sw_clwp, gpu_sw_cswp) &
-!$acc   device(gpu_sw_rei, gpu_sw_rel, gpu_sw_res) &
-!$acc   device(gpu_sw_tauc, gpu_sw_ssac, gpu_sw_asmc, gpu_sw_fsfc) &
-!$acc   device(gpu_sw_tauaer, gpu_sw_ssaaer, gpu_sw_asmaer, gpu_sw_ecaer)
+! Upload the column-contiguous staging buffers and transpose them into the
+! (ncol, ...) batch arrays on the device -- same bytes over PCIe as the 27
+! separate updates this replaces, but the host-side fill that produced them
+! is far cheaper. See gpu_sw_stage's declaration, and the LW twin.
+!$acc update device(gpu_sw_stage, gpu_sw_stage_cld, gpu_sw_stage_aer, gpu_sw_stage_eca) &
+!$acc   device(gpu_sw_tsfc, gpu_sw_asdir, gpu_sw_asdif, gpu_sw_aldir, gpu_sw_aldif) &
+!$acc   device(gpu_sw_coszen)
+
+!$acc parallel loop gang vector collapse(2) &
+!$acc   present(gpu_sw_stage, gpu_sw_play, gpu_sw_plev, gpu_sw_tlay, gpu_sw_tlev) &
+!$acc   present(gpu_sw_h2ovmr, gpu_sw_o3vmr, gpu_sw_co2vmr, gpu_sw_ch4vmr) &
+!$acc   present(gpu_sw_n2ovmr, gpu_sw_o2vmr, gpu_sw_cldfrac, gpu_sw_ciwp) &
+!$acc   present(gpu_sw_clwp, gpu_sw_cswp, gpu_sw_rei, gpu_sw_rel, gpu_sw_res)
+   DO sk = 1, gpu_sw_nlay
+      DO sc = 1, gpu_sw_chunksize
+         gpu_sw_play(sc,sk)    = gpu_sw_stage(sk, 1,sc)
+         gpu_sw_plev(sc,sk)    = gpu_sw_stage(sk, 2,sc)
+         gpu_sw_tlay(sc,sk)    = gpu_sw_stage(sk, 3,sc)
+         gpu_sw_tlev(sc,sk)    = gpu_sw_stage(sk, 4,sc)
+         gpu_sw_h2ovmr(sc,sk)  = gpu_sw_stage(sk, 5,sc)
+         gpu_sw_o3vmr(sc,sk)   = gpu_sw_stage(sk, 6,sc)
+         gpu_sw_co2vmr(sc,sk)  = gpu_sw_stage(sk, 7,sc)
+         gpu_sw_ch4vmr(sc,sk)  = gpu_sw_stage(sk, 8,sc)
+         gpu_sw_n2ovmr(sc,sk)  = gpu_sw_stage(sk, 9,sc)
+         gpu_sw_o2vmr(sc,sk)   = gpu_sw_stage(sk,10,sc)
+         gpu_sw_cldfrac(sc,sk) = gpu_sw_stage(sk,11,sc)
+         gpu_sw_ciwp(sc,sk)    = gpu_sw_stage(sk,12,sc)
+         gpu_sw_clwp(sc,sk)    = gpu_sw_stage(sk,13,sc)
+         gpu_sw_cswp(sc,sk)    = gpu_sw_stage(sk,14,sc)
+         gpu_sw_rei(sc,sk)     = gpu_sw_stage(sk,15,sc)
+         gpu_sw_rel(sc,sk)     = gpu_sw_stage(sk,16,sc)
+         gpu_sw_res(sc,sk)     = gpu_sw_stage(sk,17,sc)
+      ENDDO
+   ENDDO
+
+!  plev/tlev carry the extra top interface.
+!$acc parallel loop gang vector present(gpu_sw_stage, gpu_sw_plev, gpu_sw_tlev)
+   DO sc = 1, gpu_sw_chunksize
+      gpu_sw_plev(sc,gpu_sw_nlay+1) = gpu_sw_stage(gpu_sw_nlay+1,2,sc)
+      gpu_sw_tlev(sc,gpu_sw_nlay+1) = gpu_sw_stage(gpu_sw_nlay+1,4,sc)
+   ENDDO
+
+!$acc parallel loop gang vector collapse(3) &
+!$acc   present(gpu_sw_stage_cld, gpu_sw_tauc, gpu_sw_ssac, gpu_sw_asmc, gpu_sw_fsfc) &
+!$acc   present(gpu_sw_stage_aer, gpu_sw_tauaer, gpu_sw_ssaaer, gpu_sw_asmaer)
+   DO sb = 1, nbndsw
+      DO sk = 1, gpu_sw_nlay
+         DO sc = 1, gpu_sw_chunksize
+            gpu_sw_tauc(sb,sc,sk)   = gpu_sw_stage_cld(sb,sk,1,sc)
+            gpu_sw_ssac(sb,sc,sk)   = gpu_sw_stage_cld(sb,sk,2,sc)
+            gpu_sw_asmc(sb,sc,sk)   = gpu_sw_stage_cld(sb,sk,3,sc)
+            gpu_sw_fsfc(sb,sc,sk)   = gpu_sw_stage_cld(sb,sk,4,sc)
+            gpu_sw_tauaer(sc,sk,sb) = gpu_sw_stage_aer(sk,sb,1,sc)
+            gpu_sw_ssaaer(sc,sk,sb) = gpu_sw_stage_aer(sk,sb,2,sc)
+            gpu_sw_asmaer(sc,sk,sb) = gpu_sw_stage_aer(sk,sb,3,sc)
+         ENDDO
+      ENDDO
+   ENDDO
+
+!  ecaer carries naerec bands, not nbndsw.
+!$acc parallel loop gang vector collapse(3) present(gpu_sw_stage_eca, gpu_sw_ecaer)
+   DO sb = 1, naerec
+      DO sk = 1, gpu_sw_nlay
+         DO sc = 1, gpu_sw_chunksize
+            gpu_sw_ecaer(sc,sk,sb) = gpu_sw_stage_eca(sk,sb,sc)
+         ENDDO
+      ENDDO
+   ENDDO
+
+#ifdef WRF_GPU_RAD_CHECK_STAGE
+!  Transpose self-check -- see the LW twin. A pure re-indexing, so any
+!  nonzero count is an indexing bug (a wrong slot, or nbndsw used where
+!  naerec belongs). Checked against the staging buffers rather than against
+!  model output, which float atomics make non-deterministic run to run.
+   BLOCK
+   INTEGER :: cb, ck, cq, nbad_t
+   nbad_t = 0
+!$acc update host(gpu_sw_play, gpu_sw_plev, gpu_sw_tlay, gpu_sw_tlev) &
+!$acc   host(gpu_sw_h2ovmr, gpu_sw_o3vmr, gpu_sw_co2vmr, gpu_sw_ch4vmr) &
+!$acc   host(gpu_sw_n2ovmr, gpu_sw_o2vmr, gpu_sw_cldfrac, gpu_sw_ciwp) &
+!$acc   host(gpu_sw_clwp, gpu_sw_cswp, gpu_sw_rei, gpu_sw_rel, gpu_sw_res) &
+!$acc   host(gpu_sw_tauc, gpu_sw_ssac, gpu_sw_asmc, gpu_sw_fsfc) &
+!$acc   host(gpu_sw_tauaer, gpu_sw_ssaaer, gpu_sw_asmaer, gpu_sw_ecaer)
+   DO cb = 1, gpu_sw_chunksize
+      DO ck = 1, gpu_sw_nlay
+         IF (gpu_sw_play(cb,ck)    .ne. gpu_sw_stage(ck, 1,cb)) nbad_t = nbad_t + 1
+         IF (gpu_sw_plev(cb,ck)    .ne. gpu_sw_stage(ck, 2,cb)) nbad_t = nbad_t + 1
+         IF (gpu_sw_tlay(cb,ck)    .ne. gpu_sw_stage(ck, 3,cb)) nbad_t = nbad_t + 1
+         IF (gpu_sw_tlev(cb,ck)    .ne. gpu_sw_stage(ck, 4,cb)) nbad_t = nbad_t + 1
+         IF (gpu_sw_h2ovmr(cb,ck)  .ne. gpu_sw_stage(ck, 5,cb)) nbad_t = nbad_t + 1
+         IF (gpu_sw_o3vmr(cb,ck)   .ne. gpu_sw_stage(ck, 6,cb)) nbad_t = nbad_t + 1
+         IF (gpu_sw_co2vmr(cb,ck)  .ne. gpu_sw_stage(ck, 7,cb)) nbad_t = nbad_t + 1
+         IF (gpu_sw_ch4vmr(cb,ck)  .ne. gpu_sw_stage(ck, 8,cb)) nbad_t = nbad_t + 1
+         IF (gpu_sw_n2ovmr(cb,ck)  .ne. gpu_sw_stage(ck, 9,cb)) nbad_t = nbad_t + 1
+         IF (gpu_sw_o2vmr(cb,ck)   .ne. gpu_sw_stage(ck,10,cb)) nbad_t = nbad_t + 1
+         IF (gpu_sw_cldfrac(cb,ck) .ne. gpu_sw_stage(ck,11,cb)) nbad_t = nbad_t + 1
+         IF (gpu_sw_ciwp(cb,ck)    .ne. gpu_sw_stage(ck,12,cb)) nbad_t = nbad_t + 1
+         IF (gpu_sw_clwp(cb,ck)    .ne. gpu_sw_stage(ck,13,cb)) nbad_t = nbad_t + 1
+         IF (gpu_sw_cswp(cb,ck)    .ne. gpu_sw_stage(ck,14,cb)) nbad_t = nbad_t + 1
+         IF (gpu_sw_rei(cb,ck)     .ne. gpu_sw_stage(ck,15,cb)) nbad_t = nbad_t + 1
+         IF (gpu_sw_rel(cb,ck)     .ne. gpu_sw_stage(ck,16,cb)) nbad_t = nbad_t + 1
+         IF (gpu_sw_res(cb,ck)     .ne. gpu_sw_stage(ck,17,cb)) nbad_t = nbad_t + 1
+         DO cq = 1, nbndsw
+            IF (gpu_sw_tauc(cq,cb,ck)   .ne. gpu_sw_stage_cld(cq,ck,1,cb)) nbad_t = nbad_t + 1
+            IF (gpu_sw_ssac(cq,cb,ck)   .ne. gpu_sw_stage_cld(cq,ck,2,cb)) nbad_t = nbad_t + 1
+            IF (gpu_sw_asmc(cq,cb,ck)   .ne. gpu_sw_stage_cld(cq,ck,3,cb)) nbad_t = nbad_t + 1
+            IF (gpu_sw_fsfc(cq,cb,ck)   .ne. gpu_sw_stage_cld(cq,ck,4,cb)) nbad_t = nbad_t + 1
+            IF (gpu_sw_tauaer(cb,ck,cq) .ne. gpu_sw_stage_aer(ck,cq,1,cb)) nbad_t = nbad_t + 1
+            IF (gpu_sw_ssaaer(cb,ck,cq) .ne. gpu_sw_stage_aer(ck,cq,2,cb)) nbad_t = nbad_t + 1
+            IF (gpu_sw_asmaer(cb,ck,cq) .ne. gpu_sw_stage_aer(ck,cq,3,cb)) nbad_t = nbad_t + 1
+         ENDDO
+         DO cq = 1, naerec
+            IF (gpu_sw_ecaer(cb,ck,cq) .ne. gpu_sw_stage_eca(ck,cq,cb)) nbad_t = nbad_t + 1
+         ENDDO
+      ENDDO
+      IF (gpu_sw_plev(cb,gpu_sw_nlay+1) .ne. gpu_sw_stage(gpu_sw_nlay+1,2,cb)) nbad_t = nbad_t + 1
+      IF (gpu_sw_tlev(cb,gpu_sw_nlay+1) .ne. gpu_sw_stage(gpu_sw_nlay+1,4,cb)) nbad_t = nbad_t + 1
+   ENDDO
+   write(0,*)'HP sw_transpose_mismatches= ',nbad_t
+   END BLOCK
+#endif
 
    CALL rrtmg_sw_gpu_chain_driver(gpu_sw_chunksize, gpu_sw_nlay, gpu_sw_icld, gpu_sw_iaer, &
              irng, permuteseed, &

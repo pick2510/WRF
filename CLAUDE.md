@@ -42,11 +42,53 @@ cold first pair read 21.15 s; the usual trap, and for once it did not
 change the conclusion.)
 
 With McICA gone the largest remaining radiation kernel is
-`cldprmc_sw_gpu` at 0.33 s, and radiation as a whole is no longer the
-first item in the step. **Re-profile before choosing the next lever** —
-the table at the top of this section is now stale in its percentages, and
-Thompson microphysics (20.5 s, CPU, untouched) is almost certainly first
-now.
+`cldprmc_sw_gpu` at 0.33 s. The re-profile that followed is below.
+
+## The re-profile after McICA, and where radiation's time actually was
+
+Same `-DBENCH` method, same case, on the post-McICA build. `solve_em`
+87.0 s, 92.3% accounted:
+
+| phase | s | % | on |
+|---|---|---|---|
+| `rad_driver` | 26.4 | 30.4% | GPU **+ CPU** |
+| `micro_driver` (Thompson) | **21.0** | **24.1%** | CPU |
+| `dyn_em` advection | 9.3 | 10.7% | GPU |
+| `dyn_em` acoustic | 7.9 | 9.1% | GPU |
+| diffusion + TKE (`hor_diff` 5.3) | 6.6 | 7.6% | CPU |
+| `pbl_driver` | 4.5 | 5.1% | CPU |
+
+**Radiation was still first, but only 11.4 s of its 26.4 s was GPU work**
+(7.9 s kernels + 3.4 s transfers in the flush routines). ~15 s was host
+code *inside* the already-ported drivers: the `#ifdef WRF_GPU_RAD` path
+replaced only the two innermost per-column calls, so all of WRF's original
+per-column setup still runs serially for every one of the 15,625 columns,
+twice per radiation call.
+
+Splitting that host time by phase is what made the next step obvious, and
+it was **not** what "port the host-side setup" would suggest:
+
+| phase | LW s | SW s | sum |
+|---|---|---|---|
+| column extract + MP options | 0.36 | 0.38 | 0.74 |
+| model-top buffer + ozone (`inirad`) | 0.85 | 0.64 | 1.49 |
+| cloud properties (`relcalc`/`reicalc`) | 0.25 | 0.30 | 0.55 |
+| aerosols | 0.05 | 0.15 | 0.19 |
+| **copy into the batch arrays** | **2.46** | **5.05** | **7.51** |
+| flush unpack | 0.09 | 0.10 | 0.19 |
+
+The per-column *physics* is 2.97 s. **72% of the host time was a memcpy.**
+Porting the physics would have targeted the smaller half and left the real
+cost untouched. (The unpack loop was expected to be the other big item and
+is not — it moves 5 arrays at stride ~130 into `rthratenlw(i,k,j)`, against
+accum's 23 arrays at stride ~5000.)
+
+See "Staging the RRTMG batch arrays" below for the fix. Afterwards
+`rad_driver` is ~21 s and **Thompson microphysics at 21.0 s, entirely on
+the CPU and never touched, is the largest single item in the model.** It
+is also a much bigger project than anything since the original RRTMG port:
+a full greenfield port of a large scheme with lookup tables and iterative
+solvers. Re-profile before starting it.
 
 **Two long-standing assumptions this kills.** Diffusion
 (`module_diffusion_em.F`, `diff_opt=2`/`km_opt=4`) has been the scoped "next
@@ -64,6 +106,76 @@ Two aggregation traps: `solve_em`'s own timers are zeroed per call so they
 must be **summed**, while any timer you add to part1/part2 as `SAVE` is
 cumulative and must be **maxed**, not summed — summing a running total gave
 a first reading of 636% of `solve_em`.
+
+## Staging the RRTMG batch arrays (the layout fix)
+
+The batch arrays `gpu_play(ncol, nlay)` etc. are ncol-major because that is
+what makes the device kernels coalesce — it is the layout the whole RRTMG
+port rests on. But the host fills them one column at a time, so
+`gpu_play(ic,:) = play(1,:)` writes nlay elements at stride `gpu_chunksize`
+(~5000), for 23 arrays (LW) / 27 (SW), for every one of 15,625 columns.
+**The layout that makes the kernels fast is exactly what makes the host
+fill slow.**
+
+Measured directly before writing any fix, by adding contiguous writes into
+a `(nlay, nvar, ncol)` twin *alongside* the real strided ones (results
+unaffected — nothing read the twin — so the delta is the whole signal):
+
+| 23 writes per column, LW | s |
+|---|---|
+| strided, into `(ncol, nlay)` | 2.46 |
+| contiguous, into `(nlay, …, ncol)` | **0.46** |
+
+5.4x. Note neither is bandwidth-bound: 0.93 GB in 0.46 s is ~2 GB/s, so
+even the fast path is loop-overhead-bound on 65-element copies.
+
+**The fix is a transpose, not a port.** The host stages into
+`gpu_stage(k, var, ic)` (contiguous per column) and the transpose into the
+ncol-major batch arrays happens on the **device**, at the top of
+`gpu_flush_{lw,sw}_chunk`, where it is a coalesced copy costing
+microseconds. One `!$acc update device` of the staging buffers replaces the
+23/27 separate updates and moves the same bytes. The chain drivers'
+interfaces are untouched.
+
+SW needs three staging buffers because its arrays have three shapes:
+`gpu_sw_stage` (layer-deep), `gpu_sw_stage_cld` (`taucld`/`ssacld`/
+`asmcld`/`fsfcld`, **band-major** `(nbndsw, ncol, nlay)`, unlike LW's), and
+`gpu_sw_stage_aer` + `_eca` — the last separate because **`ecaer` carries
+`naerec`=6 bands, not `nbndsw`=14**. Folding it into the band loop would
+have written 14 bands' worth of indices into a 6-band array. Same family as
+the `nlayers`-vs-`nlayers+1` split on `plev`/`tlev`, which also gets its own
+kernel in both schemes.
+
+| | before | after |
+|---|---|---|
+| LW accum | 2.46 s | 0.48 s |
+| SW accum | 5.05 s | 1.20 s |
+| **total** | **7.51 s** | **1.67 s** |
+
+Wall clock, four alternating pairs, 1 rank: 93.05 s -> 87.70 s, **mean
+5.36 s, stdev 0.34, sem 0.19 over the three warm pairs (1.061x)**. The
+cold first pair read 5.93 s.
+
+**Verification: `WRF_GPU_RAD_CHECK_STAGE`.** A transpose does no
+arithmetic, so the scattered batch arrays must equal the staging buffers
+element-for-element. Building with that macro adds a self-check to each
+flush that counts mismatches over every element of every staged array,
+including the `nlayers+1` boundary and `ecaer`'s band count. It reports
+**0 over 47 LW and 96 SW flushes**. Run it after any rebase that touches
+the slot numbering — it is the cheap guard against exactly the silent
+index error this restructuring risks.
+
+**Do not try to verify this with a `wrfout` diff.** The build is not
+run-to-run reproducible (float atomics, see above), so an output diff
+cannot distinguish a correct transpose from a broken one. Check the
+invariant instead.
+
+**A confounder worth recognising: the chunk size *is* the stride.** The
+first LW measurement looked like a 5x win because it ran with
+`WRF_GPU_RAD_CHUNK=2000` against a baseline at the default 5385 — a smaller
+chunk makes the strided writes faster for free. Untouched SW "improved"
+from 5.05 to 4.25 s in the same run, which is what exposed it. Never
+compare accum timings across different chunk sizes.
 
 ## McICA: 66x, and what was actually wrong with it
 
@@ -201,13 +313,15 @@ simply slow (211 ms and 98 ms per launch, 10x the next kernel). **That has
 since been fixed — 66x, 18.57 s off a 111 s run, 1.20x end-to-end** — see
 "McICA: 66x, and what was actually wrong with it".
 
-**The next lever is therefore unmeasured.** Thompson microphysics was
-second at 20.5 s / 19% and is entirely on the CPU, so it is very likely
-first now, but re-run the `-DBENCH` breakdown before committing to it
-rather than inheriting a percentage from a profile that no longer
-describes this build. Diffusion — the phase that has been scoped as "next"
-since the original plan — is **6.5%**, i.e. smaller than the acoustic step,
-which measured as worth nothing. Do not start it.
+**The next lever has since been measured twice** — see "The re-profile
+after McICA" and "Staging the RRTMG batch arrays". The short version:
+radiation's remaining time was mostly host-side, 72% of that was a strided
+memcpy rather than physics, and fixing the layout took another 5.4 s out.
+**Thompson microphysics (21.0 s, 24%, entirely CPU, never touched) is now
+the largest single item in the model** — but it is a full greenfield port,
+not a tuning pass, so re-profile before starting. Diffusion — the phase
+scoped as "next" since the original plan — is **7.6%**, i.e. smaller than
+the acoustic step, which measured as worth nothing. Do not start it.
 
 Full architectural analysis, phase plan, and rationale live in `plan.md` at
 the repo root — read that for the "why" behind the sequencing. This file is
