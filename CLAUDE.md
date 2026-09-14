@@ -155,14 +155,43 @@ restart both builds for exactly one fixed-`dt` step. Results:
   The residual is confined to optically thick cloud and scales with the
   overcast-layer count.
 
-The mechanism is *consistent with* `reftra_sw`'s `zwo >= zwcrit`
-(0.9999995) conservative-scattering branch flipping on ulp-level
-host-vs-device differences — water cloud in the visible sits essentially on
-that threshold, and `-Kieee` constrains reassociation but not FMA
-contraction. That is a discontinuity in RRTMG's own algorithm, where neither
-side is more correct than the other. **This is a plausible mechanism, not a
-verified one** — it was not proven by instrumenting `zwo`. What *is*
-established is the bound and the confinement to cloudy columns.
+**That residual is NOT floating-point association order.** This was tested,
+and the first mechanism proposed for it was wrong.
+
+`rrtmg_{lw,sw}_gpu_chunksize` honours `WRF_GPU_RAD_CHUNK` from the
+environment and logs the chunk it settled on. Forcing the chunk is the only
+clean way to vary the GPU path's summation order while holding binary,
+algorithm and inputs fixed. Defaults on this case are LW 1281 and SW 260
+columns of a 3969-column tile (memory-limited, not tile-limited). Forcing
+both to 97 — 13x for LW, 2.7x for SW — against the same cloudy restart:
+
+| comparison | max rel | cols > 1e-5 | cols 1e-6..1e-5 |
+|---|---|---|---|
+| GPU chunk 1281/260 vs GPU chunk 97 | 1.1e-6 | **0** | **0** |
+| GPU vs CPU | 1.0e-4 | 10 | 77 |
+
+Association order moves nothing and produces no outliers at all. So the
+tail is specific to host-vs-device arithmetic, and the original story —
+`reftra_sw`'s `zwo >= zwcrit` (0.9999995) conservative-scattering branch
+being flipped by ulp-level noise — **does not survive**: a 13x chunk change
+perturbs at the same ulp level and flips nothing. It was recorded here as
+plausible-but-unverified and is now disproven; it is kept only so it is not
+proposed again.
+
+Still unproven, and the remaining candidate: host and device differ in more
+than association. `-Kieee` constrains reassociation, division and sqrt, but
+not FMA contraction and not the *implementations* of transcendentals. The
+two-stream solver is dense in `exp`, and device `exp` is not host `exp` to
+the last ulp. Changing the chunk cannot change which implementation runs,
+which is exactly why it moves nothing while host-vs-device does. That fits
+every observation (SW-cloudy only; LW and clear-sky at the float32 storage
+floor; a handful of columns rather than all 5001 cloudy ones) but has not
+been demonstrated. Demonstrating it means dumping intermediates from
+`reftra_sw`/`spcvmc_sw` for one of the 10 columns on each side.
+
+The bound is unchanged and is the part that matters for using this: <= 1e-4
+relative, 0.04 W/m^2 on 404 W/m^2, 10 of 15625 columns, all cloudy, domain
+means agreeing to 1e-5.
 
 **Nests — all three domains, natively.** 2 simulated minutes, 4 ranks,
 `max_dom=3` (d01 126x126 @6.25km, d02 126x126 @1.25km, d03 121x121 @250m,
@@ -190,13 +219,13 @@ calls, so its 125 steps contain about two radiation calls and the run is
 dominated by CPU dynamics that this line does not port. The nested speedup
 is bounded by `dyn_em`, not by radiation.
 
-Control run: GPU at 4 ranks vs GPU at 2 ranks, same restart, agrees to
-1.4e-6 — so the GPU path is decomposition-stable and those 10 columns are a
-real GPU-vs-CPU difference, not chunk-boundary noise. (Note this control
-came back *negative*: it was expected to reproduce the outliers via changed
-chunk boundaries and did not. Do not reuse it as the McICA perturbation
-control; the one that works is described under "Field-level verification"
-below.)
+Superseded control, recorded so it is not repeated: GPU at 4 ranks vs GPU
+at 2 ranks agreed to 1.4e-6. That is true but was the wrong thing to
+conclude from — rank count only reaches the chunk indirectly (via
+`ranks_per_device`), and the chunk is then clamped by host memory, so two
+rank counts can land on similar chunks and the "control" perturbs almost
+nothing. Force `WRF_GPU_RAD_CHUNK` instead; that is the control that has
+known perturbation size.
 
 ### RRTMG-LW — fully ported and verified (module_ra_rrtmg_lw.F)
 All behind `#ifdef WRF_GPU_RAD`, all additive (original CPU code untouched):

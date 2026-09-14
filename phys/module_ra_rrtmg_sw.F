@@ -14567,6 +14567,10 @@
       INTEGER(kind=8) :: free_bytes, bytes_per_col, host_bytes
       INTEGER(kind=im) :: host_chunk
       CHARACTER(len=160) :: chunkmsg
+!  Chunk override + one-time report; see the block below.
+      CHARACTER(len=32) :: chunkenv
+      INTEGER :: envstat, envchunk
+      LOGICAL, SAVE :: chunk_reported = .FALSE.
       REAL(kind=rb), PARAMETER :: safety_fraction = 0.5_rb
 
       devnum = acc_get_device_num(acc_device_nvidia)
@@ -14594,6 +14598,37 @@
 
       IF (ncol_chunk .gt. max_ncol) ncol_chunk = max_ncol
       IF (ncol_chunk .lt. 1) ncol_chunk = 1
+
+!  WRF_GPU_RAD_CHUNK forces the chunk size. This is a verification
+!  facility, not a tuning knob -- leave it unset for real runs, where the
+!  memory-derived size above is what you want.
+!
+!  It exists because it is the only way to vary this path's floating-point
+!  association order while holding the binary, the algorithm and the
+!  inputs fixed, which is what a GPU-vs-GPU control needs. Rank count does
+!  not do it: it reaches the chunk only through ranks_per_device, the
+!  result is then clamped by host memory and by max_ncol, and two rank
+!  counts can land on similar chunks -- a control that perturbs nothing
+!  and quietly looks like a clean result.
+!
+!  Used to establish that association order is NOT the source of the
+!  residual GPU-vs-CPU difference in cloudy shortwave: forcing 1281/260
+!  down to 97 moves nothing (1.1e-6, zero outlier columns) while
+!  GPU-vs-CPU shows 1.0e-4 with 10. See CLAUDE.md.
+      CALL GET_ENVIRONMENT_VARIABLE('WRF_GPU_RAD_CHUNK', chunkenv, STATUS=envstat)
+      IF (envstat .eq. 0) THEN
+         READ(chunkenv,*,IOSTAT=envstat) envchunk
+         IF (envstat .eq. 0 .and. envchunk .ge. 1) THEN
+            ncol_chunk = MIN(envchunk, max_ncol)
+         ENDIF
+      ENDIF
+      IF (.NOT. chunk_reported) THEN
+         chunk_reported = .TRUE.
+         WRITE(chunkmsg,'(A,I0,A,I0,A)') &
+              'WRF_GPU_RAD SW chunk = ', ncol_chunk, ' columns (tile has ', &
+              max_ncol, ')'
+         CALL wrf_message(chunkmsg)
+      ENDIF
 
 ! Say something when the sizing has degenerated, rather than silently
 ! running 15000 one-column chunks. Neither case is wrong -- the pipeline is
