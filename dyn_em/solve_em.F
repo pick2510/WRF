@@ -2195,6 +2195,24 @@ BENCH_END(small_step_finish_tim)
 !</DESCRIPTION>
 
 
+#ifdef WRF_GPU_DYN
+!  rk_scalar_tend's advect_scalar_o5v3 kernels declare present() on these
+!  shared read-only inputs, and the routine is called once per species per
+!  RK substep. None of the host code from here through
+!  "ENDIF other_scalar_advance" writes any of them, so bring them onto the
+!  device once for the whole span instead of once per call.
+!
+!  NOTE: this is the advection residency only. The acoustic-step residency
+!  that V3.9.1.1 also had here is deliberately absent -- the GPU calc_p_rho
+!  / calc_coef_w / advance_* kernels are not forward-ported to v4.7.1 yet,
+!  and that block is only correct in company with them: it is followed by
+!  "!$acc update self(...)" after each call, which would overwrite correct
+!  host results with stale device values if those routines ran on the host.
+!$acc enter data copyin(grid%ru_m,grid%rv_m,grid%ww_m,grid%muts,grid%c1h, &
+!$acc& grid%c2h,grid%msfux,grid%msfuy,grid%msfvx,grid%msfvy,grid%msftx,   &
+!$acc& grid%msfty,grid%fnm,grid%fnp,grid%rdnw,grid%rdn,config_flags)
+#endif
+
        moist_scalar_advance: IF (num_3d_m >= PARAM_FIRST_SCALAR )  THEN
 
          moist_variable_loop: DO im = PARAM_FIRST_SCALAR, num_3d_m
@@ -2953,6 +2971,12 @@ BENCH_END(tracer_adv_tim)
        ENDDO scalar_variable_loop
 
      ENDIF other_scalar_advance
+
+#ifdef WRF_GPU_DYN
+!$acc exit data delete(grid%ru_m,grid%rv_m,grid%ww_m,grid%muts,grid%c1h, &
+!$acc& grid%c2h,grid%msfux,grid%msfuy,grid%msfvx,grid%msfvy,grid%msftx,  &
+!$acc& grid%msfty,grid%fnm,grid%fnp,grid%rdnw,grid%rdn,config_flags)
+#endif
 
  !  update the pressure and density at the new time level
 
