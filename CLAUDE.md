@@ -44,6 +44,47 @@ change the conclusion.)
 With McICA gone the largest remaining radiation kernel is
 `cldprmc_sw_gpu` at 0.33 s. The re-profile that followed is below.
 
+## Full GPU-vs-CPU benchmark (current numbers — quote these)
+
+Hong Kong d01, 10 model minutes, fixed `dt=25`, 24 steps, 15,625 columns,
+`/mnt/nvme/hk471_bench`. **CPU reference is the same tree with only
+`-DWRF_GPU_DYN -DWRF_GPU_RAD` removed from `ARCH_LOCAL`** and the seven
+guarded files rebuilt — same compiler, same `-O3 -acc -gpu=ccnative
+-Kieee`, so the macro is the only variable. Three passes alternating the
+two builds within each pass; first pass discarded (the CPU binary's code
+cache is cold); warm mean of passes 2-3. All 21 runs `SUCCESS COMPLETE
+WRF`.
+
+| build | ranks | wall (s) | spread | vs CPU same ranks |
+|---|---|---|---|---|
+| CPU-only | 1 | **417.35** | 3.29 | |
+| CPU-only | 2 | 217.99 | 0.23 | |
+| CPU-only | 4 | 129.34 | 0.80 | |
+| CPU-only | 8 | **77.81** | 0.11 | |
+| GPU | 1 | **87.85** | 0.62 | **4.75x** |
+| GPU | 2 | 55.92 | 0.10 | 3.90x |
+| GPU | 4 | **51.93** | 3.08 | 2.49x |
+
+- **4.75x at 1 rank** (417.4 -> 87.9 s) — the cleanest measure of the port.
+- **1.50x best-against-best**: GPU 4 ranks vs CPU 8 ranks, i.e. the port
+  now beats the best CPU configuration using half the ranks. It previously
+  only *matched* it (57.6 vs 57.3 s).
+- **8.04x** from 1-rank CPU to the best GPU configuration.
+
+**The scaling asymmetry bounds what is left.** CPU scales 5.36x from 1 to
+8 ranks; the GPU build scales only **1.69x from 1 to 4**, and essentially
+nothing from 2 to 4 (55.9 -> 51.9 s). Four ranks share one 8 GB card and
+the per-rank chunk shrinks, so the device saturates. On this hardware the
+GPU build's useful range is 1-2 ranks, and the next real gains have to come
+from the CPU-side physics that is still untouched (Thompson 24%, diffusion,
+PBL) — not from more radiation tuning.
+
+Two caveats on quoting these. The 4-rank GPU spread is 3.08 s (50.4-53.5)
+against 0.1-0.8 s everywhere else, so treat 51.9 s as approximate. And this
+is **d01 only, no nests**: nested runs are bounded by `dyn_em` rather than
+radiation and have historically shown a much smaller ratio (1.29x on the
+two-domain case), so do not quote these for the nested configuration.
+
 ## The re-profile after McICA, and where radiation's time actually was
 
 Same `-DBENCH` method, same case, on the post-McICA build. `solve_em`
@@ -299,11 +340,15 @@ total wall-clock time**. Porting RRTMG-LW and RRTMG-SW to GPU was the top
 priority, superseding the earlier `dyn_em` OpenACC port (which is done and
 stable — see "Prior work" below).
 
-**That work is now complete.** Both RRTMG-LW and RRTMG-SW are fully ported,
-chained, integrated into their WRF drivers, and verified against the
-CPU-only build at the field level. 10-minute real case: **312.0s CPU 1-rank
-→ 103.7s GPU 1-rank (3.0x)**, and the 4-rank GPU build (57.6s) matches the
-8-rank CPU build (57.3s).
+**That work is now complete**, and two rounds of kernel/layout tuning have
+followed it. Both RRTMG-LW and RRTMG-SW are fully ported, chained,
+integrated into their WRF drivers, and verified against the CPU-only build
+at the field level. Current numbers on the 10-minute d01 case: **417.4s
+CPU 1-rank → 87.9s GPU 1-rank (4.75x)**, and the 4-rank GPU build (51.9s)
+now beats the 8-rank CPU build (77.8s) by 1.50x. Full table under "Full
+GPU-vs-CPU benchmark" at the top of this file — quote those, not the older
+312.0/103.7 figures, which are from the V3.9.1.1-line case and predate the
+McICA and staging fixes.
 
 **Radiation was nevertheless still 41% of the timestep**, and "profile
 before choosing the next lever" has now actually been done — see "Where the
@@ -1393,6 +1438,11 @@ simulated, same machine, `nvfortran -O3`), `SUCCESS COMPLETE WRF` and zero
 number rather than merely beating a like-for-like rank count. `dmudt`
 agrees with the CPU-only baseline to 5 significant figures at 1, 2 and 4
 ranks (94.76674 / 94.76756 / 94.76801 vs 94.7676).
+
+**Superseded by the full sweep below** — that table is from the
+V3.9.1.1-line case and predates the McICA and staging fixes. It is kept
+only because the *sequence* (dyn alone at parity, LW worth 1.27x, SW the
+step change) is the history.
 
 ### Field-level verification — done, and the McICA control is the point
 This closes the item that had been outstanding for LW as well. Run both
