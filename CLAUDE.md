@@ -8,11 +8,13 @@ before resuming GPU-port work in this repo.
 
 Full `-DBENCH` breakdown, Hong Kong d01, 10 model minutes, fixed `dt=25`,
 24 steps, 1 rank, on the build that has GPU RRTMG **and** GPU `dyn_em`
-advection + acoustic. `solve_em` total 108.8 s:
+advection + acoustic. `solve_em` total 108.8 s. **This table predates the
+McICA fix below, which took 19.0 s out of `rad_driver`** — read the
+percentages as the state that motivated that work, not as current:
 
 | phase | s | % | on |
 |---|---|---|---|
-| `rad_driver` | **44.6** | **41%** | GPU |
+| `rad_driver` (**now ~25.6**) | **44.6** | **41%** | GPU |
 | `micro_driver` (Thompson, `mp_physics=8`) | **20.5** | **19%** | CPU |
 | `dyn_em` advection (`rk_scalar_tend`+`rk_tend`+`update_scal`) | 10.4 | 10% | GPU |
 | `dyn_em` acoustic (all 8 phases) | 9.0 | 8% | GPU |
@@ -20,27 +22,31 @@ advection + acoustic. `solve_em` total 108.8 s:
 | `pbl_driver` | 4.3 | 4% | CPU |
 | everything else (BCs, halos, `surf`, `fdda`, `phy_prep`) | 9.4 | 9% | CPU |
 
-**Radiation is still 41% even after being ported**, and the reason is one
-kernel pair. From `NVCOMPILER_ACC_TIME` on the same run (26.9 s of radiation
-GPU kernel time):
+**Radiation was 41% even after being ported, and 17.7% of the whole step
+was two McICA kernels. That has been fixed** — see "McICA: 66x, and what
+was actually wrong with it" below. The table as first measured, kept
+because the *shape* of the mistake is the reusable part:
 
-| kernel | s | launches | ms/launch |
-|---|---|---|---|
-| `mcica_subcol_lw_gpu` | **9.92** | 47 | **211** |
-| `mcica_subcol_sw_gpu` | **9.38** | 96 | **98** |
-| `inatm_cloud_gpu` | 2.13 | 94 | 22.7 |
-| `rtrnmc_gpu` | 0.98 | 47 | 20.9 |
-| everything else | < 0.8 each | | < 16 |
+| kernel | s | launches | ms/launch | after the fix |
+|---|---|---|---|---|
+| `mcica_subcol_lw_gpu` | **9.92** | 47 | **211** | **0.149 s / 3.2 ms** |
+| `mcica_subcol_sw_gpu` | **9.38** | 96 | **98** | **0.144 s / 1.5 ms** |
+| `cldprmc_sw_gpu` | — | 96 | — | 0.330 s / 3.4 ms |
+| `inatm_cloud_gpu` | 2.13 | 94 | 22.7 | unchanged |
+| `rtrnmc_gpu` | 0.98 | 47 | 20.9 | unchanged |
 
-**McICA alone is 19.3 s — 72% of all radiation GPU time and 17.7% of the
-entire timestep**, at 10x the per-launch cost of the next kernel. It is the
-largest single item in the model that is already on the GPU, so it needs
-kernel tuning rather than a port, and kissvec is bitwise integer arithmetic
-so bit-exactness is the acceptance bar (see the LW/SW McICA entries below).
-Worth checking first: the coalescing of the `cldfmc`-style
-`(ncol, ngpt, nlay)` writes, and register/local-memory pressure from the
-per-thread RNG state — the arithmetic itself is only ~1.4 G integer ops for
-the whole domain, which should not cost 200 ms.
+19.0 s came off a 108.8 s step. End-to-end on `/mnt/nvme/hk471_bench`,
+1 rank, four alternating pairs: **110.96-111.35 s before, 92.39-92.68 s
+after — 18.57 s, stdev 0.21 s over the three warm pairs, 1.20x.** (The
+cold first pair read 21.15 s; the usual trap, and for once it did not
+change the conclusion.)
+
+With McICA gone the largest remaining radiation kernel is
+`cldprmc_sw_gpu` at 0.33 s, and radiation as a whole is no longer the
+first item in the step. **Re-profile before choosing the next lever** —
+the table at the top of this section is now stale in its percentages, and
+Thompson microphysics (20.5 s, CPU, untouched) is almost certainly first
+now.
 
 **Two long-standing assumptions this kills.** Diffusion
 (`module_diffusion_em.F`, `diff_opt=2`/`km_opt=4`) has been the scoped "next
@@ -59,6 +65,120 @@ must be **summed**, while any timer you add to part1/part2 as `SAVE` is
 cumulative and must be **maxed**, not summed — summing a running total gave
 a first reading of 636% of `solve_em`.
 
+## McICA: 66x, and what was actually wrong with it
+
+Both `mcica_subcol_lw_gpu` and `mcica_subcol_sw_gpu` were "on the GPU" and
+were the two slowest kernels in the model by an order of magnitude. The
+cause was visible in one line of `-Minfo=accel` and in the array
+declarations, and neither had anything to do with the arithmetic:
+
+```
+2809, !$acc loop gang, vector(128) ! blockidx%x threadidx%x   <- ncol, and nothing else
+2825..2909, !$acc loop seq  x7                                <- subcolumns, levels, everything
+2804, Local memory used for cdf
+```
+
+1. **One parallel axis.** The kernel was `!$acc parallel loop` over `ncol`
+   alone, so a 1281-column chunk launched 11 blocks of 128 on a 30-SM card
+   — most of the GPU idle, and no warps to hide memory latency with.
+   Everything else (140 g-points x 65 levels) ran `seq` inside each thread.
+2. **Every store uncoalesced.** The outputs are
+   `cldfmcl(ngptlw, ncol, nlay)`, and the *thread* index was the middle
+   dimension: adjacent lanes wrote 140 floats apart, so each 4 useful bytes
+   cost a 32-byte transaction. ~233 MB of real writes became ~7.5 GB of
+   traffic, issued by 11 blocks. That is the 211 ms.
+
+**The fix is a two-kernel split.** kissvec is a strictly sequential chain
+per column, consumed subcolumn-major, and that chain was the only thing
+coupling the subcolumns:
+
+- `mcica_subcol_{lw,sw}_seeds_gpu` — one thread per column, walks the chain
+  once and records the 4-word seed state at the start of every subcolumn
+  into `seedsv(ngpt, ncol, 4)`. Pure integer work, no output traffic; it
+  costs 9.4 ms (LW) / 11.2 ms (SW) over the whole run, i.e. nothing.
+- the main kernel — `gang vector collapse(2)` over (column, subcolumn),
+  subcolumn as the vector index. Each thread reloads its own seed state and
+  replays exactly the draws it owns, so the RNG stream is untouched and the
+  result is bit-identical. ~180k threads instead of 1408, and a warp now
+  writes 128 consecutive words.
+
+**The `cdf(mxlay)` per-thread buffer disappeared as a side effect**, and
+that is the part worth reusing. The original draws a whole column of
+randoms, then walks down it applying the `icld=2` overlap adjustment, then
+walks down it *again* to write the outputs. The adjustment at level k reads
+only the already-adjusted level k-1, so all three passes fuse into one loop
+carrying a single scalar — same arithmetic, same order, no local memory.
+Look for this shape whenever a ported routine reports
+`Local memory used for <x>`: an array that exists only to carry a value
+between two sequential passes over the same index is usually a scalar.
+
+The main kernel now moves ~980 MB per launch in 2.95 ms, about 330 GB/s
+against this card's ~448 GB/s peak. **It is bandwidth-bound and near the
+limit, so there is no second round of tuning here.** The only way further
+would be to stop materialising four of the five outputs (they are all just
+`cldfmcl`-gated copies of per-(column,layer) inputs that `cldprmc_gpu`
+could gate itself), and at 0.29 s total that is not worth the interface
+surgery.
+
+**Verification: bit-exact, and the ncol=1 harness could not have shown
+it.** kissvec is bitwise integer arithmetic and every downstream value is a
+copy or a compare, so the bar is bit-exactness, not a tolerance. The
+existing `check_mcica_{lw,sw}.f90` ran `ncol=1`, which cannot see the one
+thing this restructuring risks — a wrong `seedsv` stride between columns.
+`check_mcica_{lw,sw}2.f90` (in `/tmp/rrtmg_integrate/`) run 37 columns with
+per-column staggered pressure profiles and cloud bands, plus a fully
+overcast layer directly above a clear one so both sides of the `icld=2`
+branch are taken inside the same column. Every output element matches the
+CPU reference exactly, for `icld=1,2,3`, LW and SW.
+
+Both files' changes are entirely inside `#ifdef WRF_GPU_RAD` — checked by
+walking the guard stack and testing every changed line number against it,
+not by eye.
+
+### This build is not run-to-run reproducible, and that is not a bug
+
+Trying to confirm the fix by diffing `wrfout` between the before and after
+builds does not work, and the reason matters more than the attempt.
+**The same binary, run twice, on the same inputs, with `WRF_GPU_RAD_CHUNK`
+forced to the same value, produces the same scatter:**
+
+| max abs difference at t=10 min | `SWUPTC` | `SWDNBC` | `LWUPBC` | `GLW` | `SWDOWN` |
+|---|---|---|---|---|---|
+| same binary, two runs | 6.9e-4 | 2.3e-3 | 3.36 | 6.15 | 17.97 |
+| before vs after the rewrite | 6.3e-4 | 2.3e-3 | 2.30 | 10.23 | 26.44 |
+| (field max) | 149.7 | 400.8 | 467.2 | 423.4 | 400.8 |
+
+Read the **clear-sky SW** row first: `SWUPTC` and `SWDNBC` are the fields
+McICA does not randomise, and they agree to 4-6e-6 relative — *identically*
+in both comparisons. Everything else is larger in one comparison and
+smaller in the other, with no systematic sign. The rewrite is
+indistinguishable from the binary compared against itself.
+
+The source is floating-point `!$acc atomic update`: `rtrnmc_gpu` sums
+`urad`/`drad`/`clrurad`/`clrdrad` across 140 g-points that way, and
+`spcvmc_sw_accumulate_gpu` sums six flux arrays across 112. The order those
+adds land in is scheduling-dependent, so the sums are non-associative
+between runs. McICA then amplifies: its seed is the fractional part of the
+column's own pressure, so a last-ulp flux change re-randomises that
+column's entire subcolumn draw, and 24 timesteps of feedback turn a 5e-6
+clear-sky difference into a few percent on all-sky `SWDOWN`.
+
+**This corrects a rule written into this file earlier**: "run-to-run
+variation in a GPU port's output, on identical inputs, is a race or an
+uninitialized read — never data, never FP reassociation." That rule found
+two real bugs and is still worth applying, but it is false as stated
+wherever float atomics are in the loop, which in this port is both schemes.
+The way to tell the two apart is to look at the *accumulator*, not at
+anything downstream of McICA: atomics differ in the last ulp, an
+uninitialized read gives garbage, negatives or NaN. Downstream magnitude
+proves nothing here, because the amplifier has no small-perturbation
+regime.
+
+Practical consequence: **`wrfout` diffing is not an acceptance test for
+anything in this port.** Use unit-level bit-exactness against the CPU
+routine, and use the same-binary-twice run as the yardstick for any
+field-level comparison.
+
 ## Top-level priority
 
 Profiling the real Hong Kong case (`/mnt/nvme/wrf_hk_gpu_d01`, `radt=1`,
@@ -73,16 +193,21 @@ CPU-only build at the field level. 10-minute real case: **312.0s CPU 1-rank
 → 103.7s GPU 1-rank (3.0x)**, and the 4-rank GPU build (57.6s) matches the
 8-rank CPU build (57.3s).
 
-**Radiation is nevertheless still 41% of the timestep**, and "profile before
-choosing the next lever" has now actually been done — see "Where the time
-actually goes" at the top of this file. The short version: radiation is
-still first at 41%, but 17.7% of the whole step is **two McICA kernels that
-are already on the GPU and are simply slow** (211 ms and 98 ms per launch,
-10x the next kernel). Tuning those is the highest-value work available and
-needs no new port. Thompson microphysics is second at 19% and untouched.
-Diffusion — the phase that has been scoped as "next" since the original plan
-— is **6.5%**, i.e. smaller than the acoustic step, which measured as worth
-nothing. Do not start it.
+**Radiation was nevertheless still 41% of the timestep**, and "profile
+before choosing the next lever" has now actually been done — see "Where the
+time actually goes" at the top of this file. It found that 17.7% of the
+whole step was two McICA kernels that were already on the GPU and were
+simply slow (211 ms and 98 ms per launch, 10x the next kernel). **That has
+since been fixed — 66x, 18.57 s off a 111 s run, 1.20x end-to-end** — see
+"McICA: 66x, and what was actually wrong with it".
+
+**The next lever is therefore unmeasured.** Thompson microphysics was
+second at 20.5 s / 19% and is entirely on the CPU, so it is very likely
+first now, but re-run the `-DBENCH` breakdown before committing to it
+rather than inheriting a percentage from a profile that no longer
+describes this build. Diffusion — the phase that has been scoped as "next"
+since the original plan — is **6.5%**, i.e. smaller than the acoustic step,
+which measured as worth nothing. Do not start it.
 
 Full architectural analysis, phase plan, and rationale live in `plan.md` at
 the repo root — read that for the "why" behind the sequencing. This file is
@@ -565,8 +690,11 @@ All behind `#ifdef WRF_GPU_RAD`, all additive (original CPU code untouched):
 - `setcoef_gpu` + `laytrop_gpu` + `setcoef_bnd_gpu` + `setcoef_driver_gpu` (commit `53bd32c2e`)
 - `cldprmc_gpu` + `cldprmc_prep_gpu` (commit `53bd32c2e`)
 - `rtrnmc_gpu` + `rtrnmc_secdiff_gpu` + `rtrnmc_cldprep_gpu` + `rtrnmc_zero_gpu` + `rtrnmc_post_gpu` + `rtrnmc_driver_gpu` (commit `ef83bf348`)
-- `mcica_subcol_lw_gpu` + `mcica_subcol_lw_prep_gpu` + `mcica_subcol_lw_driver_gpu`
-  (commit `e0e7edc84`) — the McICA stochastic subcolumn cloud generator that
+- `mcica_subcol_lw_gpu` + `mcica_subcol_lw_seeds_gpu` +
+  `mcica_subcol_lw_prep_gpu` + `mcica_subcol_lw_driver_gpu`
+  (commit `e0e7edc84`; split into two kernels and made 66x faster later —
+  see "McICA: 66x" at the top of this file) — the McICA stochastic
+  subcolumn cloud generator that
   runs *before* `cldprmc` in the real per-column call chain (not part of
   the `rrtmg_lw` AER driver itself — it's called directly by
   `RRTMG_LWRAD`). Supports all three overlap modes WRF's `icloud` namelist
@@ -617,7 +745,9 @@ CPU 4.04s vs GPU 0.161s = **25.1x speedup** on the full LW compute chain
 All behind `#ifdef WRF_GPU_RAD`, all additive. The chain driver, the
 `RRTMG_SWRAD` integration and the field-level verification are written up
 further down (search "SW is now complete too"); the per-routine list is:
-- `mcica_subcol_sw_gpu` (commit `44bc6d712`) — verified bit-exact
+- `mcica_subcol_sw_gpu` + `mcica_subcol_sw_seeds_gpu` (commit `44bc6d712`;
+  split into two kernels and made 65x faster later — see "McICA: 66x" at
+  the top of this file) — verified bit-exact
 - `rrtmg_sw_inatm_gpu` (commit `166d8723c`) — verified bit-exact
 - `rrtmg_sw_gpu_chain_driver` (commit `94b77c533`) — verified to ≤4.7e-6 relative
 - `RRTMG_SWRAD` accumulate/flush + `rrtmg_sw_gpu_tables` + `rrtmg_sw_gpu_chunk` (commit `89e4eb501`)
@@ -982,7 +1112,7 @@ addition, original CPU per-column path untouched) that:
   commit `01df733b0`) queries the *actual running device's* free memory at
   runtime via OpenACC's `acc_get_property(devnum, acc_device_nvidia,
   acc_property_free_memory)` and divides by a per-column byte-footprint
-  estimate (`rrtmg_lw_gpu_bytes_per_column`, currently ~0.34MB/column at
+  estimate (`rrtmg_lw_gpu_bytes_per_column`, 0.601MB/column at
   nlayers=65) with a 50% safety margin for already-resident allocations
   (k-distribution tables, other OpenACC ports' working arrays) the query
   can't see. **This must never be replaced with a number hardcoded to any
@@ -991,11 +1121,7 @@ addition, original CPU per-column path untouched) that:
   querying `acc_get_property` at runtime is the established pattern for
   this, not a namelist option or a compile-time constant. Verified on this
   device: reports needing 2 chunks for the real 15,876-column Hong Kong
-  tile at nlayers=65. The byte-per-column *estimate* should be revisited
-  now that `rrtmg_lw_gpu_chain_driver`'s real array list is final (it
-  wasn't, when the estimate was first written) — the sizing *mechanism* is
-  solid, the number it multiplies is worth double-checking against the
-  chain driver's actual `ALLOCATE` list.
+  tile at nlayers=65.
   **Made rank-aware** (commit `6004292d8`).
   `acc_get_property(..., acc_property_free_memory)` reports the whole
   device, so every rank believed it was alone and `-np 4` on the 8GB card
@@ -1119,7 +1245,9 @@ pieces landed as:
   unusable — the tile's last column may be dark and never accumulate.
   Flush when full, plus once after both loops for the remainder (which is
   legitimately zero for an entirely dark tile).
-- SW costs **~5x LW per column** (~1.7MB at nlay=65), almost entirely
+- SW costs **2.75x LW per column** (1.655 vs 0.601MB at nlay=65 — the
+  figure both `bytes_per_column` functions actually compute; "~5x" stood
+  here for a while and was a bad mental shortcut, never the code), almost entirely
   because `spcvmc_sw`'s adding-doubling solver keeps far more
   `ngptsw`-wide state resident (32 arrays inside `spcvmc_sw_driver_gpu`
   alone) than `rtrnmc`'s up/down sweep does.
@@ -1618,6 +1746,22 @@ For each new `_gpu` subroutine ported:
   `check_taumol_sw.f90`, `check_spcvmc_sw.f90`, `check_mcica_sw.f90`,
   `check_inatm_sw.f90`, `check_sw_chain.f90`). Use these as templates for
   the next stage's harness.
+  `check_mcica_lw2.f90` / `check_mcica_sw2.f90` are the multi-column
+  (`ncol=37`) versions, written for the two-kernel McICA rewrite. **Prefer
+  them over the `ncol=1` originals for anything that touches the column
+  axis** — an `ncol=1` harness cannot see a wrong per-column stride at all,
+  which is exactly the class of bug that restructuring risks. They stagger
+  the pressure profile and cloud band per column and put a fully overcast
+  layer directly above a clear one so both sides of the `icld=2` branch are
+  taken within one column.
+  Two link-time things that changed with v4.7.1 and will bite the next
+  harness: the CPU `mcica_subcol_{lw,sw}` now take four extra arguments
+  (`hgt`, `idcor`, `juldat`, `lat`) for the unported `icld=4,5` overlap
+  modes and must be passed something; and linking the real
+  `module_ra_rrtmg_{lw,sw}.o` now pulls in
+  `module_ra_clWRF_support.o` (for `read_camgases`), which in turn needs a
+  `get_unused_unit` stub — `extra_stubs.f90` supplies it. Neither symbol is
+  reachable from any mcica harness; they only have to resolve.
   **Harnesses must link with `mpifort`, not `nvfortran`**, since
   `rrtmg_lw_gpu_ranks_per_device` calls MPI; `dm_stubs.f90` supplies a
   one-line `wrf_get_dm_communicator` returning `MPI_UNDEFINED`. (The source
@@ -1738,14 +1882,25 @@ fail ("attempt to read past end of file").
     `prup(klev+1)` and `inatm`'s `pz(iplon,0)`; this keeps recurring and is
     worth a deliberate checklist pass per ported routine.
 - **Run-to-run variation in a GPU port's output, on identical inputs, is a
-  race or an uninitialized read — never data, never FP reassociation.** FP
-  noise is deterministic for a fixed kernel launch geometry. Counting
-  affected elements across two runs of the same case (943 bad columns, then
-  a *different* 943) is a cheaper and far more decisive test than any
-  sanitizer, and it immediately rules out the entire "bad input data" class
-  of hypothesis. Note the failing indices may also carry a structural
-  signature worth reading: here every surviving bad column after the first
-  fix was at a flattened index ≡ 5 (mod 32), i.e. one fixed warp lane.
+  race or an uninitialized read — unless a float `!$acc atomic update` is
+  in the loop.** Counting affected elements across two runs of the same
+  case (943 bad columns, then a *different* 943) is a cheaper and far more
+  decisive test than any sanitizer, and it immediately rules out the entire
+  "bad input data" class of hypothesis. Note the failing indices may also
+  carry a structural signature worth reading: here every surviving bad
+  column after the first fix was at a flattened index ≡ 5 (mod 32), i.e.
+  one fixed warp lane.
+  **The exception is real and this port lives in it.** This rule used to
+  end "never data, never FP reassociation", on the argument that FP noise
+  is deterministic for a fixed launch geometry. That is true of a plain
+  kernel and false of an atomic accumulation: `rtrnmc_gpu` sums over 140
+  g-points with `!$acc atomic update` and `spcvmc_sw_accumulate_gpu` over
+  112, and the order those adds land in varies run to run, so the whole
+  build is non-deterministic at the last ulp by design. Distinguish by
+  looking at the accumulator itself, never at anything downstream of McICA
+  — a last-ulp flux change re-randomises a column's entire subcolumn draw,
+  so downstream magnitude carries no information about the cause. See
+  "This build is not run-to-run reproducible" at the top of this file.
 - **Localize a NaN by instrumenting the pipeline in causal order, in one
   run, with `COUNT(.NOT. finite)` per stage — not with fired-once `SAVE`d
   flags.** Two independently-`SAVE`d one-shot probes fire on *different

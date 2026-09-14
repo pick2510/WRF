@@ -2740,22 +2740,43 @@ contains
 ! irng=0 (kissvec) directly, not via namelist, so that restriction is a
 ! code-level fact rather than a run-configuration assumption).
 !
-! kissvec's bitwise RNG update is a strict per-column sequential chain (each
-! call's seed state depends on the previous call for that same column), but
-! is otherwise embarrassingly parallel across columns -- exactly the
-! genuine-recurrence-per-thread pattern used by rtrnmc_gpu/vrtqdr_sw_gpu,
-! just with scalar integer state instead of flux accumulators. For
-! icld=1 (random overlap), each subcolumn/level's random draw has no
-! cross-level dependency and can be consumed immediately without ever
-! being stored as an array. For icld=2/3, one subcolumn's random draws
-! across all levels must be buffered (a private `cdf(mxlay)` array) before
-! the overlap adjustment (icld=2) or level-broadcast (icld=3) can be
-! applied -- still per-column-private, no cross-column or cross-subcolumn
-! sharing.
+! kissvec's bitwise RNG update is a strict sequential chain: each draw's
+! seed state depends on the previous draw for that same column, and within
+! a column the draws are consumed subcolumn-major (all nlay draws for
+! subcolumn 1, then all nlay for subcolumn 2, ...). That chain is the only
+! thing coupling the subcolumns, and it is broken here in two kernels so
+! that (column, subcolumn) can both be parallel:
+!
+!   mcica_subcol_lw_seeds_gpu  -- one thread per column, walks the chain
+!       once and records the 4-word seed state at the START of every
+!       subcolumn into seedsv. ncol threads, no memory traffic in the
+!       inner loop.
+!   mcica_subcol_lw_gpu        -- one thread per (column, subcolumn),
+!       reloads that subcolumn's seed state and replays exactly the draws
+!       it owns. The chain is untouched, so the RNG stream each subcolumn
+!       sees is bit-identical to the CPU's.
+!
+! Two properties of that split are what make it fast, and both were
+! measured rather than assumed (see the profile at the top of CLAUDE.md):
+!   - The parallel axis used to be ncol alone (1281 columns -> 11 blocks
+!     of 128 on a 30-SM card, most of the GPU idle). It is now
+!     ncol*ngptlw, ~180k threads.
+!   - The outputs are (ngptlw, ncol, nlay), so with subcolumn as the
+!     vector index a warp writes 128 consecutive words. Previously the
+!     thread index sat in the middle dimension and every lane of a store
+!     was 140 floats from its neighbour -- one 32-byte transaction per
+!     4 useful bytes.
+!
+! The per-thread `cdf(mxlay)` buffer is gone with it. It existed because
+! the original draws a whole column of random numbers, then walks down it
+! applying the icld=2 overlap adjustment, then walks down it again to
+! write the outputs. The adjustment at level k reads only the already-
+! adjusted level k-1, so the three passes fuse into one loop carrying a
+! single scalar -- same arithmetic, same order, no local memory.
       MODULE mcica_subcol_gen_lw_gpu
 
       use parkind, only : im => kind_im, rb => kind_rb
-      use parrrtm, only : nbndlw, ngptlw, mxlay
+      use parrrtm, only : nbndlw, ngptlw
 
       IMPLICIT NONE
 
@@ -2800,20 +2821,35 @@ contains
       REAL(kind=rb), INTENT(OUT) :: reicmcl(ncol,nlay), relqmcl(ncol,nlay), resnmcl(ncol,nlay)
       REAL(kind=rb), INTENT(OUT) :: taucmcl(ngptlw,ncol,nlay)
 
-      INTEGER(kind=im) :: iplon, ilev, isubcol, n, i
+      INTEGER(kind=im) :: iplon, ilev, isubcol, n, i, ndraw
       INTEGER(kind=im) :: seed1, seed2, seed3, seed4, kiss
       REAL(kind=rb) :: pmid1, pmid2, pmid3, pmid4
-      REAL(kind=rb) :: rand_num, cldf_val
-      REAL(kind=rb) :: cdf(mxlay)
+      REAL(kind=rb) :: rand_num, cldf_val, cdfv, cdf_prev
       LOGICAL :: iscloudy
+
+      INTEGER(kind=im), ALLOCATABLE :: seedsv(:,:,:)
 
       REAL(kind=rb), PARAMETER :: cldmin = 1.0e-20_rb
 
-!$acc parallel loop &
-!$acc   private(ilev, isubcol, n, i, seed1, seed2, seed3, seed4, kiss) &
-!$acc   private(pmid1, pmid2, pmid3, pmid4, rand_num, cldf_val, cdf, iscloudy) &
-!$acc   present(play, cldfrac, ciwp, clwp, cswp, tauc, rei, rel, res) &
-!$acc   present(cldfmcl, ciwpmcl, clwpmcl, cswpmcl, reicmcl, relqmcl, resnmcl, taucmcl, ngb)
+!  Draws consumed per subcolumn: icld=3 (maximum overlap) takes one and
+!  broadcasts it down the column, icld=1/2 take one per level.
+      IF (icld .eq. 3) THEN
+         ndraw = 1
+      ELSE
+         ndraw = nlay
+      ENDIF
+
+      ALLOCATE(seedsv(ngptlw,ncol,4))
+!$acc enter data create(seedsv)
+
+!  Pass 1: walk the per-column RNG chain once and record where each
+!  subcolumn's draws begin. One thread per column; the chain is a genuine
+!  sequential recurrence and cannot be split any finer than this, but it
+!  touches no output array, so it is pure integer work.
+!$acc parallel loop gang vector &
+!$acc   private(ilev, isubcol, i, seed1, seed2, seed3, seed4, kiss) &
+!$acc   private(pmid1, pmid2, pmid3, pmid4, rand_num) &
+!$acc   present(play, seedsv)
       DO iplon = 1, ncol
 
          pmid1 = play(iplon,1)*1.e2_rb
@@ -2843,8 +2879,46 @@ contains
 
 !$acc loop seq
          DO isubcol = 1, ngptlw
-            n = ngb(isubcol)
+            seedsv(isubcol,iplon,1) = seed1
+            seedsv(isubcol,iplon,2) = seed2
+            seedsv(isubcol,iplon,3) = seed3
+            seedsv(isubcol,iplon,4) = seed4
+!$acc loop seq
+            DO ilev = 1, ndraw
+               seed1 = 69069_im * seed1 + 1327217885_im
+               seed2 = ieor(seed2, ishft(seed2, 13_im))
+               seed2 = ieor(seed2, ishft(seed2, -17_im))
+               seed2 = ieor(seed2, ishft(seed2, 5_im))
+               seed3 = 18000_im * iand(seed3, 65535_im) + ishft(seed3, -16_im)
+               seed4 = 30903_im * iand(seed4, 65535_im) + ishft(seed4, -16_im)
+               kiss = seed1 + seed2 + ishft(seed3, 16_im) + seed4
+               rand_num = kiss*2.328306e-10_rb + 0.5_rb
+            ENDDO
+         ENDDO
 
+      ENDDO
+
+!  Pass 2: one thread per (column, subcolumn). The subcolumn index is the
+!  vector index AND the leading dimension of every output, so a warp's
+!  stores are contiguous. The draw, the icld=2 overlap adjustment and the
+!  output write are fused into a single descending pass over levels --
+!  the adjustment at level k reads only the adjusted level k-1, so a
+!  scalar carries what the original kept in a cdf(mxlay) buffer.
+!$acc parallel loop gang vector collapse(2) &
+!$acc   private(n, seed1, seed2, seed3, seed4, kiss, ilev) &
+!$acc   private(rand_num, cldf_val, cdfv, cdf_prev, iscloudy) &
+!$acc   present(cldfrac, ciwp, clwp, cswp, tauc, seedsv) &
+!$acc   present(cldfmcl, ciwpmcl, clwpmcl, cswpmcl, taucmcl, ngb)
+      DO iplon = 1, ncol
+         DO isubcol = 1, ngptlw
+
+            n = ngb(isubcol)
+            seed1 = seedsv(isubcol,iplon,1)
+            seed2 = seedsv(isubcol,iplon,2)
+            seed3 = seedsv(isubcol,iplon,3)
+            seed4 = seedsv(isubcol,iplon,4)
+
+            cdfv = 0._rb
             IF (icld .eq. 3) THEN
 ! Maximum overlap: one random draw per subcolumn, reused at every level.
                seed1 = 69069_im * seed1 + 1327217885_im
@@ -2855,15 +2929,16 @@ contains
                seed4 = 30903_im * iand(seed4, 65535_im) + ishft(seed4, -16_im)
                kiss = seed1 + seed2 + ishft(seed3, 16_im) + seed4
                rand_num = kiss*2.328306e-10_rb + 0.5_rb
+               cdfv = rand_num
+            ENDIF
+
+            cdf_prev = 0._rb
 !$acc loop seq
-               DO ilev = 1, nlay
-                  cdf(ilev) = rand_num
-               ENDDO
-            ELSE
+            DO ilev = 1, nlay
+
+               IF (icld .ne. 3) THEN
 ! Random overlap (icld=1) and maximum/random overlap (icld=2) both start
 ! from one independent random draw per level.
-!$acc loop seq
-               DO ilev = 1, nlay
                   seed1 = 69069_im * seed1 + 1327217885_im
                   seed2 = ieor(seed2, ishft(seed2, 13_im))
                   seed2 = ieor(seed2, ishft(seed2, -17_im))
@@ -2872,30 +2947,25 @@ contains
                   seed4 = 30903_im * iand(seed4, 65535_im) + ishft(seed4, -16_im)
                   kiss = seed1 + seed2 + ishft(seed3, 16_im) + seed4
                   rand_num = kiss*2.328306e-10_rb + 0.5_rb
-                  cdf(ilev) = rand_num
-               ENDDO
+                  cdfv = rand_num
 
-               IF (icld .eq. 2) THEN
-! Maximum/random overlap: walk down the column -- if the layer above is
-! cloudy, reuse its random number; otherwise rescale this level's draw.
-!$acc loop seq
-                  DO ilev = 2, nlay
+                  IF (icld .eq. 2 .and. ilev .gt. 1) THEN
+! Maximum/random overlap: if the layer above is cloudy, reuse its random
+! number; otherwise rescale this level's draw.
                      cldf_val = cldfrac(iplon,ilev-1)
                      IF (cldf_val .lt. cldmin) cldf_val = 0._rb
-                     IF (cdf(ilev-1) .gt. 1._rb - cldf_val) THEN
-                        cdf(ilev) = cdf(ilev-1)
+                     IF (cdf_prev .gt. 1._rb - cldf_val) THEN
+                        cdfv = cdf_prev
                      ELSE
-                        cdf(ilev) = cdf(ilev) * (1._rb - cldf_val)
+                        cdfv = cdfv * (1._rb - cldf_val)
                      ENDIF
-                  ENDDO
+                  ENDIF
+                  cdf_prev = cdfv
                ENDIF
-            ENDIF
 
-!$acc loop seq
-            DO ilev = 1, nlay
                cldf_val = cldfrac(iplon,ilev)
                IF (cldf_val .lt. cldmin) cldf_val = 0._rb
-               iscloudy = (cdf(ilev) .ge. 1._rb - cldf_val)
+               iscloudy = (cdfv .ge. 1._rb - cldf_val)
 
                IF (iscloudy) THEN
                   cldfmcl(isubcol,iplon,ilev) = 1._rb
@@ -2911,16 +2981,22 @@ contains
                   taucmcl(isubcol,iplon,ilev) = 0._rb
                ENDIF
             ENDDO
-         ENDDO
 
-!$acc loop seq
-         DO ilev = 1, nlay
+         ENDDO
+      ENDDO
+
+!$acc parallel loop gang vector collapse(2) &
+!$acc   present(rei, rel, res, reicmcl, relqmcl, resnmcl)
+      DO ilev = 1, nlay
+         DO iplon = 1, ncol
             reicmcl(iplon,ilev) = rei(iplon,ilev)
             relqmcl(iplon,ilev) = rel(iplon,ilev)
             resnmcl(iplon,ilev) = res(iplon,ilev)
          ENDDO
-
       ENDDO
+
+!$acc exit data delete(seedsv)
+      DEALLOCATE(seedsv)
 
       END SUBROUTINE mcica_subcol_lw_gpu
 
@@ -3053,6 +3129,14 @@ contains
 !   indself/indfor/indminor, selffac/selffrac/forfac/forfrac,
 !   minorfrac/scaleminor/scaleminorn2, fac00/01/10/11, the 12 rat_* arrays,
 !   and icldlyr. No longer negligible now that they are counted honestly.
+!
+! Plus one term that does NOT scale with nlayers: mcica_subcol_lw_gpu's
+! seedsv(ngptlw,ncol,4), the per-subcolumn RNG state its first kernel
+! records for its second. 4 words per subcolumn per column, live only for
+! the duration of that one call. Under a percent of the total here, but
+! counted rather than waved away -- the last revision of this function
+! undercounted by 1.75x precisely by writing off the terms that looked
+! small.
       INTEGER(kind=8) FUNCTION rrtmg_lw_gpu_bytes_per_column(nlayers) RESULT(nbytes)
 
       use parrrtm, only : nbndlw, ngptlw, mxmol, maxxsec
@@ -3064,7 +3148,8 @@ contains
       nlay8 = INT(nlayers, 8)
 
       nbytes = 4_8 * nlay8 * (INT(mxmol,8) + INT(maxxsec,8) + 16_8*INT(ngptlw,8) &
-                               + 3_8*INT(nbndlw,8) + 95_8)
+                               + 3_8*INT(nbndlw,8) + 95_8) &
+             + 4_8 * 4_8 * INT(ngptlw,8)
 
       END FUNCTION rrtmg_lw_gpu_bytes_per_column
 
