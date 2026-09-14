@@ -1079,6 +1079,26 @@ For each new `_gpu` subroutine ported:
    `ulimit -s unlimited` is not optional on the v4.7.1 line — see
    "Two v4.7.1 build traps" below. Both traps surface only at link time,
    and neither names the real cause.
+
+   **For iteration, add `export WRF_GPU_ARCH=ccnative`** — a fourth line,
+   and the single biggest build-time saving available here. The default,
+   `ccall`, generates device code for all 12 compute capabilities this
+   NVHPC supports, and that is most of the cost of the two radiation
+   files. Measured, same machine, same file:
+
+   | file | `ccall` | `ccnative` |
+   |---|---|---|
+   | `module_ra_rrtmg_lw.f90` | 118.1 s | 46.9 s |
+   | `module_ra_rrtmg_sw.f90` | 82.1 s | 31.8 s |
+
+   ~2.5x each, about two minutes off every radiation rebuild. Details and
+   the correctness caveats are in the `arch/configure.defaults` stanza;
+   the short version is that it changes build time and not results, but
+   the binary then runs *only* on this machine's GPU, so do a final
+   default-`ccall` build before publishing numbers or sharing a binary.
+
+   Note `-gpu=native` is **not** a valid NVHPC keyword (the spelling is
+   `ccnative`); passing it fails with an unhelpful wall of valid keywords.
    **Always build in parallel** — this is a 40-core box with 62GB RAM, and
    `-j 1` wastes most of it. `-j 12` is a good default: WRF's own build is
    partly serialised by module dependencies, so higher `-j` buys little,

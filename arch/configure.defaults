@@ -2293,16 +2293,42 @@ CFLAGS_LOCAL    =       -w -O3
 LDFLAGS_LOCAL   =       $(GPU_DYN_FLAGS) $(GPU_RAD_FLAGS)
 CPLUSPLUSLIB    =
 ESMF_LDFLAG     =       $(CPLUSPLUSLIB)
-# -gpu=ccall builds device code for every compute capability this NVHPC
-# release supports, so one binary runs on any of them. Do NOT pin this to a
-# single ccXX: the runtime chunk sizing already queries whatever device it
-# finds (see rrtmg_lw_gpu_chunksize), and pinning is the only thing that
-# would tie the build to one GPU.
-# -Kieee is required: without it the GPU and CPU paths disagree well above
-# the single-precision noise floor and every verification tolerance here
-# becomes meaningless.
-GPU_DYN_FLAGS   =       -acc -gpu=ccall -Kieee
-GPU_RAD_FLAGS   =       -acc -gpu=ccall -Kieee
+# Which device architectures to generate code for.
+#
+# The DEFAULT, ccall, builds device code for every compute capability this
+# NVHPC release supports (12 of them here, sm_75 through sm_121), so one
+# binary runs on any of them. Any build that leaves this machine must use
+# it. Nothing else in the port is allowed to assume a particular GPU
+# either: the runtime chunk sizing queries whatever device it finds via
+# acc_get_property (see rrtmg_lw_gpu_chunksize), rather than hardcoding a
+# VRAM size.
+#
+# ccall is also most of the compile time for the two radiation files, so
+# for local iteration override it from the environment:
+#
+#     export WRF_GPU_ARCH=ccnative     # the GPU in this machine
+#     ./compile em_real
+#
+# Prefer ccnative over naming a ccXY: it asks the driver what is installed
+# instead of encoding one card into a build recipe, so the same command
+# works on any machine. An explicit ccXY (cc120, cc90, ...) or a list also
+# works if you need to cross-build.
+#
+# Two things to know before using it:
+#  - The result runs ONLY on the architecture(s) named. On anything else it
+#    fails at launch with "no kernel image is available for execution on
+#    the device". Never hand such a binary to anyone.
+#  - It changes build time, NOT results: the code generated for a given
+#    architecture is identical whether or not others were built alongside
+#    it. Verification runs are still valid, but do a final ccall build
+#    before publishing numbers, so the thing measured is the thing shipped.
+#
+# -Kieee is required regardless: without it the GPU and CPU paths disagree
+# well above the single-precision noise floor and every verification
+# tolerance here becomes meaningless.
+WRF_GPU_ARCH   ?=       ccall
+GPU_DYN_FLAGS   =       -acc -gpu=$(WRF_GPU_ARCH) -Kieee
+GPU_RAD_FLAGS   =       -acc -gpu=$(WRF_GPU_ARCH) -Kieee
 # Deliberately plain -O3, not the aarch64 entry's "-fast -Mvect=noaltcode
 # -Mprefetch": -fast implies -Mfprelaxed-style reassociation that fights
 # -Kieee, and the GPU path is not helped by host vectorisation flags.
